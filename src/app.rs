@@ -2,11 +2,26 @@ use std::collections::VecDeque;
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::deepseek::Message;
+
+// === opencode-inspired theme ===
+const BG: Color = Color::Rgb(10, 10, 10);          // #0a0a0a
+const BG_PANEL: Color = Color::Rgb(20, 20, 20);    // #141414
+const BG_ELEMENT: Color = Color::Rgb(30, 30, 30);  // #1e1e1e
+const TEXT: Color = Color::Rgb(238, 238, 238);     // #eeeeee
+const TEXT_MUTED: Color = Color::Rgb(128, 128, 128); // #808080
+const BORDER: Color = Color::Rgb(72, 72, 72);      // #484848
+const PRIMARY: Color = Color::Rgb(250, 178, 131);  // #fab283 (peach)
+const USER_ACCENT: Color = Color::Rgb(92, 156, 245); // #5c9cf5 (blue)
+const AI_ACCENT: Color = Color::Rgb(159, 124, 216); // #9d7cd8 (purple)
+const SYSTEM_ACCENT: Color = Color::Rgb(128, 128, 128);
+const SUCCESS: Color = Color::Rgb(127, 216, 143); // #7fd88f
+const ERROR: Color = Color::Rgb(224, 108, 117);   // #e06c75
 
 /// UI event sent from the main loop to the app
 #[derive(Debug, Clone)]
@@ -51,6 +66,71 @@ fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
         idx -= 1;
     }
     idx
+}
+
+/// Wrap a single line of text to a maximum display width (in columns).
+/// Handles Unicode widths: CJK = 2 columns, ASCII = 1.
+fn wrap_line(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+
+    for word in text.split_whitespace() {
+        let word_width = word.width();
+
+        if current_width > 0 {
+            // Try placing word after a space
+            if current_width + 1 + word_width <= max_width {
+                current.push(' ');
+                current.push_str(word);
+                current_width += 1 + word_width;
+                continue;
+            }
+            // Flush current line
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+
+        // Place word on fresh line (may need character-level break)
+        if word_width <= max_width {
+            current = word.to_string();
+            current_width = word_width;
+        } else {
+            for c in word.chars() {
+                let cw = c.width().unwrap_or(0);
+                if current_width + cw > max_width && !current.is_empty() {
+                    lines.push(current);
+                    current = String::new();
+                    current_width = 0;
+                }
+                current.push(c);
+                current_width += cw;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
+}
+
+/// Wrap a multi-paragraph text, preserving blank lines.
+fn wrap_paragraph(text: &str, max_width: usize) -> Vec<String> {
+    let mut all = Vec::new();
+    for (i, para) in text.split('\n').enumerate() {
+        if i > 0 {
+            // Preserve blank lines between paragraphs
+        }
+        if para.is_empty() {
+            all.push(String::new());
+            continue;
+        }
+        all.extend(wrap_line(para, max_width));
+    }
+    all
 }
 
 impl App {
@@ -194,89 +274,125 @@ impl App {
 
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
+
+        // Clear background
+        frame.render_widget(
+            Block::default().style(Style::default().bg(BG)),
+            area,
+        );
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .margin(1)
             .split(area);
 
         let output_area = chunks[0];
         let input_area = chunks[1];
 
-        // --- Output panel ---
+        // Content width = available width minus the "┃ " prefix (2 columns)
+        let content_width = (output_area.width.saturating_sub(2)) as usize;
+
+        // --- Output panel: build text with left-border messages ---
         let mut output_lines: Vec<Line> = Vec::new();
 
         for entry in &self.history {
-            let (label, style) = match entry.role {
-                Role::User => (
-                    "You",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Role::Assistant => (
-                    "AI",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Role::System => (
-                    "",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
-                ),
+            let (accent, label) = match entry.role {
+                Role::User => (USER_ACCENT, "You"),
+                Role::Assistant => (AI_ACCENT, "AI"),
+                Role::System => (SYSTEM_ACCENT, ""),
             };
-            if !label.is_empty() {
-                output_lines.push(Line::from(vec![Span::styled(
-                    format!("{}: ", label),
-                    style,
-                )]));
-            }
-            for line in entry.text.lines() {
-                output_lines.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::White),
-                )));
-            }
+
+            // Spacer between messages
             output_lines.push(Line::from(""));
-        }
 
-        // Show streaming response
-        if self.is_streaming || !self.current_response.is_empty() {
-            output_lines.push(Line::from(vec![Span::styled(
-                "AI: ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )]));
-            for line in self.current_response.lines() {
-                output_lines.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::White),
-                )));
+            if !label.is_empty() {
+                output_lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(accent)),
+                    Span::styled(label, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                ]));
+            } else {
+                output_lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(SYSTEM_ACCENT)),
+                ]));
+            }
+
+            // Content lines: manual wrap so every wrapped line keeps the prefix
+            let wrapped = wrap_paragraph(&entry.text, content_width.max(1));
+            for line in wrapped {
+                output_lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(accent)),
+                    Span::styled(line, Style::default().fg(TEXT)),
+                ]));
             }
         }
 
-        let output_block = Block::default()
-            .title(" Chat ")
-            .borders(Borders::ALL);
+        // Show streaming response with a spinner indicator
+        if self.is_streaming || !self.current_response.is_empty() {
+            output_lines.push(Line::from(""));
+            let spinner = if self.is_streaming {
+                Span::styled("◐ ", Style::default().fg(AI_ACCENT))
+            } else {
+                Span::styled("┃ ", Style::default().fg(AI_ACCENT))
+            };
+            output_lines.push(Line::from(vec![
+                spinner,
+                Span::styled("AI", Style::default().fg(AI_ACCENT).add_modifier(Modifier::BOLD)),
+            ]));
+            let wrapped = wrap_paragraph(&self.current_response, content_width.max(1));
+            for line in wrapped {
+                output_lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(AI_ACCENT)),
+                    Span::styled(line, Style::default().fg(TEXT)),
+                ]));
+            }
+        }
+
         let output_widget = Paragraph::new(output_lines)
-            .block(output_block)
-            .wrap(Wrap { trim: true })
             .scroll((self.scroll_offset, 0));
         frame.render_widget(output_widget, output_area);
 
+        // --- Input separator line ---
+        let sep_y = input_area.y.saturating_sub(1);
+        if sep_y >= area.y {
+            let sep_line = "─".repeat(area.width as usize);
+            let sep_widget = Paragraph::new(sep_line).style(Style::default().fg(BORDER));
+            let sep_area = ratatui::layout::Rect {
+                x: area.x,
+                y: sep_y,
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(sep_widget, sep_area);
+        }
+
         // --- Input panel ---
-        let input_block = Block::default()
-            .title(" Input (Enter to send, Ctrl+C to quit) ")
-            .borders(Borders::ALL);
-        let cursor_indicator = " ";
-        let input_text = if self.input_cursor >= self.input.len() {
-            format!("{}{}", self.input, cursor_indicator)
+        let prompt = Span::styled("> ", Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD));
+        let input_content = if self.input.is_empty() {
+            Text::from(vec![Line::from(vec![
+                prompt,
+                Span::styled(
+                    "Type a message...",
+                    Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC),
+                ),
+            ])])
         } else {
-            let before = &self.input[..self.input_cursor];
-            let after = &self.input[self.input_cursor..];
-            format!("{}{}{}", before, cursor_indicator, after)
+            let cursor_indicator = " ";
+            let text = if self.input_cursor >= self.input.len() {
+                format!("{}{}", self.input, cursor_indicator)
+            } else {
+                let before = &self.input[..self.input_cursor];
+                let after = &self.input[self.input_cursor..];
+                format!("{}{}{}", before, cursor_indicator, after)
+            };
+            Text::from(vec![Line::from(vec![
+                prompt,
+                Span::styled(text, Style::default().fg(TEXT)),
+            ])])
         };
-        let input_widget = Paragraph::new(input_text).block(input_block);
+
+        let input_widget = Paragraph::new(input_content)
+            .style(Style::default().bg(BG_PANEL));
         frame.render_widget(input_widget, input_area);
     }
 }
