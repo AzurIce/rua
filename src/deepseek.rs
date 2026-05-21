@@ -1,6 +1,6 @@
 use std::pin::Pin;
 
-use anyhow::{Context, Result};
+use color_eyre::{eyre::Context, Result};
 use futures::{Stream, StreamExt};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,7 @@ impl DeepSeekClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("DeepSeek API error {}: {}", status, text);
+            color_eyre::eyre::bail!("DeepSeek API error {}: {}", status, text);
         }
 
         let mut byte_stream = response.bytes_stream();

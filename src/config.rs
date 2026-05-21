@@ -1,9 +1,16 @@
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use color_eyre::{eyre::Context, Result};
+use once_cell::sync::Lazy;
 use serde::Deserialize;
+
+/// Cache for shell command results (persists for process lifetime).
+static COMMAND_CACHE: Lazy<Mutex<HashMap<String, String>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Config file at ~/.config/rua/config.toml
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -52,19 +59,37 @@ fn default_true() -> bool {
 pub fn resolve_value(value: &str) -> Result<String> {
     if value.starts_with('!') {
         let command = &value[1..];
+
+        // Check cache first
+        {
+            let cache = COMMAND_CACHE.lock().unwrap();
+            if let Some(cached) = cache.get(command) {
+                return Ok(cached.clone());
+            }
+        }
+
         let output = Command::new("sh")
             .arg("-c")
             .arg(command)
             .output()
             .with_context(|| format!("failed to execute shell command: {}", command))?;
+
         if !output.status.success() {
-            anyhow::bail!(
+            color_eyre::eyre::bail!(
                 "shell command failed (exit {}): {}",
                 output.status.code().unwrap_or(-1),
                 command
             );
         }
+
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Store in cache
+        {
+            let mut cache = COMMAND_CACHE.lock().unwrap();
+            cache.insert(command.to_string(), stdout.clone());
+        }
+
         Ok(stdout)
     } else {
         // Try environment variable first, then literal

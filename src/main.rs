@@ -1,7 +1,9 @@
-use std::io;
+use std::io::stdout;
+use std::time::Duration;
 
+use color_eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{Event, EventStream, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -17,8 +19,9 @@ use rua::config::Config;
 use rua::deepseek::{DeepSeekClient, StreamEvent};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Load config
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+
     let config = Config::load().unwrap_or_else(|e| {
         eprintln!("Warning: failed to load config: {}", e);
         Config::default()
@@ -34,11 +37,20 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // Setup terminal
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut out = stdout();
+    out.execute(EnterAlternateScreen)?;
+
+    let result = run_app(config).await;
+
+    let _ = disable_raw_mode();
+    let _ = stdout().execute(LeaveAlternateScreen);
+
+    result
+}
+
+async fn run_app(config: Config) -> Result<()> {
+    let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
@@ -51,18 +63,29 @@ async fn main() -> anyhow::Result<()> {
     // Channel for UI events from background tasks
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
-    // Spawn a task to read crossterm events and send them to the channel
+    // Spawn crossterm event reader using EventStream (non-blocking)
     let tx_crossterm = tx.clone();
+    let mut event_reader = EventStream::new();
     tokio::spawn(async move {
-        loop {
-            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if tx_crossterm.send(UiEvent::Key(key)).is_err() {
-                        break;
-                    }
-                }
+        while let Some(Ok(event)) = event_reader.next().await {
+            let ui_event = match event {
+                Event::Key(key) => UiEvent::Key(key),
+                Event::Resize(cols, rows) => UiEvent::Resize(cols, rows),
+                _ => UiEvent::Tick,
+            };
+            if tx_crossterm.send(ui_event).is_err() {
+                break;
             }
-            if tx_crossterm.send(UiEvent::Tick).is_err() {
+        }
+    });
+
+    // Tick timer for spinner animation
+    let tx_tick = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(80));
+        loop {
+            interval.tick().await;
+            if tx_tick.send(UiEvent::Tick).is_err() {
                 break;
             }
         }
@@ -78,12 +101,17 @@ async fn main() -> anyhow::Result<()> {
         };
 
         match event {
-            UiEvent::Tick => {}
+            UiEvent::Tick => {
+                if app.status != rua::app::AppStatus::Idle {
+                    app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                }
+            }
             UiEvent::Key(key) => {
                 if key.code == KeyCode::Enter && !app.is_streaming {
                     if let Some(_user_msg) = app.submit_input() {
+                        app.status = rua::app::AppStatus::Waiting;
                         let client_clone = client.clone();
-                        let messages = app.messages.clone();
+                        let messages = app.history_messages();
                         let tx_stream = tx.clone();
                         stream_task = Some(tokio::spawn(async move {
                             match client_clone.chat_stream(messages).await {
@@ -123,7 +151,9 @@ async fn main() -> anyhow::Result<()> {
             UiEvent::StreamError(e) => {
                 app.add_error(&e);
             }
-            UiEvent::Resize(_, _) => {}
+            UiEvent::Resize(cols, rows) => {
+                let _ = (cols, rows); // Terminal::draw handles resize automatically
+            }
         }
 
         if app.should_quit {
@@ -133,10 +163,6 @@ async fn main() -> anyhow::Result<()> {
             break Ok(());
         }
     };
-
-    // Restore terminal
-    disable_raw_mode()?;
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
 
     result
 }
