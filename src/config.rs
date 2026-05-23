@@ -17,8 +17,6 @@ static COMMAND_CACHE: Lazy<Mutex<HashMap<String, String>>> =
 pub struct Config {
     #[serde(default)]
     pub deepseek: DeepSeekConfig,
-    #[serde(default)]
-    pub ui: UiConfig,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -31,12 +29,6 @@ pub struct DeepSeekConfig {
     pub model: String,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
-pub struct UiConfig {
-    #[serde(default = "default_true")]
-    pub streaming: bool,
-}
-
 fn default_api_key() -> String {
     String::new()
 }
@@ -47,10 +39,6 @@ fn default_base_url() -> String {
 
 fn default_model() -> String {
     "deepseek-v4-pro".to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Resolve a config value using pi-style rules:
@@ -136,9 +124,6 @@ api_key = "!echo $DEEPSEEK_API_KEY"
 
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-pro"
-
-[ui]
-streaming = true
 "#;
 
     std::fs::write(path, default_contents)
