@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::state::{
     AppState, AppStatus, BG, BG_PANEL, TEXT, TEXT_MUTED, BORDER, PRIMARY, USER_ACCENT,
-    AI_ACCENT, SYSTEM_ACCENT, SPINNER_FRAMES,
+    AI_ACCENT, SYSTEM_ACCENT, SPINNER_FRAMES, SUCCESS,
 };
 use crate::model::Role;
 
@@ -38,6 +38,7 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
             Role::User => (USER_ACCENT, Some("You")),
             Role::Assistant => (AI_ACCENT, Some("AI")),
             Role::System => (SYSTEM_ACCENT, None),
+            Role::Tool => (SUCCESS, Some("🔧")),
         };
 
         lines.push(Line::from(""));
@@ -59,9 +60,32 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
                 Span::styled(line, Style::default().fg(TEXT)),
             ]));
         }
+
+        // Render reasoning content for Assistant entries
+        if entry.role == Role::Assistant {
+            if let Some(ref reasoning) = entry.reasoning_content {
+                if entry.reasoning_expanded {
+                    lines.push(Line::from(vec![
+                        Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
+                        Span::styled("💭 thinking:", Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC)),
+                    ]));
+                    for line in crate::app::state::wrap_paragraph(reasoning, content_width.max(1)) {
+                        lines.push(Line::from(vec![
+                            Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
+                            Span::styled(line, Style::default().fg(TEXT_MUTED)),
+                        ]));
+                    }
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
+                        Span::styled("💭 ▶ thinking... (press r to expand)", Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC)),
+                    ]));
+                }
+            }
+        }
     }
 
-    if state.is_streaming || !state.current_response.is_empty() {
+    if state.is_streaming || !state.current_response.is_empty() || !state.current_reasoning.is_empty() {
         lines.push(Line::from(""));
         let icon = if state.is_streaming {
             SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string()
@@ -72,6 +96,17 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
             Span::styled(format!("{} ", icon), Style::default().fg(AI_ACCENT)),
             Span::styled("AI", Style::default().fg(AI_ACCENT).add_modifier(Modifier::BOLD)),
         ]));
+
+        // Show reasoning content in real-time during streaming
+        if !state.current_reasoning.is_empty() {
+            for line in crate::app::state::wrap_paragraph(&state.current_reasoning, content_width.max(1)) {
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
+                    Span::styled(line, Style::default().fg(TEXT_MUTED)),
+                ]));
+            }
+        }
+
         for line in crate::app::state::wrap_paragraph(&state.current_response, content_width.max(1)) {
             lines.push(Line::from(vec![
                 Span::styled("┃ ", Style::default().fg(AI_ACCENT)),

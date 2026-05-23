@@ -7,6 +7,9 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.should_quit = true;
         }
+        KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.toggle_latest_reasoning();
+        }
         KeyCode::Char(c) => {
             if state.input_cursor >= state.input.len() {
                 state.input.push(c);

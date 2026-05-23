@@ -18,6 +18,7 @@ use rua::app::{App, UiEvent};
 use rua::config::Config;
 use rua::deepseek::DeepSeekClient;
 use rua::session::Session;
+use rua::tools::{BashTool, Tool, ToolRegistry};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -91,7 +92,9 @@ async fn run_app(config: Config) -> Result<()> {
 
     // Session layer: manages LLM requests
     let client = DeepSeekClient::new(config.deepseek)?;
-    let session = Session::new(client, tx.clone());
+    let mut tools = ToolRegistry::new();
+    tools.add(Tool::Bash(BashTool));
+    let session = Session::new(client, tx.clone(), tools);
 
     let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -125,8 +128,15 @@ async fn run_app(config: Config) -> Result<()> {
                 }
             }
             UiEvent::StreamDelta(delta) => app.append_delta(&delta),
+            UiEvent::ReasoningDelta(delta) => app.append_reasoning_delta(&delta),
             UiEvent::StreamDone => app.finish_stream(),
             UiEvent::StreamError(e) => app.add_error(&e),
+            UiEvent::ToolCall { name, arguments } => {
+                app.add_tool_call(&name, &arguments);
+            }
+            UiEvent::ToolResult { name, output } => {
+                app.add_tool_result(&name, &output);
+            }
             UiEvent::Resize(_, _) => {} // Terminal::draw handles resize automatically
         }
 

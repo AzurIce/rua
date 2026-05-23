@@ -59,6 +59,8 @@ pub struct AppState {
     pub input_cursor: usize,
     pub(crate) history: VecDeque<ChatEntry>,
     pub current_response: String,
+    /// Accumulates reasoning_content from DeepSeek reasoning models.
+    pub current_reasoning: String,
     pub is_streaming: bool,
     pub scroll_offset: u16,
     pub should_quit: bool,
@@ -74,6 +76,7 @@ impl AppState {
             input_cursor: 0,
             history: VecDeque::new(),
             current_response: String::new(),
+            current_reasoning: String::new(),
             is_streaming: false,
             scroll_offset: 0,
             should_quit: false,
@@ -92,6 +95,9 @@ impl AppState {
         self.history.push_back(ChatEntry {
             role: Role::System,
             text: text.to_string(),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_expanded: false,
         });
     }
 
@@ -103,14 +109,38 @@ impl AppState {
         self.history.push_back(ChatEntry {
             role: Role::User,
             text: text.clone(),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_expanded: false,
         });
         self.input.clear();
         self.input_cursor = 0;
         self.current_response.clear();
+        self.current_reasoning.clear();
         self.is_streaming = true;
         self.status = AppStatus::Sending;
         self.token_count = 0;
         Some(text)
+    }
+
+    pub fn add_tool_call(&mut self, name: &str, arguments: &str) {
+        self.history.push_back(ChatEntry {
+            role: Role::Tool,
+            text: format!("{}({})", name, arguments),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        });
+    }
+
+    pub fn add_tool_result(&mut self, _name: &str, output: &str) {
+        self.history.push_back(ChatEntry {
+            role: Role::Tool,
+            text: format!("→ {}", output),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_expanded: false,
+        });
     }
 
     pub fn append_delta(&mut self, delta: &str) {
@@ -119,15 +149,28 @@ impl AppState {
         self.token_count = self.current_response.len() / 4;
     }
 
+    pub fn append_reasoning_delta(&mut self, delta: &str) {
+        self.current_reasoning.push_str(delta);
+    }
+
     pub fn finish_stream(&mut self) {
         let text = self.current_response.trim().to_string();
+        let reasoning = if self.current_reasoning.is_empty() {
+            None
+        } else {
+            Some(self.current_reasoning.trim().to_string())
+        };
         if !text.is_empty() {
             self.history.push_back(ChatEntry {
                 role: Role::Assistant,
                 text,
+                tool_call_id: None,
+                reasoning_content: reasoning,
+                reasoning_expanded: false,
             });
         }
         self.current_response.clear();
+        self.current_reasoning.clear();
         self.is_streaming = false;
         self.status = AppStatus::Idle;
         self.token_count = 0;
@@ -140,7 +183,20 @@ impl AppState {
         self.history.push_back(ChatEntry {
             role: Role::System,
             text: format!("Error: {}", text),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning_expanded: false,
         });
+    }
+
+    /// Toggle the reasoning expansion state of the most recent Assistant entry.
+    pub fn toggle_latest_reasoning(&mut self) {
+        for entry in self.history.iter_mut().rev() {
+            if entry.role == Role::Assistant && entry.reasoning_content.is_some() {
+                entry.reasoning_expanded = !entry.reasoning_expanded;
+                break;
+            }
+        }
     }
 }
 
