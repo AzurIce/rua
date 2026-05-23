@@ -7,12 +7,26 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::config::DeepSeekConfig;
+use crate::model::{ChatEntry, Role};
 
-/// A single chat message
+/// A single chat message (API wire format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+}
+
+impl From<ChatEntry> for Message {
+    fn from(entry: ChatEntry) -> Self {
+        Self {
+            role: match entry.role {
+                Role::User => "user".to_string(),
+                Role::Assistant => "assistant".to_string(),
+                Role::System => "system".to_string(),
+            },
+            content: entry.text,
+        }
+    }
 }
 
 /// Request body for DeepSeek Chat Completions API

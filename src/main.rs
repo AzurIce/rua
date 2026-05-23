@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 
 use rua::app::{App, UiEvent};
 use rua::config::Config;
-use rua::deepseek::{DeepSeekClient, StreamEvent};
+use rua::deepseek::DeepSeekClient;
+use rua::session::Session;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,17 +54,14 @@ async fn run_app(config: Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app
+    // UI state
     let mut app = App::new();
     app.add_system_message("Welcome to rua! Type a message and press Enter. Ctrl+C to quit.");
 
-    // Create DeepSeek client
-    let client = DeepSeekClient::new(config.deepseek)?;
-
-    // Channel for UI events from background tasks
+    // Event channel
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
-    // Spawn crossterm event reader using EventStream (non-blocking)
+    // Background: crossterm events
     let tx_crossterm = tx.clone();
     let mut event_reader = EventStream::new();
     tokio::spawn(async move {
@@ -79,7 +77,7 @@ async fn run_app(config: Config) -> Result<()> {
         }
     });
 
-    // Tick timer for spinner animation
+    // Background: tick timer (spinner animation)
     let tx_tick = tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(80));
@@ -91,10 +89,14 @@ async fn run_app(config: Config) -> Result<()> {
         }
     });
 
+    // Session layer: manages LLM requests
+    let client = DeepSeekClient::new(config.deepseek)?;
+    let session = Session::new(client, tx.clone());
+
     let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let result = loop {
-        terminal.draw(|f| app.draw(f))?;
+        terminal.draw(|f| rua::app::render::draw(&app, f))?;
 
         let Some(event) = rx.recv().await else {
             break Ok(());
@@ -108,52 +110,24 @@ async fn run_app(config: Config) -> Result<()> {
             }
             UiEvent::Key(key) => {
                 if key.code == KeyCode::Enter && !app.is_streaming {
-                    if let Some(_user_msg) = app.submit_input() {
+                    if app.submit_input().is_some() {
                         app.status = rua::app::AppStatus::Waiting;
-                        let client_clone = client.clone();
-                        let messages = app.history_messages();
-                        let tx_stream = tx.clone();
-                        stream_task = Some(tokio::spawn(async move {
-                            match client_clone.chat_stream(messages).await {
-                                Ok(mut stream) => {
-                                    while let Some(event) = stream.next().await {
-                                        let ui_event = match event {
-                                            StreamEvent::TextDelta(delta) => {
-                                                UiEvent::StreamDelta(delta)
-                                            }
-                                            StreamEvent::Done => UiEvent::StreamDone,
-                                            StreamEvent::Error(e) => {
-                                                UiEvent::StreamError(e)
-                                            }
-                                        };
-                                        let _ = tx_stream.send(ui_event);
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx_stream.send(UiEvent::StreamError(format!(
-                                        "Request failed: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                        }));
+                        let messages: Vec<rua::deepseek::Message> = app
+                            .history_entries()
+                            .into_iter()
+                            .filter(|e| e.role != rua::model::Role::System)
+                            .map(Into::into)
+                            .collect();
+                        stream_task = Some(session.send_message(messages));
                     }
                 } else {
-                    app.on_key(key);
+                    rua::app::input::handle_key(&mut app, key);
                 }
             }
-            UiEvent::StreamDelta(delta) => {
-                app.append_delta(&delta);
-            }
-            UiEvent::StreamDone => {
-                app.finish_stream();
-            }
-            UiEvent::StreamError(e) => {
-                app.add_error(&e);
-            }
-            UiEvent::Resize(cols, rows) => {
-                let _ = (cols, rows); // Terminal::draw handles resize automatically
-            }
+            UiEvent::StreamDelta(delta) => app.append_delta(&delta),
+            UiEvent::StreamDone => app.finish_stream(),
+            UiEvent::StreamError(e) => app.add_error(&e),
+            UiEvent::Resize(_, _) => {} // Terminal::draw handles resize automatically
         }
 
         if app.should_quit {
