@@ -8,6 +8,16 @@ TUI 的 `AppState` 当前持有用于展示的历史。每个用户 turn 开始�
 
 在加入更多 provider、工具、持久化能力或用户界面之前，Rua 需要一个稳定的 agent core。这个核心必须无损地保存会话，并为每个参与组件建立明确的边界。
 
+这里首先要分开三种经常被混为“会话状态”的东西：
+
+```text
+canonical conversation   模型已经被告知了哪些事实
+execution journal        runtime 已经或准备进行哪些外部动作
+display projection       用户此刻看见、选择和编辑什么
+```
+
+它们会相互引用，却不能合并。把 projection 当作 conversation 会让折叠、流式草稿和局部 UI 状态污染下一次请求；只保存 conversation 又无法判断崩溃前的工具是否已经产生副作用。后文的 ownership 与提交点都从这一区分展开。
+
 Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider 边界与标准消息模型](d0002-provider-model.md) 定义。
 
 ## 目标
@@ -34,9 +44,7 @@ Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider �
 
 这些能力可以建立在本文定义的边界之上，但不属于首版 runtime 设计。
 
-## 设计
-
-### Runtime 所有权
+## 谁拥有会话
 
 `AgentRuntime` 持有 canonical conversation，并且是唯一可以向其中追加具有协议意义消息的组件。Conversation 必须保留未来发起 provider 请求所需的全部信息，无需读取 UI 状态。
 
@@ -52,7 +60,7 @@ Canonical model 不是某个 provider 的 wire model。Provider adapter 负责�
 
 TUI 只维护用于渲染和输入的投影视图。它消费 runtime events，不得根据展示条目重建 canonical messages。
 
-### Turn 生命周期
+## 一个 Turn 怎样推进
 
 Runtime 接受用户输入时，一个 turn 开始；它以 completed、cancelled 或 failed 三种结果之一结束，并且只能结束一次。同一个 runtime 同时只能存在一个活动 turn。
 
@@ -73,7 +81,7 @@ Runtime 对 model steps 和 tool calls 执行可配置的数量限制。超过�
 
 一个逻辑 step 可以有多次执行 attempt。瞬时失败不会创建新的 turn，也不会把失败的 attempt 伪装成新的 conversation message。Runtime 保持原有 turn ID 和 step ID，并为每次尝试分配新的 attempt ID。
 
-### 稳定提交点与可重入执行
+## 为什么需要稳定提交点
 
 Runtime 只能从稳定提交点恢复执行。稳定提交点是 canonical conversation 中最后一个完整、协议有效的状态，包括：
 
@@ -88,7 +96,7 @@ Runtime 的执行接口在语义上是可重入的：它可以根据 turn execut
 
 同一个 turn 同时只能有一个执行者。Runtime 通过锁、lease 或 revision check 防止两个任务并发推进同一 turn，并在追加 committed state 时验证预期的 conversation head。
 
-### Conversation 与 execution journal
+## Conversation 不能代替 execution journal
 
 Canonical conversation 记录模型已经知道的内容，但不足以表示 runtime 已经执行过的外部动作。Runtime 因此还维护最小的 turn execution journal，用于记录：
 
@@ -102,7 +110,7 @@ Turn phase 至少能够表达 awaiting model、executing tools、waiting to retr
 
 跨进程恢复、journal 的 write-ahead 顺序和文件格式由 [D0005：执行 Journal 与 Session 恢复](d0005-execution-journal-and-session-recovery.md) 定义。
 
-### 组件边界
+## 组件怎样协作
 
 ```text
                          Provider
@@ -124,7 +132,7 @@ Turn phase 至少能够表达 awaiting model、executing tools、waiting to retr
 
 Provider adapter 不执行工具，也不发布 UI events。工具不向 conversation 追加消息。用户界面不决定一个 model step 是否应当继续。
 
-### Runtime events
+## Events 只用于观察
 
 Events 描述有意义的生命周期变化，而不是 provider wire chunks。事件类型至少必须区分：
 
@@ -141,7 +149,7 @@ Events 描述有意义的生命周期变化，而不是 provider wire chunks。�
 
 事件投递仅用于观察。缓慢或失败的展示端不得改变 conversation 语义。实现阶段可以调整背压和投递机制，但必须保留这项原则。
 
-### 取消与错误
+## 取消与错误
 
 取消从 runtime 边界发起，并传播给活动的 provider stream 和工具执行。取消只产生一次最终 turn outcome，不能被静默地视为成功完成。
 
@@ -176,28 +184,3 @@ Streaming deltas 用于提升响应性，committed messages 用于确保协议�
 对于未提交的 model step，committed conversation 通常足以构造一次新的 provider attempt。模型调用不是确定性重放，因此 runtime 只保证协议与因果状态一致，不保证新 attempt 产生相同内容。
 
 工具调用可能改变外部世界。仅凭缺少 tool result 的 history，无法区分“尚未执行”和“已经执行但结果未提交”。增加 execution journal 会提高 runtime 的状态复杂度，但这是安全重入和未来持久化恢复所必需的边界。
-
-## 迁移
-
-引入 runtime 不要求同时添加其他 provider 或替换 TUI。
-
-1. 引入 provider 无关的 conversation、turn execution state、turn outcome、error 和 event 类型。
-2. 将现有 DeepSeek client 适配到 `Provider` 边界。
-3. 把模型与工具的继续循环从 `Session` 移入 `AgentRuntime`。
-4. 让 runtime 跨调用持有 conversation。
-5. 将 TUI 改为事件消费者，并删除从 UI history 重建 provider messages 的逻辑。
-6. 在扩展工具集之前，使用 fake providers 和 fake tools 添加确定性测试，包括 model-step retry、重复进入和结果未知的工具执行。
-
-迁移期间可以通过兼容 adapter 暴露现有 UI 类型，但不能存在两个可独立修改的 canonical histories。
-
-## 当前实现状态
-
-`AgentRuntime` 已接管真实 turn lifecycle，并成为 canonical conversation 的唯一写入者。
-
-- user、assistant tool calls 和 tool results 跨 turn 保存在 `Conversation`，TUI history 只做展示投影。
-- model step 使用稳定 `StepId` 和 conversation revision；retry/resume 使用新 `AttemptId`，失败 draft 不提交。
-- provider failure 后 active turn 保留在进程内，`resume_turn` 从稳定提交点重入；TUI 可用 `Ctrl+R` 触发。
-- model、tool 和 turn completion 已拆成不同的 `RuntimeEvent`。
-- 取消通过 `CancellationToken` 传入 provider 与 tools。
-
-尚未实现独立 execution journal 与磁盘持久化；对应的 crash recovery、tool outcome unknown 人工决议与完整 crash-safe reentry 已由 D0005 设计，仍待实现。

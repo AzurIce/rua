@@ -6,6 +6,16 @@ Rua 当前的 TUI 是一个可运行的原型：`main.rs` 同时负责终端模�
 
 [D0001：Agent Runtime 与会话所有权](d0001-agent-runtime.md) 已规定 TUI 不是 canonical conversation 的所有者；[D0002：Provider 边界与标准消息模型](d0002-provider-model.md) 已规定 provider wire chunks 不能直接成为 UI 的长期状态。本设计继续定义 terminal 到 display projection 之间的边界。
 
+从数据流看，TUI 只有三条单向路径：
+
+```text
+terminal events  -> input actions      -> runtime commands
+runtime events   -> display projection -> frame + cursor intent
+local UI actions -> composer / focus / viewport
+```
+
+键盘输入不能直接修改 conversation，runtime event 不能反向变成 command，本地光标和 viewport 也不应进入业务状态。这比某个具体 widget 或 event enum 更耐久。
+
 对 Codex 与 pi 的调查得到三个直接结论：
 
 - Codex 在 terminal event 边界过滤 key release，将 paste 与 key 分流，并使用独立 textarea 维护 Unicode cursor 与显示宽度。
@@ -235,61 +245,6 @@ Bracketed paste payload 直接插入 composer，并保留换行。无 bracketed 
 - panic unwind：guard 尽力恢复；后续增加 panic hook 覆盖 guard 之前或多线程异常路径；
 - 外部编辑器/交互子进程：暂停 event source，恢复 terminal，子进程结束后重新探测 size/capabilities 并 redraw。
 
-## 测试策略
-
-### 纯单元测试
-
-- grapheme movement/delete：CJK、combining marks、ZWJ emoji、regional indicators；
-- byte boundary 与 viewport cell width 不变量；
-- key release normalization；
-- paste 原子性；
-- keymap 不吞普通字符；
-- projection 对重复/迟到 runtime event 的处理。
-
-### 渲染测试
-
-使用 Ratatui `TestBackend` 验证 buffer 和 cursor position，覆盖窄窗口、双宽字符、resize、scroll 与 overlay。若引入 terminal diff 优化，再添加真实 ANSI output snapshot，特别验证 wide grapheme 后的 clear-to-end。
-
-### 集成与实机测试
-
-- 伪 terminal event source 驱动 controller，不依赖真实 stdin；
-- fake runtime 验证 submit/cancel/retry command；
-- PTY/ConPTY smoke tests 验证模式进入与恢复；
-- Windows IME 测试保留事件 trace 和最终 committed text，明确区分“自动测试覆盖”和“人工验证”。
-
-## 迁移计划
-
-### Phase A：输入与 terminal 基础
-
-本设计首个实现切片：
-
-- 对齐到单一 Crossterm 0.29 依赖；
-- 增加 `TerminalSession`；
-- 增加规范化 `TuiEvent`，过滤 release 并分离 paste；
-- 增加独立、grapheme-safe `Composer`；
-- 使用 display-width-aware 水平 viewport 与真实硬件光标；
-- 修复裸 `r` 吞字快捷键。
-
-### Phase B：Controller 与 runtime projection
-
-- 用 D0001 runtime commands/events 替换 `Session -> UiEvent`；（已完成）
-- 将 `AppState.history` 拆为可重建 projection；
-- 引入 `InputAction`、turn-aware commands 与 cancel/retry；
-- 分离 terminal/runtime/frame 输入源。
-
-### Phase C：完整 composer 与调度
-
-- 多行编辑、visual-line layout cache、vertical navigation；
-- history、undo/redo、paste placeholders；
-- dirty-frame coalescing 和 stream delta 背压；
-- overlay/focus stack 与 context keymap。
-
-### Phase D：平台后端
-
-- Windows event trace 与测试矩阵；
-- VT/legacy/cooked backend 决策；
-- suspend/resume、inline mode、external editor；
-- capability negotiation 与配置。
 
 ## 重要决策与权衡
 
@@ -308,7 +263,3 @@ Codex TextArea 已覆盖大量编辑语义，但与其 placeholders、paste burs
 ### 先使用单行 viewport
 
 真实光标和 Unicode 正确性优先于立即实现完整多行编辑器。单个可视编辑行和水平 viewport 能建立正确的坐标与边界模型，并安全展示 multiline paste 的 cursor 所在行；后续多行能力复用同一 Composer，而不是继续在 render 中拼字符串。
-
-## 当前实现状态
-
-Phase A 已完成。Phase B 已完成 runtime event 接线和单一 canonical history：`AppState` 只消费 `RuntimeEvent`，不再构造 provider messages；provider failure 后可通过 `Ctrl+R` 请求 `resume_turn`。完整 `AppController`、`InputAction`、cancel command、独立事件源优先级和 dirty-frame scheduler 仍未实现。

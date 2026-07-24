@@ -8,6 +8,8 @@
 
 本设计定义一个与 canonical conversation 并列、可持久化的 execution journal。它记录事实性执行状态和恢复决策，而不作为模型消息发送。
 
+因此，session persistence 的目标不是“尽量恢复一些 UI”，而是在重启后不对外部世界撒谎。只要 Rua 不能证明一个动作尚未开始、已经完成或明确失败，就不能为了让 agent loop 看起来连续而猜测一个 tool result。
+
 ## 目标
 
 - 让 committed conversation、turn 控制状态和工具执行事实在进程重启后可恢复。
@@ -28,7 +30,7 @@
 
 Journal 只能保证 Rua 自己的记录和恢复决策可靠。对于不支持 idempotency key 的外部系统，无法把“进程在请求发出后崩溃”变成真正的 exactly-once。
 
-## 核心模型
+## Session 由什么组成
 
 ```text
                  committed conversation
@@ -84,7 +86,7 @@ enum TurnPhase {
 
 这是逻辑形状，不要求一开始把它作为单个 JSON 文件直接序列化。持久化真相是 snapshot 加 append-only journal；上述状态由 replay 构建。
 
-## Journal record
+## Journal 记录状态转换，不是调试日志
 
 每条 record 包含：
 
@@ -117,7 +119,7 @@ SnapshotCreated { last_sequence }
 
 `ConversationAppended` 是 canonical message 的 durable source；`AssistantCommitted` 和 `ToolResultCommitted` 是便于恢复索引和状态机校验的语义 marker，必须与对应 message/revision 一致，不能独立制造消息。
 
-## 原子性与写入顺序
+## 哪些边界必须先落盘
 
 ### 普通 committed conversation
 
@@ -157,21 +159,20 @@ assistant tool call 已 committed
 
 `ToolOutcomeRecorded` 对 `Completed` 和 `FailedKnown` 必须携带完整、已截断的 result content 与 `is_error`，以便崩溃后无需重跑工具就能补写同一个 `ToolResultMessage`。若 outcome 记录同步失败，runtime 必须把该执行升级为 `OutcomeUnknown`，不能声称已知成功。
 
-## 工具重放类别与恢复决策
+## 何时可以重放
 
 Tool definition 在现有 schema 之外增加 replay metadata：
 
 ```rust
 enum ReplayClass {
     ReadOnly,
-    Idempotent,
+    Idempotent { key_source: String },
     Effectful,
-    IdempotencyKey { field: String },
     Unknown,
 }
 ```
 
-首版 `bash` 一律是 `Unknown`：即使模型输入看似 `ls`，runtime 不解析 shell 文本来猜测副作用。未来单独定义的 `read_file` 才能标为 `ReadOnly`，带稳定远端 idempotency key 的写操作可标为 `IdempotencyKey`。
+首版 `bash` 一律是 `Unknown`：即使模型输入看似 `ls`，runtime 不解析 shell 文本来猜测副作用。未来单独定义的 `read_file` 才能标为 `ReadOnly`；具有稳定远端 idempotency key 的写操作可标为 `Idempotent`，并说明 key 从哪个参数或 runtime identity 派生。自动重放仍需同时满足工具契约和 journal 证据，不能只看分类。
 
 | 恢复时观察到的 durable 状态 | 自动动作 |
 | --- | --- |
@@ -212,7 +213,7 @@ enum ReplayClass {
 
 全局 session 浏览、项目外 session、导入/导出和用户可配置存放位置属于配置设计，不在本设计中决定。
 
-## 恢复流程
+## 恢复不是“尽力继续”
 
 ```text
 open session + acquire writer lock
@@ -242,37 +243,3 @@ trait SessionStore: Send + Sync {
 ```
 
 store append failure是 runtime failure，不可继续执行可能产生副作用的 tool。UI 接收 `SessionRecovered`、`RecoveryRequired`、`PersistenceFailed` 等 runtime events，投影为状态和明确 command；UI 不解析 journal 文件，也不自行推断 retry。
-
-## Compatibility、迁移与版本
-
-- `schema_version` 只允许向前读取；未知主版本拒绝写入，提供只读导出。
-- migration 是 `old snapshot + old WAL -> new temporary session files -> validate -> atomic switch`，原文件保留到验证成功。
-- canonical message/opaque provider state 的 version 与 journal format version 分开管理。
-- session恢复时验证 tool name 与 schema/version metadata；工具已卸载时不执行，进入 reconciliation，而不是用同名新工具猜测替代。
-
-## 测试策略
-
-使用内存 store 和 fault-injecting file store，在每一个 durable record 后模拟崩溃：
-
-- user、assistant、tool result commit 前后的 replay 等价性；
-- 同一 model step 的 retry 保持 revision/step identity，attempt 新建；
-- `Started` 后崩溃绝不自动执行 effectful/unknown tool；
-- recorded known outcome 恢复后只提交一次 result；
-- 半行、checksum 错误、sequence gap、snapshot/WAL 不一致；
-- writer lock 冲突和 unlock 后恢复；
-- Windows rename/锁行为的集成测试；
-- secret 不出现在 manifest、diagnostic 或 panic message。
-
-必须以 property/state-machine tests 覆盖“任意 journal 前缀恢复后，不会产生重复 committed message 或未经确认的 effectful tool replay”。
-
-## 实施切片
-
-1. 定义 `SessionStore`、journal types、in-memory store，并让 runtime 的状态转换经过该端口。
-2. 为 tool intent/start/outcome/result 建立 write-ahead 顺序，用 deterministic fake tool 覆盖 crash points。
-3. 实现本地 snapshot + WAL、file lock、校验与 recovery report。
-4. 将 `resume_turn` 扩展为从 `RecoveredSession` 恢复，并新增 reconciliation commands/events。
-5. 最后添加 session 列表、CLI 选择、checkpoint/compaction 和配置入口。
-
-## 当前状态
-
-本文件是 active design，尚未实现。当前 `AgentRuntime` 只保留进程内 active turn；model failure 可以在进程存活时重试或 resume，但进程退出后不会恢复 conversation、attempt 或 tool execution state。

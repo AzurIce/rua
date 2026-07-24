@@ -6,6 +6,8 @@ Rua 当前使用 `deepseek.rs` 中的 `Message`、`ToolCall` 和 `StreamEvent` �
 
 [D0001：Agent Runtime 与会话所有权](d0001-agent-runtime.md) 确立了 `AgentRuntime` 对 canonical conversation 和 turn lifecycle 的所有权。本文进一步定义 runtime 与 provider 之间共享的标准模型：conversation 保存什么、provider 接收什么、流式响应如何完成，以及 provider 特有状态如何在不污染核心模型的情况下保留下来。
 
+Provider 是 adapter，不是 Rua 的 domain model。这不等于取所有供应商能力的最小交集：canonical model 保留 agent loop 真正依赖的语义，无法安全标准化的能力则通过有作用域的 opaque state 往返。这样既能跨 provider 延续 conversation，也不会让某一家 SDK 的 message enum 变成 runtime 的事实来源。
+
 ## 目标
 
 - 定义 provider 无关且可无损扩展的 canonical conversation。
@@ -29,6 +31,8 @@ Rua 当前使用 `deepseek.rs` 中的 `Message`、`ToolCall` 和 `StreamEvent` �
 - 图片、音频等非文本模态的首版实现。
 
 ## Canonical conversation
+
+Conversation 只包含已经提交、下一次请求必须再次成立的事实。stream 中尚未完成的文本、reasoning delta 和半截 tool arguments 属于 provisional response；它们可以被 UI 看见，却不能提前成为 committed message。只有 response 完整结束并通过结构校验后，runtime 才一次性追加 assistant message。
 
 Canonical conversation 由 instruction set、按提交顺序排列的 messages，以及单调递增的 revision 构成。
 
@@ -281,26 +285,3 @@ Provider 给出 retry hint，runtime 决定是否实际重试。Hint 可以表�
 - adapter 的有损转换必须产生 diagnostics，不能静默改变工具对应关系。
 
 是否允许用户在活动 turn 中切换 model 或 provider 由 AgentRuntime 与配置设计决定。本设计只保证已完成历史具有明确的转换规则。
-
-## 迁移
-
-1. 在新的 agent/provider-neutral 模块中引入 ID、conversation、message、part、usage、stop reason 和 provider error 类型。
-2. 为 `DeepSeekClient` 增加 `Provider` adapter，把 SSE chunks 转换为标准 `ProviderEvent`。
-3. 在 runtime 中实现 response draft accumulator 和 completion validation。
-4. 删除从 `ChatEntry` 到 DeepSeek `Message` 的 conversation 重建路径。
-5. 让 DeepSeek wire structs 留在 adapter 内部，不再被 session、runtime 或 TUI 导入。
-6. 使用 scripted fake provider 覆盖文本完成、tool calls、reasoning state、stream interruption、invalid arguments 和 retryable failure。
-
-迁移期间可以暂时保留旧 `DeepSeekClient::chat_stream`，但新的 canonical conversation 与旧 UI history 不能同时成为可修改的会话真相源。
-
-## 当前实现状态
-
-本文定义的 provider-neutral 模型已经接入 DeepSeek/TUI 运行链路。
-
-- `src/agent/deepseek.rs` 将 canonical messages/tools 编译为 DeepSeek chat-completions wire format，并把 SSE 映射为标准事件。
-- `ResponseAccumulator` 是 assistant message 提交前的唯一 completion validator；无 terminal、无效 tool JSON 和 stream failure 不进入 conversation。
-- `AgentRuntime` 根据结构化 `ProviderError` 和 `RetryHint` 决定同 step retry。
-- `ChatEntry` 不再被转换回 provider messages，reasoning 与 tool relationship 由 canonical model 保存。
-- scripted provider 测试覆盖同 step retry、进程内 resume 和 tool follow-up snapshot。
-
-仍待补齐 provider diagnostics、精确 usage/response provenance、更多 DeepSeek SSE fixture、跨 provider 转换测试和实际第二个 provider adapter。
