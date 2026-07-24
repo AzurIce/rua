@@ -1,25 +1,26 @@
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::app::state::{
-    AppState, AppStatus, BG, BG_PANEL, TEXT, TEXT_MUTED, BORDER, PRIMARY, USER_ACCENT,
-    AI_ACCENT, SYSTEM_ACCENT, SPINNER_FRAMES, SUCCESS,
+    AI_ACCENT, AppState, AppStatus, BG, BG_PANEL, BORDER, PRIMARY, SPINNER_FRAMES, SUCCESS,
+    SYSTEM_ACCENT, TEXT, TEXT_MUTED, USER_ACCENT,
 };
 use crate::model::Role;
 
 pub fn draw(state: &AppState, frame: &mut Frame) {
     let area = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(BG)),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
         .margin(1)
         .split(area);
 
@@ -46,12 +47,16 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
         if let Some(label) = label {
             lines.push(Line::from(vec![
                 Span::styled("┃ ", Style::default().fg(accent)),
-                Span::styled(label, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    label,
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
             ]));
         } else {
-            lines.push(Line::from(vec![
-                Span::styled("┃ ", Style::default().fg(SYSTEM_ACCENT)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "┃ ",
+                Style::default().fg(SYSTEM_ACCENT),
+            )]));
         }
 
         for line in crate::app::state::wrap_paragraph(&entry.text, content_width.max(1)) {
@@ -62,30 +67,43 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
         }
 
         // Render reasoning content for Assistant entries
-        if entry.role == Role::Assistant {
-            if let Some(ref reasoning) = entry.reasoning_content {
-                if entry.reasoning_expanded {
+        if entry.role == Role::Assistant
+            && let Some(ref reasoning) = entry.reasoning_content
+        {
+            if entry.reasoning_expanded {
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
+                    Span::styled(
+                        "💭 thinking:",
+                        Style::default()
+                            .fg(TEXT_MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+                for line in crate::app::state::wrap_paragraph(reasoning, content_width.max(1)) {
                     lines.push(Line::from(vec![
                         Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
-                        Span::styled("💭 thinking:", Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC)),
-                    ]));
-                    for line in crate::app::state::wrap_paragraph(reasoning, content_width.max(1)) {
-                        lines.push(Line::from(vec![
-                            Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
-                            Span::styled(line, Style::default().fg(TEXT_MUTED)),
-                        ]));
-                    }
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
-                        Span::styled("💭 ▶ thinking... (press r to expand)", Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC)),
+                        Span::styled(line, Style::default().fg(TEXT_MUTED)),
                     ]));
                 }
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
+                    Span::styled(
+                        "💭 ▶ thinking... (press Ctrl+R to expand)",
+                        Style::default()
+                            .fg(TEXT_MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
             }
         }
     }
 
-    if state.is_streaming || !state.current_response.is_empty() || !state.current_reasoning.is_empty() {
+    if state.is_streaming
+        || !state.current_response.is_empty()
+        || !state.current_reasoning.is_empty()
+    {
         lines.push(Line::from(""));
         let icon = if state.is_streaming {
             SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string()
@@ -94,12 +112,17 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", icon), Style::default().fg(AI_ACCENT)),
-            Span::styled("AI", Style::default().fg(AI_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "AI",
+                Style::default().fg(AI_ACCENT).add_modifier(Modifier::BOLD),
+            ),
         ]));
 
         // Show reasoning content in real-time during streaming
         if !state.current_reasoning.is_empty() {
-            for line in crate::app::state::wrap_paragraph(&state.current_reasoning, content_width.max(1)) {
+            for line in
+                crate::app::state::wrap_paragraph(&state.current_reasoning, content_width.max(1))
+            {
                 lines.push(Line::from(vec![
                     Span::styled("┃ ", Style::default().fg(TEXT_MUTED)),
                     Span::styled(line, Style::default().fg(TEXT_MUTED)),
@@ -107,7 +130,8 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
             }
         }
 
-        for line in crate::app::state::wrap_paragraph(&state.current_response, content_width.max(1)) {
+        for line in crate::app::state::wrap_paragraph(&state.current_response, content_width.max(1))
+        {
             lines.push(Line::from(vec![
                 Span::styled("┃ ", Style::default().fg(AI_ACCENT)),
                 Span::styled(line, Style::default().fg(TEXT)),
@@ -115,17 +139,11 @@ fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_widt
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).scroll((state.scroll_offset, 0)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).scroll((state.scroll_offset, 0)), area);
 }
 
 fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
-    frame.render_widget(
-        Block::default().style(Style::default().bg(BG_PANEL)),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(BG_PANEL)), area);
 
     let spinner = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
     let icon = match state.status {
@@ -159,26 +177,33 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
 }
 
 fn render_input(state: &AppState, frame: &mut Frame, area: Rect) {
-    let prompt = Span::styled("> ", Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD));
-    let content = if state.input.is_empty() {
+    let inner = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    let prompt_width = 2;
+    let editor_width = inner.width.saturating_sub(prompt_width);
+    let viewport = state.composer.viewport(editor_width);
+    let prompt = Span::styled(
+        "> ",
+        Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+    );
+    let content = if state.composer.is_empty() {
         Text::from(vec![Line::from(vec![
             prompt,
             Span::styled(
                 "Type a message...",
-                Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(TEXT_MUTED)
+                    .add_modifier(Modifier::ITALIC),
             ),
         ])])
     } else {
-        let text = if state.input_cursor >= state.input.len() {
-            format!("{} ", state.input)
-        } else {
-            let before = &state.input[..state.input_cursor];
-            let after = &state.input[state.input_cursor..];
-            format!("{} {}", before, after)
-        };
         Text::from(vec![Line::from(vec![
             prompt,
-            Span::styled(text, Style::default().fg(TEXT)),
+            Span::styled(viewport.text, Style::default().fg(TEXT)),
         ])])
     };
 
@@ -192,4 +217,37 @@ fn render_input(state: &AppState, frame: &mut Frame, area: Rect) {
             .style(Style::default().bg(BG_PANEL)),
         area,
     );
+
+    if inner.width > prompt_width && inner.height > 0 {
+        let cursor_x = inner
+            .x
+            .saturating_add(prompt_width)
+            .saturating_add(viewport.cursor_column)
+            .min(inner.right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, inner.y));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{
+        Terminal,
+        backend::{Backend, TestBackend},
+    };
+
+    use super::*;
+
+    #[test]
+    fn draw_places_the_hardware_cursor_after_wide_text() {
+        let mut state = AppState::new();
+        state.composer.insert_str("你a");
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+
+        terminal.draw(|frame| draw(&state, frame)).unwrap();
+
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            Position::new(6, 5)
+        );
+    }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
-use color_eyre::{eyre::Context, Result};
+use color_eyre::{Result, eyre::Context};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 
@@ -45,9 +45,7 @@ fn default_model() -> String {
 /// - If starts with "!", execute the rest as a shell command and use stdout (cached)
 /// - Otherwise, try as env var name first, then treat as literal
 pub fn resolve_value(value: &str) -> Result<String> {
-    if value.starts_with('!') {
-        let command = &value[1..];
-
+    if let Some(command) = value.strip_prefix('!') {
         // Check cache first
         {
             let cache = COMMAND_CACHE.lock().unwrap();
@@ -56,9 +54,7 @@ pub fn resolve_value(value: &str) -> Result<String> {
             }
         }
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        let output = config_shell(command)
             .output()
             .with_context(|| format!("failed to execute shell command: {}", command))?;
 
@@ -83,6 +79,26 @@ pub fn resolve_value(value: &str) -> Result<String> {
         // Try environment variable first, then literal
         Ok(env::var(value).unwrap_or_else(|_| value.to_string()))
     }
+}
+
+#[cfg(windows)]
+fn config_shell(command: &str) -> Command {
+    let mut process = Command::new("powershell");
+    process.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        command,
+    ]);
+    process
+}
+
+#[cfg(not(windows))]
+fn config_shell(command: &str) -> Command {
+    let mut process = Command::new("sh");
+    process.args(["-c", command]);
+    process
 }
 
 impl Config {

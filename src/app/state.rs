@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
+use crate::agent::{AssistantPart, RuntimeEvent};
 use crate::model::{ChatEntry, Role};
+use crate::tui::Composer;
 
 // === opencode-inspired theme ===
 pub(crate) const BG: ratatui::style::Color = ratatui::style::Color::Rgb(10, 10, 10);
@@ -55,8 +57,7 @@ impl AppStatus {
 
 /// The main application state (pure data + state transitions)
 pub struct AppState {
-    pub input: String,
-    pub input_cursor: usize,
+    pub composer: Composer,
     pub(crate) history: VecDeque<ChatEntry>,
     pub current_response: String,
     /// Accumulates reasoning_content from DeepSeek reasoning models.
@@ -67,13 +68,13 @@ pub struct AppState {
     pub status: AppStatus,
     pub spinner_frame: usize,
     pub token_count: usize,
+    pub can_resume_turn: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
-            input: String::new(),
-            input_cursor: 0,
+            composer: Composer::new(),
             history: VecDeque::new(),
             current_response: String::new(),
             current_reasoning: String::new(),
@@ -83,12 +84,8 @@ impl AppState {
             status: AppStatus::Idle,
             spinner_frame: 0,
             token_count: 0,
+            can_resume_turn: false,
         }
-    }
-
-    /// Return a clone of history entries for the session layer.
-    pub fn history_entries(&self) -> Vec<ChatEntry> {
-        self.history.iter().cloned().collect()
     }
 
     pub fn add_system_message(&mut self, text: &str) {
@@ -102,25 +99,110 @@ impl AppState {
     }
 
     pub fn submit_input(&mut self) -> Option<String> {
-        let text = self.input.trim().to_string();
+        let text = self.composer.text().trim().to_string();
         if text.is_empty() {
             return None;
         }
-        self.history.push_back(ChatEntry {
-            role: Role::User,
-            text: text.clone(),
-            tool_call_id: None,
-            reasoning_content: None,
-            reasoning_expanded: false,
-        });
-        self.input.clear();
-        self.input_cursor = 0;
+        self.composer.clear();
         self.current_response.clear();
         self.current_reasoning.clear();
         self.is_streaming = true;
         self.status = AppStatus::Sending;
         self.token_count = 0;
         Some(text)
+    }
+
+    pub fn begin_resume(&mut self) {
+        self.can_resume_turn = false;
+        self.current_response.clear();
+        self.current_reasoning.clear();
+        self.is_streaming = true;
+        self.status = AppStatus::Waiting;
+    }
+
+    pub fn apply_runtime_event(&mut self, event: &RuntimeEvent) {
+        match event {
+            RuntimeEvent::UserCommitted { text, .. } => {
+                self.history.push_back(ChatEntry {
+                    role: Role::User,
+                    text: text.clone(),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning_expanded: false,
+                });
+                self.is_streaming = true;
+                self.status = AppStatus::Sending;
+                self.can_resume_turn = false;
+            }
+            RuntimeEvent::ModelStepStarted { .. } => {
+                self.current_response.clear();
+                self.current_reasoning.clear();
+                self.status = AppStatus::Waiting;
+            }
+            RuntimeEvent::TextDelta { delta, .. } => self.append_delta(delta),
+            RuntimeEvent::ReasoningDelta { delta, .. } => self.append_reasoning_delta(delta),
+            RuntimeEvent::ModelStepRetrying { .. } => {
+                self.current_response.clear();
+                self.current_reasoning.clear();
+                self.status = AppStatus::Waiting;
+            }
+            RuntimeEvent::AssistantCommitted { message, .. } => {
+                let mut text = String::new();
+                let mut reasoning = String::new();
+                for part in &message.parts {
+                    match part {
+                        AssistantPart::Text(part) => text.push_str(&part.text),
+                        AssistantPart::Reasoning(part) => {
+                            if let Some(value) = &part.text {
+                                reasoning.push_str(value);
+                            }
+                        }
+                        AssistantPart::ToolCall(_) => {}
+                    }
+                }
+                if !text.trim().is_empty() {
+                    self.history.push_back(ChatEntry {
+                        role: Role::Assistant,
+                        text: text.trim().to_owned(),
+                        tool_call_id: None,
+                        reasoning_content: (!reasoning.trim().is_empty())
+                            .then(|| reasoning.trim().to_owned()),
+                        reasoning_expanded: false,
+                    });
+                }
+                self.current_response.clear();
+                self.current_reasoning.clear();
+                self.status = AppStatus::Waiting;
+            }
+            RuntimeEvent::ToolStarted {
+                name, arguments, ..
+            } => {
+                self.add_tool_call(name, &arguments.to_string());
+            }
+            RuntimeEvent::ToolCompleted { content, .. } => self.add_tool_result("", content),
+            RuntimeEvent::ToolFailed { message, .. } => {
+                self.add_tool_result("", &format!("Error: {message}"));
+            }
+            RuntimeEvent::TurnCompleted { .. } => self.finish_stream(),
+            RuntimeEvent::TurnFailed {
+                error, recoverable, ..
+            } => {
+                self.current_response.clear();
+                self.current_reasoning.clear();
+                self.is_streaming = false;
+                self.status = AppStatus::Idle;
+                self.token_count = 0;
+                self.can_resume_turn = *recoverable;
+                self.history.push_back(ChatEntry {
+                    role: Role::System,
+                    text: format!("Error: {error}"),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning_expanded: false,
+                });
+            }
+            RuntimeEvent::TurnCancelled { .. } => {}
+        }
     }
 
     pub fn add_tool_call(&mut self, name: &str, arguments: &str) {
@@ -200,17 +282,15 @@ impl AppState {
     }
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ------------------------------------------------------------------
 // Text helpers (used by render)
 // ------------------------------------------------------------------
-
-/// Walk backwards from `idx` to the nearest UTF-8 char boundary.
-pub(crate) fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
 
 /// Wrap a single line of text to a maximum display width (in columns).
 pub(crate) fn wrap_line(text: &str, max_width: usize) -> Vec<String> {
