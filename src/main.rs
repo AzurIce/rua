@@ -1,23 +1,31 @@
+use std::collections::VecDeque;
 use std::io::stdout;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use color_eyre::Result;
-use crossterm::event::{EventStream, KeyCode, KeyModifiers};
+use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use rua::agent::{
-    AgentRuntime, ApiFamily, BashTool, DeepSeekProvider, ModelRef, ProviderId, ToolRegistry,
+    AgentRuntime, ApiFamily, ApprovalMode, BashTool, DeepSeekProvider, LocalSessionStore, ModelRef,
+    ProviderId, ReconciliationDecision, RuntimeEvent, SessionId, ToolCallId, ToolRegistry,
+    register_coding_tools,
 };
-use rua::app::{App, UiEvent};
+use rua::app::{App, AppCommand, AppController, FrameScheduler, UiEvent};
 use rua::config::Config;
-use rua::tui::{TerminalSession, TuiEvent};
+use rua::tui::{InputTrace, TerminalSession, TuiEvent};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    let options = startup_options()?;
+    if let Some(action) = &options.maintenance {
+        run_maintenance(action).await?;
+        return Ok(());
+    }
 
     let config = Config::load().unwrap_or_else(|e| {
         eprintln!("Warning: failed to load config: {}", e);
@@ -34,28 +42,44 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let _terminal_session = TerminalSession::enter()?;
-    run_app(config).await
+    let terminal_session = TerminalSession::enter()?;
+    let app_result = run_app(config, options).await;
+    let restore_result = terminal_session.leave();
+    match (app_result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
-async fn run_app(config: Config) -> Result<()> {
+async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
+    let project_root = std::env::current_dir()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     // UI state
     let mut app = App::new();
     app.add_system_message("rua ready");
+    let mut controller = AppController::new(app);
 
-    // Event channel
-    let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+    // Terminal input is kept separate from runtime projection events so input
+    // and cancellation can remain responsive under a delta-heavy stream.
+    let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel::<UiEvent>();
 
     // Background: crossterm events
-    let tx_crossterm = tx.clone();
+    let tx_crossterm = terminal_tx;
     let mut event_reader = EventStream::new();
+    let mut input_trace = InputTrace::from_env(&project_root)?;
     tokio::spawn(async move {
         loop {
             match event_reader.next().await {
                 Some(Ok(event)) => {
+                    if input_trace
+                        .as_mut()
+                        .is_some_and(|trace| trace.record(&event).is_err())
+                    {
+                        input_trace = None;
+                    }
                     let Some(event) = TuiEvent::from_crossterm(event) else {
                         continue;
                     };
@@ -77,118 +101,515 @@ async fn run_app(config: Config) -> Result<()> {
         }
     });
 
-    // Background: tick timer (spinner animation)
-    let tx_tick = tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(80));
-        loop {
-            interval.tick().await;
-            if tx_tick.send(UiEvent::Tick).is_err() {
-                break;
-            }
-        }
-    });
-
     // Agent core: canonical conversation, provider adapter and tool runtime.
     let provider = Arc::new(DeepSeekProvider::new(&config.deepseek)?);
     let mut tools = ToolRegistry::new();
-    tools.register(BashTool::default())?;
-    let runtime = Arc::new(AgentRuntime::new(
-        provider,
-        Arc::new(tools),
-        "You are rua, an AI coding agent.",
-        ModelRef {
-            provider: ProviderId::new("deepseek"),
-            api_family: ApiFamily::new("openai-chat"),
-            model: config.deepseek.model.clone(),
-        },
-    ));
+    tools.register(BashTool::for_workspace(&project_root)?)?;
+    register_coding_tools(&mut tools, &project_root)?;
+    let tools = Arc::new(tools);
+    let model = ModelRef {
+        provider: ProviderId::new("deepseek"),
+        api_family: ApiFamily::new("openai-chat"),
+        model: config.deepseek.model.clone(),
+    };
+    let store = Arc::new(LocalSessionStore::new(project_root));
+    let recovered = options.session.is_some();
+    let runtime = Arc::new(
+        (if let Some(session_id) = options.session {
+            AgentRuntime::recover(provider, tools, model, store, session_id).await?
+        } else {
+            AgentRuntime::new(provider, tools, "You are rua, an AI coding agent.", model)
+                .with_session_store(store)
+        })
+        .with_approval_mode(options.approval),
+    );
+    if !recovered {
+        controller
+            .state_mut()
+            .add_system_message(&format!("session {}", runtime.session_id()));
+    }
     let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
-    let tx_runtime = tx.clone();
-    tokio::spawn(async move {
-        while let Some(event) = runtime_rx.recv().await {
-            if tx_runtime.send(UiEvent::Runtime(event)).is_err() {
-                break;
-            }
-        }
-    });
+    if recovered {
+        runtime.publish_recovery(&runtime_tx).await;
+    }
 
-    let mut stream_task: Option<(
-        tokio::task::JoinHandle<()>,
-        tokio_util::sync::CancellationToken,
-    )> = None;
+    let mut stream_task: Option<StreamTask> = None;
+    let mut runtime_buffer = VecDeque::new();
 
+    let mut frames = FrameScheduler::new(tokio::time::Instant::now());
     loop {
-        terminal.draw(|f| rua::app::render::draw(&app, f))?;
+        let now = tokio::time::Instant::now();
+        if frames.should_draw(now) {
+            terminal.draw(|frame| rua::app::render::draw(controller.state(), frame))?;
+            frames.frame_drawn(now);
+        }
 
-        let Some(event) = rx.recv().await else {
+        let animated = controller.state().status != rua::app::AppStatus::Idle;
+        let deadline = frames.deadline(tokio::time::Instant::now(), animated);
+        let mut deadline_fired = false;
+        let event = tokio::select! {
+            biased;
+            event = terminal_rx.recv() => event,
+            event = async { runtime_buffer.pop_front() }, if !runtime_buffer.is_empty() => {
+                event.map(UiEvent::Runtime)
+            }
+            event = runtime_rx.recv() => {
+                if let Some(event) = event {
+                    merge_runtime_event(&mut runtime_buffer, event);
+                    drain_runtime_events(&mut runtime_rx, &mut runtime_buffer);
+                }
+                runtime_buffer.pop_front().map(UiEvent::Runtime)
+            }
+            _ = wait_for_deadline(deadline) => {
+                deadline_fired = true;
+                None
+            }
+        };
+        if deadline_fired {
+            let now = tokio::time::Instant::now();
+            if frames.on_deadline(now, animated) {
+                controller.advance_spinner();
+                frames.request_frame();
+            }
+            continue;
+        }
+        let Some(event) = event else {
             break Ok(());
         };
-
-        match event {
-            UiEvent::Tick => {
-                if app.status != rua::app::AppStatus::Idle {
-                    app.spinner_frame = app.spinner_frame.wrapping_add(1);
+        for command in controller.handle(event) {
+            match command {
+                AppCommand::SubmitUserInput(text) => {
+                    stream_task = Some(spawn_user_turn(
+                        Arc::clone(&runtime),
+                        runtime_tx.clone(),
+                        text,
+                    ));
                 }
-            }
-            UiEvent::Terminal(event) => match event {
-                TuiEvent::Key(key) => {
-                    if key.code == KeyCode::Enter && !app.is_streaming && !app.can_resume_turn {
-                        if let Some(text) = app.submit_input() {
-                            let runtime = Arc::clone(&runtime);
-                            let runtime_tx = runtime_tx.clone();
-                            let cancel = tokio_util::sync::CancellationToken::new();
-                            let task_cancel = cancel.clone();
-                            stream_task = Some((
-                                tokio::spawn(async move {
-                                    let _ =
-                                        runtime.run_user_turn(text, &runtime_tx, task_cancel).await;
-                                }),
-                                cancel,
+                AppCommand::ResumeTurn => {
+                    stream_task = Some(spawn_resume(Arc::clone(&runtime), runtime_tx.clone()));
+                }
+                AppCommand::InspectRecovery => {
+                    let tools = runtime.recovery_tools().await;
+                    if tools.is_empty() {
+                        controller
+                            .state_mut()
+                            .add_system_message("no tool reconciliation is pending");
+                    } else {
+                        for tool in tools {
+                            controller.state_mut().add_system_message(&format!(
+                                "{} {}({}) replay={:?}",
+                                tool.tool_call_id, tool.name, tool.arguments, tool.replay_class
                             ));
                         }
-                    } else if is_ctrl_r(key.code, key.modifiers)
-                        && !app.is_streaming
-                        && app.can_resume_turn
-                    {
-                        app.begin_resume();
-                        let runtime = Arc::clone(&runtime);
-                        let runtime_tx = runtime_tx.clone();
-                        let cancel = tokio_util::sync::CancellationToken::new();
-                        let task_cancel = cancel.clone();
-                        stream_task = Some((
-                            tokio::spawn(async move {
-                                let _ = runtime.resume_turn(&runtime_tx, task_cancel).await;
-                            }),
-                            cancel,
-                        ));
-                    } else if key.code == KeyCode::Enter && !app.is_streaming {
-                        // A resumable failed turn must be explicitly retried first.
-                    } else {
-                        rua::app::input::handle_key(&mut app, key);
                     }
                 }
-                TuiEvent::Paste(text) => app.composer.insert_str(&text),
-                TuiEvent::Resize { .. } => {}
-            },
-            UiEvent::TerminalFailure(error) => {
-                break Err(color_eyre::eyre::eyre!(error));
+                AppCommand::InspectApproval => {
+                    let tools = runtime.approval_tools().await;
+                    if tools.is_empty() {
+                        controller
+                            .state_mut()
+                            .add_system_message("no tool approval is pending");
+                    } else {
+                        for tool in tools {
+                            controller.state_mut().add_system_message(&format!(
+                                "{} {}({}) replay={:?}",
+                                tool.tool_call_id, tool.name, tool.arguments, tool.replay_class
+                            ));
+                        }
+                    }
+                }
+                AppCommand::ReconcileTool {
+                    tool_call_id,
+                    decision,
+                } => {
+                    stream_task = Some(spawn_reconciliation(
+                        Arc::clone(&runtime),
+                        runtime_tx.clone(),
+                        tool_call_id,
+                        decision,
+                    ));
+                }
+                AppCommand::ResolveApproval {
+                    tool_call_id,
+                    approved,
+                    reason,
+                } => {
+                    stream_task = Some(spawn_approval(
+                        Arc::clone(&runtime),
+                        runtime_tx.clone(),
+                        tool_call_id,
+                        approved,
+                        reason,
+                    ));
+                }
+                AppCommand::CancelTurn => {
+                    if let Some((_, cancel)) = &stream_task {
+                        cancel.cancel();
+                    }
+                }
+                AppCommand::Quit => {
+                    if let Some((task, cancel)) = stream_task.take() {
+                        cancel.cancel();
+                        task.abort();
+                    }
+                    return Ok(());
+                }
+                AppCommand::TerminalFailed(error) => {
+                    return Err(color_eyre::eyre::eyre!(error));
+                }
             }
-            UiEvent::Runtime(event) => app.apply_runtime_event(&event),
         }
-
-        if app.should_quit {
-            if let Some((task, cancel)) = stream_task.take() {
-                cancel.cancel();
-                task.abort();
-            }
-            break Ok(());
-        }
+        frames.request_frame();
     }
 }
 
-fn is_ctrl_r(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    matches!(code, KeyCode::Char('r'))
-        && modifiers.contains(KeyModifiers::CONTROL)
-        && !modifiers.contains(KeyModifiers::ALT)
+fn drain_runtime_events(
+    runtime_rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    buffer: &mut VecDeque<RuntimeEvent>,
+) {
+    for _ in 0..256 {
+        let Ok(event) = runtime_rx.try_recv() else {
+            break;
+        };
+        merge_runtime_event(buffer, event);
+    }
+}
+
+fn merge_runtime_event(buffer: &mut VecDeque<RuntimeEvent>, event: RuntimeEvent) {
+    match event {
+        RuntimeEvent::TextDelta { turn_id, delta } => {
+            for pending in buffer.iter_mut().rev() {
+                match pending {
+                    RuntimeEvent::TextDelta {
+                        turn_id: previous_turn,
+                        delta: previous_delta,
+                    } if *previous_turn == turn_id => {
+                        previous_delta.push_str(&delta);
+                        return;
+                    }
+                    RuntimeEvent::ReasoningDelta {
+                        turn_id: previous_turn,
+                        ..
+                    } if *previous_turn == turn_id => continue,
+                    _ => break,
+                }
+            }
+            buffer.push_back(RuntimeEvent::TextDelta { turn_id, delta });
+        }
+        RuntimeEvent::ReasoningDelta { turn_id, delta } => {
+            for pending in buffer.iter_mut().rev() {
+                match pending {
+                    RuntimeEvent::ReasoningDelta {
+                        turn_id: previous_turn,
+                        delta: previous_delta,
+                    } if *previous_turn == turn_id => {
+                        previous_delta.push_str(&delta);
+                        return;
+                    }
+                    RuntimeEvent::TextDelta {
+                        turn_id: previous_turn,
+                        ..
+                    } if *previous_turn == turn_id => continue,
+                    _ => break,
+                }
+            }
+            buffer.push_back(RuntimeEvent::ReasoningDelta { turn_id, delta });
+        }
+        event => buffer.push_back(event),
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+type StreamTask = (
+    tokio::task::JoinHandle<()>,
+    tokio_util::sync::CancellationToken,
+);
+
+fn spawn_user_turn(
+    runtime: Arc<AgentRuntime>,
+    runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    text: String,
+) -> StreamTask {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        if let Err(rua::agent::RuntimeError::Persistence(error)) =
+            runtime.run_user_turn(text, &runtime_tx, task_cancel).await
+        {
+            let _ = runtime_tx.send(RuntimeEvent::PersistenceFailed {
+                message: error.to_string(),
+            });
+        }
+    });
+    (task, cancel)
+}
+
+fn spawn_resume(
+    runtime: Arc<AgentRuntime>,
+    runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+) -> StreamTask {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        if let Err(rua::agent::RuntimeError::Persistence(error)) =
+            runtime.resume_turn(&runtime_tx, task_cancel).await
+        {
+            let _ = runtime_tx.send(RuntimeEvent::PersistenceFailed {
+                message: error.to_string(),
+            });
+        }
+    });
+    (task, cancel)
+}
+
+fn spawn_reconciliation(
+    runtime: Arc<AgentRuntime>,
+    runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    tool_call_id: ToolCallId,
+    decision: ReconciliationDecision,
+) -> StreamTask {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        if let Err(error) = runtime
+            .reconcile_tool(tool_call_id, decision, &runtime_tx, task_cancel)
+            .await
+        {
+            let event = match error {
+                rua::agent::RuntimeError::Persistence(error) => RuntimeEvent::PersistenceFailed {
+                    message: error.to_string(),
+                },
+                error => RuntimeEvent::OperationFailed {
+                    message: error.to_string(),
+                },
+            };
+            let _ = runtime_tx.send(event);
+        }
+    });
+    (task, cancel)
+}
+
+fn spawn_approval(
+    runtime: Arc<AgentRuntime>,
+    runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    tool_call_id: ToolCallId,
+    approved: bool,
+    reason: Option<String>,
+) -> StreamTask {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        if let Err(error) = runtime
+            .resolve_tool_approval(tool_call_id, approved, reason, &runtime_tx, task_cancel)
+            .await
+        {
+            let event = match error {
+                rua::agent::RuntimeError::ApprovalRequired(_) => return,
+                rua::agent::RuntimeError::Persistence(error) => RuntimeEvent::PersistenceFailed {
+                    message: error.to_string(),
+                },
+                error => RuntimeEvent::OperationFailed {
+                    message: error.to_string(),
+                },
+            };
+            let _ = runtime_tx.send(event);
+        }
+    });
+    (task, cancel)
+}
+
+struct StartupOptions {
+    session: Option<SessionId>,
+    approval: ApprovalMode,
+    maintenance: Option<MaintenanceAction>,
+}
+
+enum MaintenanceAction {
+    Validate {
+        session_id: SessionId,
+    },
+    Export {
+        session_id: SessionId,
+        destination: PathBuf,
+    },
+    Repair {
+        session_id: SessionId,
+    },
+}
+
+fn startup_options() -> Result<StartupOptions> {
+    let mut args = std::env::args().skip(1);
+    let mut session = None;
+    let mut approval = ApprovalMode::Ask;
+    let mut maintenance = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--session" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("--session requires a session id"))?;
+                session = Some(SessionId::new(value));
+            }
+            "--approval" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("--approval requires a mode"))?;
+                approval = match value.as_str() {
+                    "auto" => ApprovalMode::Auto,
+                    "ask" => ApprovalMode::Ask,
+                    "never" => ApprovalMode::Never,
+                    _ => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "invalid approval mode {value:?}; expected auto, ask, or never"
+                        ));
+                    }
+                };
+            }
+            "--validate-session" => {
+                let value = args.next().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("--validate-session requires a session id")
+                })?;
+                maintenance = Some(MaintenanceAction::Validate {
+                    session_id: SessionId::new(value),
+                });
+            }
+            "--export-session" => {
+                let session_id = args.next().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("--export-session requires a session id")
+                })?;
+                let destination = args.next().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("--export-session requires a destination directory")
+                })?;
+                maintenance = Some(MaintenanceAction::Export {
+                    session_id: SessionId::new(session_id),
+                    destination: PathBuf::from(destination),
+                });
+            }
+            "--repair-session" => {
+                let value = args.next().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("--repair-session requires a session id")
+                })?;
+                maintenance = Some(MaintenanceAction::Repair {
+                    session_id: SessionId::new(value),
+                });
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: rua [--session <session-id>] [--approval auto|ask|never]\n       rua --validate-session <session-id>\n       rua --export-session <session-id> <destination>\n       rua --repair-session <session-id>"
+                );
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(color_eyre::eyre::eyre!("unknown argument: {argument}"));
+            }
+        }
+    }
+    if maintenance.is_some() && session.is_some() {
+        color_eyre::eyre::bail!("maintenance commands cannot be combined with --session");
+    }
+    Ok(StartupOptions {
+        session,
+        approval,
+        maintenance,
+    })
+}
+
+async fn run_maintenance(action: &MaintenanceAction) -> Result<()> {
+    let store = LocalSessionStore::new(std::env::current_dir()?);
+    match action {
+        MaintenanceAction::Validate { session_id } => {
+            let recovered = store.validate_session(session_id).await?;
+            println!(
+                "session={} sequence={} revision={} phase={:?}",
+                recovered.session_id,
+                recovered.last_sequence.0,
+                recovered.conversation.revision().0,
+                recovered.active_turn.as_ref().map(|turn| &turn.phase)
+            );
+        }
+        MaintenanceAction::Export {
+            session_id,
+            destination,
+        } => {
+            let exported = store.export_raw(session_id, destination)?;
+            println!("exported session to {}", exported.display());
+        }
+        MaintenanceAction::Repair { session_id } => {
+            let report = store.repair_incomplete_tail(session_id)?;
+            println!(
+                "repaired session {}; removed {} incomplete bytes; original saved at {}",
+                session_id,
+                report.removed_bytes,
+                report.backup_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_projection_coalesces_deltas_until_a_lifecycle_boundary() {
+        let turn_id: rua::agent::TurnId = "turn-1".into();
+        let mut buffer = VecDeque::new();
+        merge_runtime_event(
+            &mut buffer,
+            RuntimeEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: "a".to_owned(),
+            },
+        );
+        merge_runtime_event(
+            &mut buffer,
+            RuntimeEvent::ReasoningDelta {
+                turn_id: turn_id.clone(),
+                delta: "r".to_owned(),
+            },
+        );
+        merge_runtime_event(
+            &mut buffer,
+            RuntimeEvent::TextDelta {
+                turn_id: turn_id.clone(),
+                delta: "b".to_owned(),
+            },
+        );
+        merge_runtime_event(
+            &mut buffer,
+            RuntimeEvent::TurnCompleted {
+                turn_id: turn_id.clone(),
+            },
+        );
+        merge_runtime_event(
+            &mut buffer,
+            RuntimeEvent::TextDelta {
+                turn_id,
+                delta: "c".to_owned(),
+            },
+        );
+
+        assert_eq!(buffer.len(), 4);
+        assert!(matches!(
+            &buffer[0],
+            RuntimeEvent::TextDelta { delta, .. } if delta == "ab"
+        ));
+        assert!(matches!(
+            &buffer[1],
+            RuntimeEvent::ReasoningDelta { delta, .. } if delta == "r"
+        ));
+        assert!(matches!(buffer[2], RuntimeEvent::TurnCompleted { .. }));
+        assert!(matches!(
+            &buffer[3],
+            RuntimeEvent::TextDelta { delta, .. } if delta == "c"
+        ));
+    }
 }

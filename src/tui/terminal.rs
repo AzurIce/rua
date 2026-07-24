@@ -34,25 +34,45 @@ impl TerminalSession {
         Ok(session)
     }
 
-    fn restore(&mut self) {
+    pub fn leave(mut self) -> io::Result<()> {
+        self.restore()
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let mut first_error = None;
         if self.bracketed_paste {
-            let _ = stdout().execute(DisableBracketedPaste);
+            record_first_error(
+                &mut first_error,
+                stdout().execute(DisableBracketedPaste).map(|_| ()),
+            );
             self.bracketed_paste = false;
         }
-        let _ = stdout().execute(Show);
+        record_first_error(&mut first_error, stdout().execute(Show).map(|_| ()));
         if self.alternate_screen {
-            let _ = stdout().execute(LeaveAlternateScreen);
+            record_first_error(
+                &mut first_error,
+                stdout().execute(LeaveAlternateScreen).map(|_| ()),
+            );
             self.alternate_screen = false;
         }
         if self.raw_mode {
-            let _ = disable_raw_mode();
+            record_first_error(&mut first_error, disable_raw_mode());
             self.raw_mode = false;
         }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn record_first_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
+    if let Err(error) = result
+        && first_error.is_none()
+    {
+        *first_error = Some(error);
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        self.restore();
+        let _ = self.restore();
     }
 }

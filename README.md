@@ -4,22 +4,24 @@ A terminal-based AI coding agent built in Rust.
 
 ## Current Status
 
-rua is a **streaming chat agent** with a TUI built on ratatui. It connects to the DeepSeek API, supports real-time multi-turn conversation, and can execute tools (currently `bash`) in the agent loop.
+rua is a **streaming coding agent** with a TUI built on ratatui. A provider-neutral runtime owns the canonical conversation, connects to DeepSeek through an adapter, executes workspace coding tools and shell commands, and persists execution boundaries in a checksummed session journal.
 
 ## Architecture
 
 ```
-main.rs           Terminal lifecycle + event routing loop
-├── app/
-│   ├── state.rs    Pure UI state + state transitions
-│   ├── render.rs   ratatui drawing (with reasoning toggle)
-│   ├── input.rs    Keyboard event handling
-│   └── event.rs    UiEvent enum
-├── session.rs      Agent loop: LLM → tool calls → execute → re-request
-├── deepseek.rs     HTTP client + SSE parsing (supports tool_calls / reasoning_content)
-├── tools.rs        Tool definitions (BashTool) + ToolRegistry
-├── model.rs        ChatEntry, Role, reasoning_content (domain models)
-└── config.rs       TOML config + value resolution
+main.rs              Application assembly + event routing loop
+├── agent/
+│   ├── runtime.rs   Provider-neutral model → tool → model loop
+│   ├── journal.rs   Durable execution state and replay
+│   ├── session_store.rs  Checksummed WAL, snapshots, locking, repair/export
+│   ├── provider.rs  Provider contract + response accumulator
+│   ├── deepseek.rs  DeepSeek adapter + SSE parsing
+│   ├── tools.rs     Schema validation and Bash process-group execution
+│   ├── coding_tools.rs  Workspace-scoped read/write/edit/glob/grep
+│   └── conversation.rs  Canonical committed conversation
+├── app/             UI projection, input handling, and rendering
+├── tui/             Terminal lifecycle, normalized events, and composer
+└── config.rs        TOML config + value resolution
 ```
 
 ## Roadmap
@@ -39,27 +41,32 @@ main.rs           Terminal lifecycle + event routing loop
 - [x] **Agent loop** — LLM → tool decision → execute → return result → continue
 - [x] **Function calling protocol** — DeepSeek tool_call / tool_result message format
 - [x] **Tool result rendering** — Display command output in the TUI
-- [x] **Reasoning content display** — DeepSeek reasoning models: real-time streaming + collapsible "thinking" block (press `r` to toggle)
+- [x] **Reasoning content display** — DeepSeek reasoning models: real-time streaming + collapsible "thinking" block (press `Ctrl+R` to toggle)
+- [x] **Provider-neutral runtime** — Canonical messages and provider adapter boundary
+- [x] **Durable execution journal** — Write-ahead records, checksummed WAL, snapshots, and recovery
+- [x] **App controller and frame scheduler** — Explicit UI commands with dirty/deadline-driven drawing
+- [x] **Workspace coding tools** — Read, write, edit, glob, and grep with bounded outputs
 
 ### Phase 1: Enhanced Tools
 
-- [ ] **Read tool** — Read file contents with line ranges
-- [ ] **Write tool** — Create new files
-- [ ] **Edit tool** — Apply string replacements (search + replace)
-- [ ] **Glob tool** — File search by pattern
-- [ ] **Grep tool** — Content search across files
+- [x] **Read tool** — Read file contents with line ranges
+- [x] **Write tool** — Create new files
+- [x] **Edit tool** — Apply string replacements (search + replace)
+- [x] **Glob tool** — File search by pattern
+- [x] **Grep tool** — Content search across files
 - [ ] **Diff preview** — Show proposed changes before applying
 
 ### Phase 2: Safety & Control
 
-- [ ] **Approval modes** — auto / ask / never for dangerous operations
-- [ ] **Bash sandbox** — Restricted shell execution (cwd, timeout, denylist)
+- [x] **Persistent session recovery** — Snapshot/WAL storage, replay, and explicit reconciliation
+- [x] **Approval modes** — Durable auto / ask / never policy for effectful or unknown tools
+- [ ] **Bash sandbox** — Workspace cwd, timeout, and process-tree cleanup are implemented; stronger OS isolation remains
 - [ ] **Git integration** — Auto-stage changes, generate commit messages
 - [ ] **Undo / rollback** — Revert last tool action
 
 ### Phase 3: Multi-Provider Support
 
-- [ ] **Provider trait** — Abstract LLM client interface
+- [x] **Provider trait** — Abstract LLM client interface
 - [ ] **OpenAI** — GPT-4o, o1, o3 support
 - [ ] **Anthropic** — Claude Sonnet, Opus support
 - [ ] **Local models** — Ollama / llama.cpp compatibility
@@ -70,7 +77,7 @@ main.rs           Terminal lifecycle + event routing loop
 - [ ] **Syntax highlighting** — Highlight code blocks in responses
 - [ ] **Multi-line input** — Shift+Enter for newlines, Esc to send
 - [ ] **Slash commands** — `/clear`, `/help`, `/model`, `/history`
-- [ ] **Message persistence** — Save/load conversation history
+- [x] **Message persistence** — Project-local sessions under `.rua/sessions`
 - [ ] **Token/cost tracking** — Display usage stats per turn
 - [ ] **Scrollback search** — Search conversation history
 
@@ -99,6 +106,26 @@ cargo run
 # Build release
 cargo build --release
 ```
+
+Sessions are created under the current project's `.rua/sessions` directory. Rua prints the session ID at startup; reopen one with:
+
+```bash
+cargo run -- --session <session-id> --approval ask
+```
+
+Session maintenance is explicit and non-interactive:
+
+```bash
+cargo run -- --validate-session <session-id>
+cargo run -- --export-session <session-id> <destination>
+cargo run -- --repair-session <session-id>
+```
+
+Normal recovery automatically removes only an incomplete trailing frame after validating the retained WAL prefix. The maintenance repair command performs the same narrow operation offline, saves the original journal beside the session, and refuses checksum or middle-record corruption.
+
+If recovery finds a tool that may already have produced side effects, use `/recovery inspect`, then explicitly resolve it with `/recovery success`, `/recovery failed`, `/recovery retry`, or `/recovery abandon`.
+
+Approval defaults to `ask`. Use `/approval inspect`, `/approval approve <call-id>`, or `/approval reject <call-id> [reason]`. Read-only tools do not require approval; effectful and unknown tools do.
 
 ## License
 

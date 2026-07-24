@@ -4,7 +4,7 @@
 
 Rua 当前的 TUI 是一个可运行的原型：`main.rs` 同时负责终端模式、事件源、应用循环和 session 调用，`AppState` 同时持有业务投影、输入草稿和展示状态，渲染函数则通过在字符串中插入空格模拟输入光标。这种结构足以验证流式对话，但无法稳定承载 Unicode 编辑、Windows IME、粘贴、取消、runtime retry、overlay 或未来的非交互客户端。
 
-[D0001：Agent Runtime 与会话所有权](d0001-agent-runtime.md) 已规定 TUI 不是 canonical conversation 的所有者；[D0002：Provider 边界与标准消息模型](d0002-provider-model.md) 已规定 provider wire chunks 不能直接成为 UI 的长期状态。本设计继续定义 terminal 到 display projection 之间的边界。
+[D0001：Agent Runtime 与会话所有权](D0001-agent-runtime.md) 已规定 TUI 不是 canonical conversation 的所有者；[D0002：Provider 边界与标准消息模型](D0002-provider-model.md) 已规定 provider wire chunks 不能直接成为 UI 的长期状态。本设计继续定义 terminal 到 display projection 之间的边界。
 
 从数据流看，TUI 只有三条单向路径：
 

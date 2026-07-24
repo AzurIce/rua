@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::agent::{AssistantPart, RuntimeEvent};
+use crate::agent::{AssistantPart, Message, RuntimeEvent, ToolResultContent, UserContent};
 use crate::model::{ChatEntry, Role};
 use crate::tui::Composer;
 
@@ -122,6 +122,114 @@ impl AppState {
 
     pub fn apply_runtime_event(&mut self, event: &RuntimeEvent) {
         match event {
+            RuntimeEvent::SessionRecovered {
+                session_id,
+                conversation,
+            } => {
+                self.history.clear();
+                self.add_system_message(&format!("recovered session {session_id}"));
+                for message in conversation.messages() {
+                    match message {
+                        Message::User(message) => {
+                            for part in &message.content {
+                                match part {
+                                    UserContent::Text { text } => {
+                                        self.history.push_back(ChatEntry {
+                                            role: Role::User,
+                                            text: text.clone(),
+                                            tool_call_id: None,
+                                            reasoning_content: None,
+                                            reasoning_expanded: false,
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                        Message::Assistant(message) => {
+                            let mut text = String::new();
+                            let mut reasoning = String::new();
+                            for part in &message.parts {
+                                match part {
+                                    AssistantPart::Text(part) => text.push_str(&part.text),
+                                    AssistantPart::Reasoning(part) => {
+                                        if let Some(value) = &part.text {
+                                            reasoning.push_str(value);
+                                        }
+                                    }
+                                    AssistantPart::ToolCall(call) => {
+                                        self.add_tool_call(&call.name, &call.arguments.to_string())
+                                    }
+                                }
+                            }
+                            if !text.trim().is_empty() {
+                                self.history.push_back(ChatEntry {
+                                    role: Role::Assistant,
+                                    text: text.trim().to_owned(),
+                                    tool_call_id: None,
+                                    reasoning_content: (!reasoning.trim().is_empty())
+                                        .then(|| reasoning.trim().to_owned()),
+                                    reasoning_expanded: false,
+                                });
+                            }
+                        }
+                        Message::ToolResult(message) => {
+                            let text = message
+                                .content
+                                .iter()
+                                .map(|part| match part {
+                                    ToolResultContent::Text { text } => text.as_str(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.add_tool_result(&message.name, &text);
+                        }
+                    }
+                }
+                self.finish_stream();
+            }
+            RuntimeEvent::RecoveryRequired {
+                tool_call_id,
+                message,
+                ..
+            } => {
+                self.is_streaming = false;
+                self.status = AppStatus::Idle;
+                self.current_response.clear();
+                self.current_reasoning.clear();
+                self.can_resume_turn = false;
+                self.add_system_message(&format!(
+                    "Recovery required for {tool_call_id}: {message}. Use /recovery inspect."
+                ));
+            }
+            RuntimeEvent::ApprovalRequired {
+                tool_call_id,
+                name,
+                arguments,
+                replay_class,
+                ..
+            } => {
+                self.is_streaming = false;
+                self.status = AppStatus::Idle;
+                self.can_resume_turn = false;
+                self.add_system_message(&format!(
+                    "Approval required for {tool_call_id}: {name}({arguments}) replay={replay_class:?}. Use /approval approve {tool_call_id} or /approval reject {tool_call_id} [reason]."
+                ));
+            }
+            RuntimeEvent::PersistenceFailed { message } => {
+                self.can_resume_turn = false;
+                self.add_error(&format!("Persistence failed: {message}"));
+            }
+            RuntimeEvent::OperationFailed { message } => {
+                self.is_streaming = false;
+                self.status = AppStatus::Idle;
+                self.can_resume_turn = false;
+                self.add_error(message);
+            }
+            RuntimeEvent::TurnStarted { .. } => {
+                self.is_streaming = true;
+                self.status = AppStatus::Sending;
+                self.can_resume_turn = false;
+            }
             RuntimeEvent::UserCommitted { text, .. } => {
                 self.history.push_back(ChatEntry {
                     role: Role::User,
@@ -183,6 +291,9 @@ impl AppState {
             RuntimeEvent::ToolFailed { message, .. } => {
                 self.add_tool_result("", &format!("Error: {message}"));
             }
+            RuntimeEvent::ToolRejected { message, .. } => {
+                self.add_tool_result("", &format!("Rejected: {message}"));
+            }
             RuntimeEvent::TurnCompleted { .. } => self.finish_stream(),
             RuntimeEvent::TurnFailed {
                 error, recoverable, ..
@@ -201,7 +312,7 @@ impl AppState {
                     reasoning_expanded: false,
                 });
             }
-            RuntimeEvent::TurnCancelled { .. } => {}
+            RuntimeEvent::TurnCancelled { .. } => self.finish_stream(),
         }
     }
 

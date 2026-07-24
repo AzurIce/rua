@@ -18,7 +18,7 @@ display projection       用户此刻看见、选择和编辑什么
 
 它们会相互引用，却不能合并。把 projection 当作 conversation 会让折叠、流式草稿和局部 UI 状态污染下一次请求；只保存 conversation 又无法判断崩溃前的工具是否已经产生副作用。后文的 ownership 与提交点都从这一区分展开。
 
-Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider 边界与标准消息模型](d0002-provider-model.md) 定义。
+Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider 边界与标准消息模型](D0002-provider-model.md) 定义。
 
 ## 目标
 
@@ -108,7 +108,7 @@ Canonical conversation 记录模型已经知道的内容，但不足以表示 ru
 
 Turn phase 至少能够表达 awaiting model、executing tools、waiting to retry、needs reconciliation 和 terminal outcomes。Execution journal 是控制状态，不会作为普通消息发送给模型。
 
-跨进程恢复、journal 的 write-ahead 顺序和文件格式由 [D0005：执行 Journal 与 Session 恢复](d0005-execution-journal-and-session-recovery.md) 定义。
+跨进程恢复、journal 的 write-ahead 顺序和文件格式由 [D0005：执行 Journal 与 Session 恢复](D0005-execution-journal-and-session-recovery.md) 定义。
 
 ## 组件怎样协作
 

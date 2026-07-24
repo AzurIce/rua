@@ -11,6 +11,10 @@ use super::types::{
     StopReason, TextPart, ToolCall, ToolCallId, Usage,
 };
 
+const MAX_OPAQUE_PROVIDER_STATE_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_DRAFT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+
 pub type ProviderStream = Pin<Box<dyn Stream<Item = ProviderEvent> + Send>>;
 pub type ProviderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProviderStream, ProviderError>> + Send + 'a>>;
@@ -71,6 +75,7 @@ pub struct ResponseAccumulator {
     response: Option<ResponseInfo>,
     parts: BTreeMap<PartIndex, DraftPart>,
     usage: Option<Usage>,
+    draft_bytes: usize,
     terminal: bool,
 }
 
@@ -81,6 +86,7 @@ impl ResponseAccumulator {
             response: None,
             parts: BTreeMap::new(),
             usage: None,
+            draft_bytes: 0,
             terminal: false,
         }
     }
@@ -106,6 +112,7 @@ impl ResponseAccumulator {
             }
             ProviderEvent::TextDelta { part, delta } => {
                 self.require_started()?;
+                self.account_draft_bytes(delta.len())?;
                 match self.parts.entry(part).or_insert_with(DraftPart::text) {
                     DraftPart::Text { text, .. } => text.push_str(&delta),
                     other => return Err(part_conflict(part, PartKind::Text, other.kind())),
@@ -113,6 +120,7 @@ impl ResponseAccumulator {
             }
             ProviderEvent::ReasoningDelta { part, delta } => {
                 self.require_started()?;
+                self.account_draft_bytes(delta.len())?;
                 match self.parts.entry(part).or_insert_with(DraftPart::reasoning) {
                     DraftPart::Reasoning { text, .. } => text.push_str(&delta),
                     other => return Err(part_conflict(part, PartKind::Reasoning, other.kind())),
@@ -129,6 +137,7 @@ impl ResponseAccumulator {
                 if name.is_empty() {
                     return Err(ResponseValidationError::EmptyToolName(part));
                 }
+                self.account_draft_bytes(id.as_str().len().saturating_add(name.len()))?;
                 self.parts.insert(
                     part,
                     DraftPart::ToolCall {
@@ -141,15 +150,27 @@ impl ResponseAccumulator {
             }
             ProviderEvent::ToolArgumentsDelta { part, delta } => {
                 self.require_started()?;
-                let Some(draft) = self.parts.get_mut(&part) else {
+                let Some(draft) = self.parts.get(&part) else {
                     return Err(ResponseValidationError::UnknownPart(part));
                 };
-                match draft {
-                    DraftPart::ToolCall { arguments, .. } => arguments.push_str(&delta),
-                    other => {
-                        return Err(part_conflict(part, PartKind::ToolCall, other.kind()));
-                    }
+                let DraftPart::ToolCall { arguments, .. } = draft else {
+                    return Err(part_conflict(part, PartKind::ToolCall, draft.kind()));
+                };
+                let bytes = arguments.len().saturating_add(delta.len());
+                if bytes > MAX_TOOL_ARGUMENT_BYTES {
+                    return Err(ResponseValidationError::ToolArgumentsTooLarge {
+                        part,
+                        bytes,
+                        max_bytes: MAX_TOOL_ARGUMENT_BYTES,
+                    });
                 }
+                self.account_draft_bytes(delta.len())?;
+                let DraftPart::ToolCall { arguments, .. } =
+                    self.parts.get_mut(&part).expect("validated tool part")
+                else {
+                    unreachable!("tool part kind changed without mutation")
+                };
+                arguments.push_str(&delta);
             }
             ProviderEvent::PartState { part, kind, state } => {
                 self.require_started()?;
@@ -284,6 +305,18 @@ impl ResponseAccumulator {
         Ok(())
     }
 
+    fn account_draft_bytes(&mut self, additional: usize) -> Result<(), ResponseValidationError> {
+        let bytes = self.draft_bytes.saturating_add(additional);
+        if bytes > MAX_RESPONSE_DRAFT_BYTES {
+            return Err(ResponseValidationError::ResponseDraftTooLarge {
+                bytes,
+                max_bytes: MAX_RESPONSE_DRAFT_BYTES,
+            });
+        }
+        self.draft_bytes = bytes;
+        Ok(())
+    }
+
     fn validate_state_scope(
         &self,
         state: &OpaqueProviderState,
@@ -303,6 +336,15 @@ impl ResponseAccumulator {
         let model = &response.provenance.requested;
         if state.provider != model.provider || state.api_family != model.api_family {
             return Err(ResponseValidationError::ProviderStateScopeMismatch);
+        }
+        let bytes = serde_json::to_vec(state)
+            .map_err(|error| ResponseValidationError::InvalidProviderState(error.to_string()))?
+            .len();
+        if bytes > MAX_OPAQUE_PROVIDER_STATE_BYTES {
+            return Err(ResponseValidationError::ProviderStateTooLarge {
+                bytes,
+                max_bytes: MAX_OPAQUE_PROVIDER_STATE_BYTES,
+            });
         }
         Ok(())
     }
@@ -402,8 +444,22 @@ pub enum ResponseValidationError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "tool arguments at part {part:?} are {bytes} bytes, exceeding the {max_bytes} byte limit"
+    )]
+    ToolArgumentsTooLarge {
+        part: PartIndex,
+        bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("provider response draft is {bytes} bytes, exceeding the {max_bytes} byte limit")]
+    ResponseDraftTooLarge { bytes: usize, max_bytes: usize },
     #[error("provider state scope does not match the response provider")]
     ProviderStateScopeMismatch,
+    #[error("provider state cannot be serialized: {0}")]
+    InvalidProviderState(String),
+    #[error("provider state is {bytes} bytes, exceeding the {max_bytes} byte limit")]
+    ProviderStateTooLarge { bytes: usize, max_bytes: usize },
     #[error("tool-use stop reason requires at least one tool call")]
     ToolUseWithoutCalls,
     #[error("a response containing tool calls must use the tool-use stop reason")]
@@ -436,8 +492,17 @@ pub(crate) mod test_support {
             Self {
                 scripts: Mutex::new(scripts.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
-                capabilities: ModelCapabilities::default(),
+                capabilities: ModelCapabilities {
+                    tools: true,
+                    reasoning: true,
+                    image_input: true,
+                },
             }
+        }
+
+        pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
+            self.capabilities = capabilities;
+            self
         }
 
         pub fn requests(&self) -> Vec<ModelRequest> {
@@ -621,6 +686,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_tool_arguments_while_the_response_is_provisional() {
+        let mut accumulator = ResponseAccumulator::new("message-1");
+        accumulator.push(started()).unwrap();
+        accumulator
+            .push(ProviderEvent::ToolCallStarted {
+                part: PartIndex(0),
+                id: ToolCallId::new("call-1"),
+                name: "write".to_owned(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            accumulator.push(ProviderEvent::ToolArgumentsDelta {
+                part: PartIndex(0),
+                delta: "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1),
+            }),
+            Err(ResponseValidationError::ToolArgumentsTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn provider_failure_is_terminal_but_not_an_assistant_message() {
         let mut accumulator = ResponseAccumulator::new("message-1");
         accumulator.push(started()).unwrap();
@@ -643,6 +729,33 @@ mod tests {
             AccumulatorOutcome::Failed(failure)
         );
         assert!(accumulator.is_terminal());
+    }
+
+    #[test]
+    fn rejects_oversized_opaque_provider_state() {
+        let mut accumulator = ResponseAccumulator::new("message-1");
+        accumulator.push(started()).unwrap();
+        accumulator
+            .push(ProviderEvent::TextDelta {
+                part: PartIndex(0),
+                delta: "hello".to_owned(),
+            })
+            .unwrap();
+        let state = OpaqueProviderState {
+            provider: ProviderId::new("fake"),
+            api_family: ApiFamily::new("test-api"),
+            schema_version: 1,
+            value: json!({ "payload": "x".repeat(MAX_OPAQUE_PROVIDER_STATE_BYTES) }),
+        };
+
+        assert!(matches!(
+            accumulator.push(ProviderEvent::PartState {
+                part: PartIndex(0),
+                kind: PartKind::Text,
+                state,
+            }),
+            Err(ResponseValidationError::ProviderStateTooLarge { .. })
+        ));
     }
 
     #[test]

@@ -49,6 +49,8 @@ string_id!(ToolCallId);
 string_id!(TurnId);
 string_id!(StepId);
 string_id!(AttemptId);
+string_id!(ExecutionId);
+string_id!(SessionId);
 string_id!(ProviderId);
 string_id!(ApiFamily);
 
@@ -210,6 +212,22 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    pub replay_class: ReplayClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayClass {
+    ReadOnly,
+    Idempotent { key_source: String },
+    Effectful,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalMode {
+    Auto,
+    Ask,
+    Never,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

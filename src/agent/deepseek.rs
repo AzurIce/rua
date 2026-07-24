@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use reqwest::header::{self, HeaderMap, HeaderValue};
@@ -15,10 +16,14 @@ use super::types::{
     RetryHint, StopReason, ToolDefinition, Usage,
 };
 
+const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BUFFER_BYTES: usize = 256 * 1024;
+
 #[derive(Clone)]
 pub struct DeepSeekProvider {
     client: reqwest::Client,
     base_url: String,
+    api_key: Arc<str>,
 }
 
 impl DeepSeekProvider {
@@ -52,6 +57,7 @@ impl DeepSeekProvider {
         Ok(Self {
             client,
             base_url: config.base_url.trim_end_matches('/').to_owned(),
+            api_key: Arc::from(config.api_key.as_str()),
         })
     }
 }
@@ -67,6 +73,7 @@ impl Provider for DeepSeekProvider {
 
     fn stream(&self, request: ModelRequest, cancel: CancellationToken) -> ProviderFuture<'_> {
         let client = self.client.clone();
+        let api_key = self.api_key.clone();
         let url = format!("{}/chat/completions", self.base_url);
         Box::pin(async move {
             let body = ChatRequest::from_request(&request);
@@ -76,14 +83,14 @@ impl Provider for DeepSeekProvider {
             }
             .map_err(|error| ProviderError {
                 kind: ProviderErrorKind::Transport,
-                message: format!("failed to POST to provider: {error}"),
+                message: redact_secret(&format!("failed to POST to provider: {error}"), &api_key),
                 retry: RetryHint::Retryable { after: None },
             })?;
 
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
-                return Err(http_error(status.as_u16(), &text));
+                return Err(http_error(status.as_u16(), &text, &api_key));
             }
 
             let mut bytes = response.bytes_stream();
@@ -118,10 +125,19 @@ impl Provider for DeepSeekProvider {
                             return;
                         }
                     };
-                    parser.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = parser.buffer.find('\n') {
-                        let line = parser.buffer[..pos].trim_end_matches('\r').to_owned();
-                        parser.buffer = parser.buffer[pos + 1..].to_owned();
+                    parser.buffer.extend_from_slice(&chunk);
+                    while let Some(pos) = parser.buffer.iter().position(|byte| *byte == b'\n') {
+                        if pos > MAX_SSE_BUFFER_BYTES {
+                            let _ = tx.send(ProviderEvent::Failed(sse_buffer_limit_error()));
+                            return;
+                        }
+                        let line = match take_sse_line(&mut parser.buffer, pos) {
+                            Ok(line) => line,
+                            Err(error) => {
+                                let _ = tx.send(ProviderEvent::Failed(error));
+                                return;
+                            }
+                        };
                         if let Some(data) = line.strip_prefix("data: ") {
                             if let Err(error) = parser.consume(data, &tx) {
                                 let _ = tx.send(ProviderEvent::Failed(error));
@@ -131,6 +147,10 @@ impl Provider for DeepSeekProvider {
                                 return;
                             }
                         }
+                    }
+                    if parser.buffer.len() > MAX_SSE_BUFFER_BYTES {
+                        let _ = tx.send(ProviderEvent::Failed(sse_buffer_limit_error()));
+                        return;
                     }
                 }
             });
@@ -147,7 +167,25 @@ fn cancelled_error() -> ProviderError {
     }
 }
 
-fn http_error(status: u16, body: &str) -> ProviderError {
+fn sse_buffer_limit_error() -> ProviderError {
+    ProviderError::protocol(format!(
+        "provider SSE event exceeded the {MAX_SSE_BUFFER_BYTES} byte buffer limit"
+    ))
+}
+
+fn take_sse_line(buffer: &mut Vec<u8>, newline: usize) -> Result<String, ProviderError> {
+    let remainder = buffer.split_off(newline + 1);
+    let mut line = std::mem::replace(buffer, remainder);
+    line.truncate(newline);
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line).map_err(|error| {
+        ProviderError::protocol(format!("provider SSE line is not valid UTF-8: {error}"))
+    })
+}
+
+fn http_error(status: u16, body: &str, api_key: &str) -> ProviderError {
     let (kind, retry) = match status {
         401 => (ProviderErrorKind::Authentication, RetryHint::Never),
         403 => (ProviderErrorKind::Authorization, RetryHint::Never),
@@ -166,9 +204,20 @@ fn http_error(status: u16, body: &str) -> ProviderError {
         kind,
         message: format!(
             "provider HTTP {status}: {}",
-            body.trim().chars().take(400).collect::<String>()
+            redact_secret(body.trim(), api_key)
+                .chars()
+                .take(400)
+                .collect::<String>()
         ),
         retry,
+    }
+}
+
+fn redact_secret(message: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(secret, "[REDACTED]")
     }
 }
 
@@ -404,7 +453,7 @@ struct ToolAccumulator {
 }
 
 struct SseParser {
-    buffer: String,
+    buffer: Vec<u8>,
     requested: ModelRef,
     tools: BTreeMap<u32, ToolAccumulator>,
     terminal: bool,
@@ -416,7 +465,7 @@ struct SseParser {
 impl SseParser {
     fn new(requested: ModelRef) -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             requested,
             tools: BTreeMap::new(),
             terminal: false,
@@ -444,26 +493,32 @@ impl SseParser {
         })?;
         self.response_id = self.response_id.clone().or(chunk.id);
         self.response_model = self.response_model.clone().or(chunk.model);
-        self.ensure_started(tx);
+        self.ensure_started(tx)?;
         if let Some(usage) = chunk.usage {
-            let _ = tx.send(ProviderEvent::UsageUpdated(usage.into()));
+            send_event(tx, ProviderEvent::UsageUpdated(usage.into()))?;
         }
         for choice in chunk.choices.unwrap_or_default() {
             if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
-                let _ = tx.send(ProviderEvent::TextDelta {
-                    part: PartIndex(0),
-                    delta: text,
-                });
+                send_event(
+                    tx,
+                    ProviderEvent::TextDelta {
+                        part: PartIndex(0),
+                        delta: text,
+                    },
+                )?;
             }
             if let Some(text) = choice
                 .delta
                 .reasoning_content
                 .filter(|text| !text.is_empty())
             {
-                let _ = tx.send(ProviderEvent::ReasoningDelta {
-                    part: PartIndex(1),
-                    delta: text,
-                });
+                send_event(
+                    tx,
+                    ProviderEvent::ReasoningDelta {
+                        part: PartIndex(1),
+                        delta: text,
+                    },
+                )?;
             }
             for delta in choice.delta.tool_calls {
                 let index = delta.index.unwrap_or(0);
@@ -480,27 +535,42 @@ impl SseParser {
                     tool.name = name;
                 }
                 if let Some(arguments) = delta.function.arguments {
+                    let bytes = tool.arguments.len().saturating_add(arguments.len());
+                    if bytes > MAX_TOOL_ARGUMENT_BUFFER_BYTES {
+                        return Err(ProviderError::protocol(format!(
+                            "tool call {index} arguments exceeded the {MAX_TOOL_ARGUMENT_BUFFER_BYTES} byte buffer limit"
+                        )));
+                    }
                     tool.arguments.push_str(&arguments);
                 }
                 if !tool.started && !tool.id.is_empty() && !tool.name.is_empty() {
-                    let _ = tx.send(ProviderEvent::ToolCallStarted {
-                        part: PartIndex(2 + index),
-                        id: tool.id.clone().into(),
-                        name: tool.name.clone(),
-                    });
-                    if !tool.arguments.is_empty() {
-                        let _ = tx.send(ProviderEvent::ToolArgumentsDelta {
+                    send_event(
+                        tx,
+                        ProviderEvent::ToolCallStarted {
                             part: PartIndex(2 + index),
-                            delta: std::mem::take(&mut tool.arguments),
-                        });
+                            id: tool.id.clone().into(),
+                            name: tool.name.clone(),
+                        },
+                    )?;
+                    if !tool.arguments.is_empty() {
+                        send_event(
+                            tx,
+                            ProviderEvent::ToolArgumentsDelta {
+                                part: PartIndex(2 + index),
+                                delta: std::mem::take(&mut tool.arguments),
+                            },
+                        )?;
                     }
                     tool.started = true;
                 }
                 if tool.started && !tool.arguments.is_empty() {
-                    let _ = tx.send(ProviderEvent::ToolArgumentsDelta {
-                        part: PartIndex(2 + index),
-                        delta: std::mem::take(&mut tool.arguments),
-                    });
+                    send_event(
+                        tx,
+                        ProviderEvent::ToolArgumentsDelta {
+                            part: PartIndex(2 + index),
+                            delta: std::mem::take(&mut tool.arguments),
+                        },
+                    )?;
                 }
             }
             if let Some(reason) = choice.finish_reason {
@@ -516,7 +586,7 @@ impl SseParser {
         reason: &str,
         tx: &tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
     ) -> Result<(), ProviderError> {
-        self.ensure_started(tx);
+        self.ensure_started(tx)?;
         for (index, tool) in &mut self.tools {
             if !tool.started {
                 return Err(ProviderError::protocol(format!(
@@ -524,10 +594,13 @@ impl SseParser {
                 )));
             }
             if !tool.arguments.is_empty() {
-                let _ = tx.send(ProviderEvent::ToolArgumentsDelta {
-                    part: PartIndex(2 + *index),
-                    delta: std::mem::take(&mut tool.arguments),
-                });
+                send_event(
+                    tx,
+                    ProviderEvent::ToolArgumentsDelta {
+                        part: PartIndex(2 + *index),
+                        delta: std::mem::take(&mut tool.arguments),
+                    },
+                )?;
             }
         }
         let stop_reason = match reason {
@@ -537,28 +610,44 @@ impl SseParser {
             "stop" | "" => StopReason::EndTurn,
             other => StopReason::Other(other.to_owned()),
         };
-        let _ = tx.send(ProviderEvent::Completed(ProviderCompletion {
-            stop_reason,
-            usage: None,
-            provider_state: None,
-        }));
+        send_event(
+            tx,
+            ProviderEvent::Completed(ProviderCompletion {
+                stop_reason,
+                usage: None,
+                provider_state: None,
+            }),
+        )?;
         self.terminal = true;
         Ok(())
     }
 
-    fn ensure_started(&mut self, tx: &tokio::sync::mpsc::UnboundedSender<ProviderEvent>) {
+    fn ensure_started(
+        &mut self,
+        tx: &tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+    ) -> Result<(), ProviderError> {
         if self.started {
-            return;
+            return Ok(());
         }
         self.started = true;
-        let _ = tx.send(ProviderEvent::ResponseStarted(ResponseInfo {
-            provenance: ResponseProvenance {
-                requested: self.requested.clone(),
-                response_model: self.response_model.clone(),
-                response_id: self.response_id.clone(),
-            },
-        }));
+        send_event(
+            tx,
+            ProviderEvent::ResponseStarted(ResponseInfo {
+                provenance: ResponseProvenance {
+                    requested: self.requested.clone(),
+                    response_model: self.response_model.clone(),
+                    response_id: self.response_id.clone(),
+                },
+            }),
+        )
     }
+}
+
+fn send_event(
+    tx: &tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+    event: ProviderEvent,
+) -> Result<(), ProviderError> {
+    tx.send(event).map_err(|_| cancelled_error())
 }
 
 #[cfg(test)]
@@ -595,5 +684,31 @@ mod tests {
         assert_eq!(body.messages[0].role, "system");
         assert_eq!(body.messages[1].role, "user");
         assert_eq!(json!(body.messages[1].content), json!("hi"));
+    }
+
+    #[test]
+    fn provider_http_errors_redact_the_configured_api_key() {
+        let error = http_error(
+            500,
+            r#"{"error":"request mentioned secret-api-key"}"#,
+            "secret-api-key",
+        );
+
+        assert!(!error.message.contains("secret-api-key"));
+        assert!(error.message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sse_line_decoding_preserves_utf8_split_across_network_chunks() {
+        let encoded = "data: 你好\n".as_bytes();
+        let mut buffer = encoded[..7].to_vec();
+        assert!(!buffer.contains(&b'\n'));
+
+        buffer.extend_from_slice(&encoded[7..]);
+        let newline = buffer.iter().position(|byte| *byte == b'\n').unwrap();
+        let line = take_sse_line(&mut buffer, newline).unwrap();
+
+        assert_eq!(line, "data: 你好");
+        assert!(buffer.is_empty());
     }
 }

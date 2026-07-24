@@ -1,9 +1,60 @@
-use crossterm::event::{Event, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiKeyEvent {
+    pub code: TuiKeyCode,
+    pub modifiers: TuiKeyModifiers,
+}
+
+impl TuiKeyEvent {
+    pub const fn new(code: TuiKeyCode, modifiers: TuiKeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiKeyCode {
+    Char(char),
+    Backspace,
+    Enter,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Delete,
+    Escape,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TuiKeyModifiers {
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+impl TuiKeyModifiers {
+    pub const NONE: Self = Self {
+        control: false,
+        alt: false,
+        shift: false,
+    };
+
+    pub const fn new(control: bool, alt: bool, shift: bool) -> Self {
+        Self {
+            control,
+            alt,
+            shift,
+        }
+    }
+}
 
 /// Terminal events after transport-specific noise has been removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiEvent {
-    Key(KeyEvent),
+    Key(TuiKeyEvent),
     Paste(String),
     Resize { columns: u16, rows: u16 },
 }
@@ -12,12 +63,37 @@ impl TuiEvent {
     pub fn from_crossterm(event: Event) -> Option<Self> {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                Some(Self::Key(key))
+                Some(Self::Key(normalize_key(key)))
             }
             Event::Paste(text) => Some(Self::Paste(text)),
             Event::Resize(columns, rows) => Some(Self::Resize { columns, rows }),
             _ => None,
         }
+    }
+}
+
+fn normalize_key(key: KeyEvent) -> TuiKeyEvent {
+    let code = match key.code {
+        KeyCode::Char(value) => TuiKeyCode::Char(value),
+        KeyCode::Backspace => TuiKeyCode::Backspace,
+        KeyCode::Enter => TuiKeyCode::Enter,
+        KeyCode::Left => TuiKeyCode::Left,
+        KeyCode::Right => TuiKeyCode::Right,
+        KeyCode::Up => TuiKeyCode::Up,
+        KeyCode::Down => TuiKeyCode::Down,
+        KeyCode::Home => TuiKeyCode::Home,
+        KeyCode::End => TuiKeyCode::End,
+        KeyCode::Delete => TuiKeyCode::Delete,
+        KeyCode::Esc => TuiKeyCode::Escape,
+        _ => TuiKeyCode::Other,
+    };
+    TuiKeyEvent {
+        code,
+        modifiers: TuiKeyModifiers {
+            control: key.modifiers.contains(KeyModifiers::CONTROL),
+            alt: key.modifiers.contains(KeyModifiers::ALT),
+            shift: key.modifiers.contains(KeyModifiers::SHIFT),
+        },
     }
 }
 

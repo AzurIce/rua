@@ -27,7 +27,7 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 
 ## 已记录的目标设计
 
-### [D0001：Agent Runtime 与会话所有权](designs/d0001-agent-runtime.md)
+### [D0001：Agent Runtime 与会话所有权](designs/D0001-agent-runtime.md)
 
 定义：
 
@@ -37,7 +37,7 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - 可重入 turn、稳定提交点和 execution journal；
 - runtime、provider、tools 和 UI 的顶层职责边界。
 
-### [D0002：Provider 边界与标准消息模型](designs/d0002-provider-model.md)
+### [D0002：Provider 边界与标准消息模型](designs/D0002-provider-model.md)
 
 定义：
 
@@ -47,7 +47,7 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - provider stream 的唯一 terminal event 和 completion validation；
 - provider error classification、retry hint 和跨 provider history 转换。
 
-### [D0003：TUI 架构与终端交互](designs/d0003-tui-architecture.md)
+### [D0003：TUI 架构与终端交互](designs/D0003-tui-architecture.md)
 
 定义：
 
@@ -56,7 +56,7 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - AppController、display projection、commands 与 runtime events 的关系；
 - frame scheduling、背压、错误恢复和 Windows IME 分阶段策略。
 
-### [D0004：Tool Runtime 与执行语义](designs/d0004-tool-runtime.md)
+### [D0004：Tool Runtime 与执行语义](designs/D0004-tool-runtime.md)
 
 定义：
 
@@ -65,7 +65,7 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - known failure 与 outcome unknown 的区别；
 - 取消、输出上限、串行执行和跨平台 shell 策略。
 
-### [D0005：执行 Journal 与 Session 恢复](designs/d0005-execution-journal-and-session-recovery.md)
+### [D0005：执行 Journal 与 Session 恢复](designs/D0005-execution-journal-and-session-recovery.md)
 
 定义：
 
@@ -106,25 +106,30 @@ RuntimeEvent -> AppState projection -> TUI
 ```
 
 - `AgentRuntime` 是 canonical conversation 的唯一写入者，并执行 model—tool—model loop。
+- 每个 turn 同时受 provider attempt、model step 和累计 tool-call 上限约束；tool-call 超限在 assistant draft 提交前终止，避免留下缺少对应 results 的 canonical message。
 - 同一 model step 的 retry 复用稳定 conversation snapshot 和 `StepId`，使用新的 `AttemptId`；失败 draft 不提交。
 - provider failure 后 turn 可从稳定 revision 进程内 `resume`，TUI 通过 `Ctrl+R` 触发。
 - `DeepSeekProvider` 把 canonical request 编译为 wire messages，并把 SSE 转换为经 accumulator 校验的 `ProviderEvent`。
-- `ToolRegistry` 使用开放 trait 注册工具；Bash 在 Windows 使用 PowerShell，在 Unix 使用 `sh`。
+- Provider accumulator 对 opaque provider state 执行 scope 与序列化大小校验；DeepSeek 的可展示 HTTP/transport 错误会移除已配置 API key。
+- `ToolRegistry` 使用开放 trait 注册工具，在注册时编译 JSON Schema，并在调用进入具体工具前执行通用参数与大小校验；Bash 在 Windows 使用 PowerShell 和 Job Object，在 Unix 使用 `sh` 和 process group。取消或超时时会终止并回收整个进程树，stdout/stderr 会持续排空但只保留有界内容，启动后的等待或通信故障仍诚实地归类为 outcome unknown。
 - `AppState.history` 仅是 `RuntimeEvent` 的展示投影，不再反向构造模型 history。
 - 旧 `src/session.rs`、`src/deepseek.rs` 和 `src/tools.rs` 已删除，仓库只保留新的 runtime/provider/tool 路径。
-- `src/tui` 已实现 terminal guard、规范化事件、grapheme-safe composer、paste 分流和真实硬件光标。
+- `src/tui` 已实现可报告首个恢复错误的 terminal guard、backend-neutral key event、grapheme-safe composer、paste 分流和真实硬件光标；Crossterm 类型不再进入 app 或 agent 层。
+- `AppController` 已串行处理 terminal/runtime 事件并产生显式 commands；terminal input 与 runtime projection 使用独立通道并优先处理输入，相邻 text/reasoning deltas 在 lifecycle boundary 前合并；frame scheduler 合并 dirty draw，并仅在动画活动时按 deadline 推进 spinner。
+- Tool registry 除 Bash 外已提供 workspace-scoped read/write/edit/glob/grep；只读工具声明 `ReadOnly` replay class，写工具声明 `Effectful`，输出与搜索结果均有界。
+- Effectful/Unknown 工具支持 durable `auto`/`ask`/`never` approval；pending approval 可跨进程恢复，且 approval resolution 在 `ToolExecutionStarted` 前落盘。
+- 可选 `RUA_INPUT_TRACE` 记录脱敏的 terminal event 类型、修饰键、时间与环境能力，不记录键入字符或 paste 内容。
 
-尚未实现的关键部分是 D0005 的持久化 execution journal/crash recovery、完整 AppController/frame scheduler、approval/sandbox，以及配置与资源装配设计。
+D0005 的核心恢复路径已经落地：`SessionStore` 端口、conversation/tool write-ahead 记录、带长度与 checksum framing 的本地 WAL、原子 snapshot、单 writer 锁、journal replay、raw export/validation、崩溃尾部自动截断，以及 outcome unknown 的显式 reconciliation。Session ID 不能逃逸项目内目录，Unix session 目录和文件会收紧为用户私有权限。完整 frame 的 checksum 或中间记录损坏仍会被拒绝，不能被 repair 命令静默截断。尚未实现的关键部分是 schema migration、针对中间损坏的只读报告/显式修复流程、强隔离 sandbox、Windows IME 测试矩阵，以及配置与资源装配设计。
 
 ## 推进顺序
 
 当前建议顺序如下：
 
-1. 按 D0005 实现 in-memory journal 与 runtime write-ahead 状态机，再实现本地 snapshot/WAL 和 crash recovery。
-2. 记录配置、凭据与应用装配设计，解除 `main.rs` 对单一 DeepSeek 配置的硬编码。
-3. 按 D0003 补齐 AppController、显式 command、cancel/retry 状态机和 frame scheduler。
-4. 在 Tool Runtime 上增加 approval、sandbox、专用 coding tools 和 output streaming。
-5. 完成 Windows input backend trace 与 IME 测试矩阵，再决定 VT/legacy/cooked 模式。
-6. 设计项目规则、skills、prompt resources 与 context compaction。
+1. 记录配置、凭据与应用装配设计，解除 `main.rs` 对单一 DeepSeek 配置的硬编码。
+2. 在 Tool Runtime 已有 approval、coding tools、workspace cwd、timeout 和进程树清理基础上，继续补强 OS sandbox 与 output streaming。
+3. 为 D0005 增加 schema migration，并维持对非尾部损坏的拒绝与原始证据保留。
+4. 完成 Windows input backend trace 与 IME 测试矩阵，再决定 VT/legacy/cooked 模式。
+5. 设计项目规则、skills、prompt resources 与 context compaction。
 
 每项实现都应明确区分当前行为和目标设计。Active design 与实现尚未对齐期间，提交应按项目采用的 design transition 协议标记 WIP，直至实现经过验证。

@@ -5,9 +5,11 @@
 //! that the application can project into a view.
 
 mod composer;
+mod diagnostics;
 mod event;
 mod terminal;
 
 pub use composer::{Composer, ComposerViewport};
-pub use event::TuiEvent;
+pub use diagnostics::InputTrace;
+pub use event::{TuiEvent, TuiKeyCode, TuiKeyEvent, TuiKeyModifiers};
 pub use terminal::TerminalSession;

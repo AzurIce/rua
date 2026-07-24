@@ -50,7 +50,7 @@ ToolDefinition
 intended -> started -> outcome recorded -> result committed
 ```
 
-如果 durable `started` 写入失败，动作不得开始。如果动作已经开始、但 outcome 记录失败，Rua 不能倒推“它一定没发生”；恢复规则由 [D0005](d0005-execution-journal-and-session-recovery.md) 定义。
+如果 durable `started` 写入失败，动作不得开始。如果动作已经开始、但 outcome 记录失败，Rua 不能倒推“它一定没发生”；恢复规则由 [D0005](D0005-execution-journal-and-session-recovery.md) 定义。
 
 ## 重放需要契约，也需要证据
 

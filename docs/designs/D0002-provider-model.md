@@ -4,7 +4,7 @@
 
 Rua 当前使用 `deepseek.rs` 中的 `Message`、`ToolCall` 和 `StreamEvent` 作为 agent loop 的输入与输出。它们既承担 DeepSeek wire format，又承担 session 内的 conversation model。`ChatEntry` 再把其中一部分信息转换为 TUI history。这个结构无法无损保存 tool calls 和 reasoning，也让重试、切换 provider、持久化及测试都依赖 DeepSeek 的协议细节。
 
-[D0001：Agent Runtime 与会话所有权](d0001-agent-runtime.md) 确立了 `AgentRuntime` 对 canonical conversation 和 turn lifecycle 的所有权。本文进一步定义 runtime 与 provider 之间共享的标准模型：conversation 保存什么、provider 接收什么、流式响应如何完成，以及 provider 特有状态如何在不污染核心模型的情况下保留下来。
+[D0001：Agent Runtime 与会话所有权](D0001-agent-runtime.md) 确立了 `AgentRuntime` 对 canonical conversation 和 turn lifecycle 的所有权。本文进一步定义 runtime 与 provider 之间共享的标准模型：conversation 保存什么、provider 接收什么、流式响应如何完成，以及 provider 特有状态如何在不污染核心模型的情况下保留下来。
 
 Provider 是 adapter，不是 Rua 的 domain model。这不等于取所有供应商能力的最小交集：canonical model 保留 agent loop 真正依赖的语义，无法安全标准化的能力则通过有作用域的 opaque state 往返。这样既能跨 provider 延续 conversation，也不会让某一家 SDK 的 message enum 变成 runtime 的事实来源。
 
