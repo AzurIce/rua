@@ -10,8 +10,8 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use rua::agent::{
-    AgentRuntime, ApiFamily, ApprovalMode, BashTool, DeepSeekProvider, LocalSessionStore, ModelRef,
-    ProviderId, ReconciliationDecision, RuntimeEvent, SessionId, ToolCallId, ToolRegistry,
+    AgentRuntime, ApiFamily, BashTool, DeepSeekProvider, LocalSessionStore, ModelRef, ProviderId,
+    ReconciliationDecision, RuntimeEvent, SessionId, ToolCallId, ToolRegistry,
     register_coding_tools,
 };
 use rua::app::{App, AppCommand, AppController, FrameScheduler, UiEvent};
@@ -102,7 +102,6 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
     });
 
     // Agent core: canonical conversation, provider adapter and tool runtime.
-    let approval_mode = options.approval;
     let provider = Arc::new(DeepSeekProvider::new(&config.deepseek)?);
     let mut tools = ToolRegistry::new();
     tools.register(BashTool::for_workspace(&project_root)?)?;
@@ -115,27 +114,24 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
     };
     let store = Arc::new(LocalSessionStore::new(project_root));
     let recovered = options.session.is_some();
-    let mut runtime = Arc::new(
-        (if let Some(session_id) = options.session {
-            AgentRuntime::recover(
-                provider.clone(),
-                tools.clone(),
-                model.clone(),
-                store.clone(),
-                session_id,
-            )
-            .await?
-        } else {
-            AgentRuntime::new(
-                provider.clone(),
-                tools.clone(),
-                "You are rua, an AI coding agent.",
-                model.clone(),
-            )
-            .with_session_store(store.clone())
-        })
-        .with_approval_mode(approval_mode),
-    );
+    let mut runtime = Arc::new(if let Some(session_id) = options.session {
+        AgentRuntime::recover(
+            provider.clone(),
+            tools.clone(),
+            model.clone(),
+            store.clone(),
+            session_id,
+        )
+        .await?
+    } else {
+        AgentRuntime::new(
+            provider.clone(),
+            tools.clone(),
+            "You are rua, an AI coding agent.",
+            model.clone(),
+        )
+        .with_session_store(store.clone())
+    });
     if !recovered {
         controller
             .state_mut()
@@ -216,21 +212,6 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
                         }
                     }
                 }
-                AppCommand::InspectApproval => {
-                    let tools = runtime.approval_tools().await;
-                    if tools.is_empty() {
-                        controller
-                            .state_mut()
-                            .add_system_message("no tool approval is pending");
-                    } else {
-                        for tool in tools {
-                            controller.state_mut().add_system_message(&format!(
-                                "{} {}({}) replay={:?}",
-                                tool.tool_call_id, tool.name, tool.arguments, tool.replay_class
-                            ));
-                        }
-                    }
-                }
                 AppCommand::ListSessions => match store.list_session_ids() {
                     Ok(session_ids) => {
                         controller
@@ -266,7 +247,7 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
                         .await
                         {
                             Ok(next) => {
-                                runtime = Arc::new(next.with_approval_mode(approval_mode));
+                                runtime = Arc::new(next);
                                 runtime.publish_recovery(&runtime_tx).await;
                             }
                             Err(error) => controller.state_mut().add_error(&error.to_string()),
@@ -316,19 +297,6 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
                         runtime_tx.clone(),
                         tool_call_id,
                         decision,
-                    ));
-                }
-                AppCommand::ResolveApproval {
-                    tool_call_id,
-                    approved,
-                    reason,
-                } => {
-                    stream_task = Some(spawn_approval(
-                        Arc::clone(&runtime),
-                        runtime_tx.clone(),
-                        tool_call_id,
-                        approved,
-                        reason,
                     ));
                 }
                 AppCommand::CancelTurn => {
@@ -485,38 +453,8 @@ fn spawn_reconciliation(
     (task, cancel)
 }
 
-fn spawn_approval(
-    runtime: Arc<AgentRuntime>,
-    runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    tool_call_id: ToolCallId,
-    approved: bool,
-    reason: Option<String>,
-) -> StreamTask {
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
-        if let Err(error) = runtime
-            .resolve_tool_approval(tool_call_id, approved, reason, &runtime_tx, task_cancel)
-            .await
-        {
-            let event = match error {
-                rua::agent::RuntimeError::ApprovalRequired(_) => return,
-                rua::agent::RuntimeError::Persistence(error) => RuntimeEvent::PersistenceFailed {
-                    message: error.to_string(),
-                },
-                error => RuntimeEvent::OperationFailed {
-                    message: error.to_string(),
-                },
-            };
-            let _ = runtime_tx.send(event);
-        }
-    });
-    (task, cancel)
-}
-
 struct StartupOptions {
     session: Option<SessionId>,
-    approval: ApprovalMode,
     maintenance: Option<MaintenanceAction>,
 }
 
@@ -536,7 +474,6 @@ enum MaintenanceAction {
 fn startup_options() -> Result<StartupOptions> {
     let mut args = std::env::args().skip(1);
     let mut session = None;
-    let mut approval = ApprovalMode::Ask;
     let mut maintenance = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -545,21 +482,6 @@ fn startup_options() -> Result<StartupOptions> {
                     .next()
                     .ok_or_else(|| color_eyre::eyre::eyre!("--session requires a session id"))?;
                 session = Some(SessionId::new(value));
-            }
-            "--approval" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| color_eyre::eyre::eyre!("--approval requires a mode"))?;
-                approval = match value.as_str() {
-                    "auto" => ApprovalMode::Auto,
-                    "ask" => ApprovalMode::Ask,
-                    "never" => ApprovalMode::Never,
-                    _ => {
-                        return Err(color_eyre::eyre::eyre!(
-                            "invalid approval mode {value:?}; expected auto, ask, or never"
-                        ));
-                    }
-                };
             }
             "--validate-session" => {
                 let value = args.next().ok_or_else(|| {
@@ -591,7 +513,7 @@ fn startup_options() -> Result<StartupOptions> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: rua [--session <session-id>] [--approval auto|ask|never]\n       rua --validate-session <session-id>\n       rua --export-session <session-id> <destination>\n       rua --repair-session <session-id>"
+                    "Usage: rua [--session <session-id>]\n       rua --validate-session <session-id>\n       rua --export-session <session-id> <destination>\n       rua --repair-session <session-id>"
                 );
                 std::process::exit(0);
             }
@@ -605,7 +527,6 @@ fn startup_options() -> Result<StartupOptions> {
     }
     Ok(StartupOptions {
         session,
-        approval,
         maintenance,
     })
 }

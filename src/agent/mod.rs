@@ -14,7 +14,7 @@ pub use deepseek::DeepSeekProvider;
 pub use journal::{
     AttemptFailure, AttemptRecord, DurableToolCall, DurableTurn, InMemorySessionStore,
     JournalEntry, JournalRecord, JournalSequence, ReconciliationDecision, RecoveredSession,
-    SessionStore, StoreError, ToolApprovalState, TurnPhase,
+    SessionStore, StoreError, TurnPhase,
 };
 pub use provider::{
     AccumulatorOutcome, Provider, ProviderEvent, ProviderStream, ResponseAccumulator,

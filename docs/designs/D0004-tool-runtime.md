@@ -87,4 +87,4 @@ Runtime event 描述观察事实，例如 execution started、output available�
 
 Bash tool 接收 `{"command": "..."}`，在 Windows 使用 PowerShell，在 Unix 使用 `sh`。进程启动失败、明确的非零退出与非法参数属于 `FailedKnown`；启动后的取消或通信中断可能属于 `OutcomeUnknown`。stdout/stderr 必须有界并注明截断。
 
-Shell 选择、sandbox、approval UX、具体进程树清理和 streaming transport 都可以演进，不改变上面的 identity、outcome 与 commit 语义。因此它们不是 Tool Runtime 的中心模型。
+Rua 与 pi 一样不在核心 Tool Runtime 中内建逐次审批：注册的工具直接以 Rua 进程已经获得的用户权限执行。需要额外限制时，应在容器、OS sandbox 或未来的扩展策略层收紧能力，而不是在 tool call 与 durable execution 之间插入交互状态机。Shell 选择、sandbox、具体进程树清理和 streaming transport 都可以演进，不改变上面的 identity、outcome 与 commit 语义。因此它们不是 Tool Runtime 的中心模型。

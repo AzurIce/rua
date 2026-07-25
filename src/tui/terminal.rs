@@ -3,7 +3,7 @@ use std::io::{self, stdout};
 use crossterm::{
     ExecutableCommand,
     cursor::Show,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
@@ -12,6 +12,7 @@ pub struct TerminalSession {
     raw_mode: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
 }
 
 impl TerminalSession {
@@ -20,6 +21,7 @@ impl TerminalSession {
             raw_mode: false,
             alternate_screen: false,
             bracketed_paste: false,
+            mouse_capture: false,
         };
 
         enable_raw_mode()?;
@@ -31,6 +33,9 @@ impl TerminalSession {
         stdout().execute(EnableBracketedPaste)?;
         session.bracketed_paste = true;
 
+        stdout().execute(EnableMouseCapture)?;
+        session.mouse_capture = true;
+
         Ok(session)
     }
 
@@ -40,6 +45,13 @@ impl TerminalSession {
 
     fn restore(&mut self) -> io::Result<()> {
         let mut first_error = None;
+        if self.mouse_capture {
+            record_first_error(
+                &mut first_error,
+                stdout().execute(DisableMouseCapture).map(|_| ()),
+            );
+            self.mouse_capture = false;
+        }
         if self.bracketed_paste {
             record_first_error(
                 &mut first_error,

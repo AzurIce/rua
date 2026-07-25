@@ -1,4 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TuiKeyEvent {
@@ -58,6 +58,7 @@ pub enum TuiEvent {
     Key(TuiKeyEvent),
     Paste(String),
     Resize { columns: u16, rows: u16 },
+    MouseScroll { up: bool },
 }
 
 impl TuiEvent {
@@ -68,6 +69,11 @@ impl TuiEvent {
             }
             Event::Paste(text) => Some(Self::Paste(text)),
             Event::Resize(columns, rows) => Some(Self::Resize { columns, rows }),
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => Some(Self::MouseScroll { up: true }),
+                MouseEventKind::ScrollDown => Some(Self::MouseScroll { up: false }),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -101,7 +107,7 @@ fn normalize_key(key: KeyEvent) -> TuiKeyEvent {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
     use super::*;
 
@@ -121,6 +127,21 @@ mod tests {
         assert_eq!(
             TuiEvent::from_crossterm(Event::Paste("你好\nworld".to_string())),
             Some(TuiEvent::Paste("你好\nworld".to_string()))
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_is_normalized_without_leaking_crossterm_types() {
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(
+            TuiEvent::from_crossterm(event),
+            Some(TuiEvent::MouseScroll { up: true })
         );
     }
 }

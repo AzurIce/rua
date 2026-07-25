@@ -75,13 +75,11 @@ pub struct AppState {
     pub token_count: usize,
     pub can_resume_turn: bool,
     pub command_assist: CommandAssistState,
-    approval_tool_calls: Vec<String>,
     recovery_tool_calls: Vec<String>,
     session_ids: Vec<String>,
-    prompt_history: Vec<String>,
-    command_history: Vec<String>,
-    prompt_history_cursor: Option<usize>,
-    command_history_cursor: Option<usize>,
+    input_history: Vec<InputHistoryEntry>,
+    input_history_cursor: Option<usize>,
+    input_history_filter: Option<InputHistoryKind>,
     command_context_revision: u64,
 }
 
@@ -93,6 +91,19 @@ pub struct CommandAssistState {
     pub diagnostic: Option<String>,
     pub open: bool,
     pub active_request: Option<CompletionRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputHistoryKind {
+    Prompt,
+    Command,
+    All,
+}
+
+#[derive(Debug, Clone)]
+struct InputHistoryEntry {
+    kind: InputHistoryKind,
+    text: String,
 }
 
 impl AppState {
@@ -110,13 +121,11 @@ impl AppState {
             token_count: 0,
             can_resume_turn: false,
             command_assist: CommandAssistState::default(),
-            approval_tool_calls: Vec::new(),
             recovery_tool_calls: Vec::new(),
             session_ids: Vec::new(),
-            prompt_history: Vec::new(),
-            command_history: Vec::new(),
-            prompt_history_cursor: None,
-            command_history_cursor: None,
+            input_history: Vec::new(),
+            input_history_cursor: None,
+            input_history_filter: None,
             command_context_revision: 0,
         }
     }
@@ -143,8 +152,11 @@ impl AppState {
         if text.trim().is_empty() {
             return None;
         }
-        self.prompt_history.push(text.clone());
-        self.prompt_history_cursor = None;
+        self.input_history.push(InputHistoryEntry {
+            kind: InputHistoryKind::Prompt,
+            text: text.clone(),
+        });
+        self.reset_input_history_navigation();
         self.composer.clear();
         self.command_assist = CommandAssistState::default();
         self.current_response.clear();
@@ -170,7 +182,6 @@ impl AppState {
             self.composer.text(),
             self.composer.cursor(),
             CompletionContext {
-                approval_tool_calls: &self.approval_tool_calls,
                 recovery_tool_calls: &self.recovery_tool_calls,
                 session_ids: &self.session_ids,
             },
@@ -299,7 +310,6 @@ impl AppState {
         CommandContext {
             revision: self.command_context_revision,
             is_streaming: self.is_streaming,
-            approval_pending: !self.approval_tool_calls.is_empty(),
             recovery_pending: !self.recovery_tool_calls.is_empty(),
         }
     }
@@ -309,36 +319,63 @@ impl AppState {
     }
 
     pub fn record_command_history(&mut self, command: String) {
-        self.command_history.push(command);
-        self.command_history_cursor = None;
+        self.input_history.push(InputHistoryEntry {
+            kind: InputHistoryKind::Command,
+            text: command,
+        });
+        self.reset_input_history_navigation();
     }
 
     pub fn navigate_input_history(&mut self, older: bool) -> bool {
-        let command_mode = self.composer.text().starts_with('/');
-        let (entries, cursor) = if command_mode {
-            (&self.command_history, &mut self.command_history_cursor)
-        } else {
-            (&self.prompt_history, &mut self.prompt_history_cursor)
-        };
-        if entries.is_empty() {
+        if self.input_history.is_empty() {
             return false;
         }
-        let next = if older {
-            cursor.map_or(entries.len() - 1, |index| index.saturating_sub(1))
-        } else {
-            match cursor {
-                Some(index) if *index + 1 < entries.len() => *index + 1,
-                Some(_) => {
-                    *cursor = None;
-                    self.composer.clear();
-                    return true;
-                }
-                None => return false,
+        let filter = *self.input_history_filter.get_or_insert_with(|| {
+            if self.composer.is_empty() {
+                InputHistoryKind::All
+            } else if self.composer.text().starts_with('/') {
+                InputHistoryKind::Command
+            } else {
+                InputHistoryKind::Prompt
             }
+        });
+        let matches =
+            |entry: &InputHistoryEntry| filter == InputHistoryKind::All || entry.kind == filter;
+        let next = if older {
+            let before = self
+                .input_history_cursor
+                .unwrap_or(self.input_history.len());
+            self.input_history[..before].iter().rposition(matches)
+        } else {
+            let Some(current) = self.input_history_cursor else {
+                return false;
+            };
+            self.input_history[current + 1..]
+                .iter()
+                .position(matches)
+                .map(|offset| current + 1 + offset)
         };
-        *cursor = Some(next);
-        self.composer.set_text(entries[next].clone());
-        true
+        if let Some(next) = next {
+            self.input_history_cursor = Some(next);
+            self.composer
+                .set_text(self.input_history[next].text.clone());
+            true
+        } else if !older && self.input_history_cursor.is_some() {
+            self.reset_input_history_navigation();
+            self.composer.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn reset_input_history_navigation(&mut self) {
+        self.input_history_cursor = None;
+        self.input_history_filter = None;
+    }
+
+    pub fn is_navigating_input_history(&self) -> bool {
+        self.input_history_cursor.is_some()
     }
 
     pub fn begin_resume(&mut self) {
@@ -357,7 +394,6 @@ impl AppState {
                 conversation,
             } => {
                 push_unique(&mut self.session_ids, session_id.to_string());
-                self.approval_tool_calls.clear();
                 self.recovery_tool_calls.clear();
                 self.history.clear();
                 self.add_system_message(&format!("recovered session {session_id}"));
@@ -435,21 +471,6 @@ impl AppState {
                     "Recovery required for {tool_call_id}: {message}. Use /recovery inspect."
                 ));
             }
-            RuntimeEvent::ApprovalRequired {
-                tool_call_id,
-                name,
-                arguments,
-                replay_class,
-                ..
-            } => {
-                push_unique(&mut self.approval_tool_calls, tool_call_id.to_string());
-                self.is_streaming = false;
-                self.status = AppStatus::Idle;
-                self.can_resume_turn = false;
-                self.add_system_message(&format!(
-                    "Approval required for {tool_call_id}: {name}({arguments}) replay={replay_class:?}. Use /approval approve {tool_call_id} or /approval reject {tool_call_id} [reason]."
-                ));
-            }
             RuntimeEvent::PersistenceFailed { message } => {
                 self.can_resume_turn = false;
                 self.add_error(&format!("Persistence failed: {message}"));
@@ -523,8 +544,6 @@ impl AppState {
                 arguments,
                 ..
             } => {
-                self.approval_tool_calls
-                    .retain(|id| id != &call_id.to_string());
                 self.recovery_tool_calls
                     .retain(|id| id != &call_id.to_string());
                 self.add_tool_call(name, &arguments.to_string());

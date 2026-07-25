@@ -223,13 +223,6 @@ pub enum ReplayClass {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ApprovalMode {
-    Auto,
-    Ask,
-    Never,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerationOptions {
     pub temperature: Option<f32>,

@@ -2,7 +2,7 @@
 
 ## 背景
 
-Rua 的 composer 同时承担两种入口：发送给模型的普通输入，以及只由客户端或 runtime 解释的控制命令。早期实现只在 `AppController` 中识别 `/recovery` 和 `/approval`，并通过字符串分割直接构造 `AppCommand`。这种做法足以打通恢复路径，却无法回答命令如何被发现、参数如何补全、什么状态下可用、未知命令是否会误发给模型，以及新的命令应当在哪一层注册。
+Rua 的 composer 同时承担两种入口：发送给模型的普通输入，以及只由客户端或 runtime 解释的控制命令。早期实现只在 `AppController` 中识别恢复命令，并通过字符串分割直接构造 `AppCommand`。这种做法足以打通恢复路径，却无法回答命令如何被发现、参数如何补全、什么状态下可用、未知命令是否会误发给模型，以及新的命令应当在哪一层注册。
 
 [D0003](D0003-tui-architecture.md) 已经确定 terminal event 经 input action 进入 controller，controller 产生 command，runtime event 只用于 projection；composer 只拥有 draft、cursor 和编辑历史。本设计在这些边界内定义一套统一的 TUI 命令语言和交互协议。[D0001](D0001-agent-runtime.md) 与 [D0005](D0005-execution-journal-and-session-recovery.md) 对 session、turn 和恢复事实的所有权保持不变：TUI 可以发起操作，但不能通过解析展示状态来替 runtime 作决定。
 
@@ -13,7 +13,7 @@ Rua 的 composer 同时承担两种入口：发送给模型的普通输入，以
 - 为命令名、子命令、选项、枚举值和动态资源提供一致的补全与参数提示模型。
 - 定义 completion overlay、ghost text、usage、错误反馈与 composer 的焦点和按键优先级。
 - 让异步候选不会阻塞输入、不会覆盖更新后的 draft，也不会在补全阶段产生外部副作用。
-- 保持 TUI、应用装配、runtime 和 tool runtime 的职责边界，所有有副作用的操作继续服从既有 approval 与 journal 语义。
+- 保持 TUI、应用装配、runtime 和 tool runtime 的职责边界；命令不能绕过 tool journal、session 恢复或外层安全隔离。
 
 ## 非目标
 
@@ -73,7 +73,7 @@ CommandDefinition
 
 registry 在构建时拒绝 canonical name、alias 和稳定 ID 冲突。alias 默认不在空筛选列表中重复展示，但用户输入 alias 时可以匹配并在提示中显示 canonical name。隐藏只影响发现，不等于无法执行；当用户精确输入一个已知但当前不可用的命令时，系统返回具体原因，而不是谎称命令不存在。
 
-`availability` 根据一个只读的 `CommandContext` 判断，例如当前是否有 active turn、是否存在 pending approval、当前 session 是否允许切换。它不能捕获 runtime、provider、store 或 tool 的可变引用。动态状态变化后，controller 生成新的 context 并重新求值，因此 popup 与 Enter 使用同一时刻的可用性规则。
+`availability` 根据一个只读的 `CommandContext` 判断，例如当前是否有 active turn、是否存在 pending recovery、当前 session 是否允许切换。它不能捕获 runtime、provider、store 或 tool 的可变引用。动态状态变化后，controller 生成新的 context 并重新求值，因此 popup 与 Enter 使用同一时刻的可用性规则。
 
 grammar 是结构化参数模式，而不是 usage 字符串。它能够描述必填与可选参数、子命令、互斥选项、枚举值、资源引用和末尾自由文本。usage、当前参数提示、解析诊断和静态补全都从 grammar 派生，避免帮助文本接受一种语法而执行路径解释另一种语法。
 
@@ -99,9 +99,9 @@ Recognizer + CommandRegistry
      local UI  app    runtime command
 ```
 
-`Local` 命令只改变 projection、focus、overlay 或 viewport，例如打开帮助和清理本地显示。`Application` 命令请求装配层协调跨组件操作，例如列出或加载 session。`Runtime` 命令表达 runtime 已定义的业务决定，例如 approval resolution 或 reconciliation。registry 的 `target` 用于帮助、可用性和路由校验；真正的 effect 仍由 controller 输出的显式 command 承载。
+`Local` 命令只改变 projection、focus、overlay 或 viewport，例如打开帮助和清理本地显示。`Application` 命令请求装配层协调跨组件操作，例如列出或加载 session。`Runtime` 命令表达 runtime 已定义的业务决定，例如 outcome-unknown reconciliation。registry 的 `target` 用于帮助、可用性和路由校验；真正的 effect 仍由 controller 输出的显式 command 承载。
 
-命令永远不会因为执行方便而直接调用 provider、tool 或 `SessionStore`。`/session load <id>` 可以成为应用命令，但 session 的验证、锁、恢复和 canonical conversation 仍由 D0005 所定义的 owner 完成。`/approval` 和 `/recovery` 也只提交显式 decision，不能从 TUI history 推断结果。
+命令永远不会因为执行方便而直接调用 provider、tool 或 `SessionStore`。`/session load <id>` 可以成为应用命令，但 session 的验证、锁、恢复和 canonical conversation 仍由 D0005 所定义的 owner 完成。`/recovery` 只提交显式 decision，不能从 TUI history 推断结果。
 
 命令提交后，controller 清空 draft 的时机取决于是否已经接受 invocation：解析失败或上下文已过期时保留原文；同步 local command 成功接受后可以立即清空；异步 application/runtime command 一旦进入命令通道便清空，并在 projection 中显示 accepted、pending、completed 或 failed。local command 的输出是 UI projection item，不自动成为 canonical model message。
 
@@ -182,7 +182,7 @@ CommandAssistState
 
 command popup 可以在 model stream 期间继续工作，但每条命令的 availability 决定能否提交。全局 cancel、terminal failure 等高优先级事件仍遵循 D0003 的调度规则；overlay 不得吞掉 `Ctrl+C` 这类必须立即处理的信号。
 
-从候选被显示到 Enter 提交之间，active turn、approval 或 session 可能已经变化。因此 invocation 带 context revision，controller 在路由前重新验证 availability；过期操作不执行并返回新的原因。该校验不是 runtime 的最终授权，有副作用的 runtime 操作仍需执行时校验、approval 和 durable journal。
+从候选被显示到 Enter 提交之间，active turn、recovery 或 session 可能已经变化。因此 invocation 带 context revision，controller 在路由前重新验证 availability；过期操作不执行并返回新的原因。该校验不是 runtime 的最终授权，有副作用的 runtime 操作仍需执行时校验和 durable journal。
 
 补全和帮助严格无副作用。展示一个 session、tool call 或路径候选不等于加载、批准、执行或读取其内容。候选来源不得包含凭据、完整环境变量或未经信任的隐藏资源；diagnostic 对底层错误执行与其他 TUI 错误相同的脱敏规则。
 
@@ -194,8 +194,6 @@ command popup 可以在 model stream 期间继续工作，但每条命令的 ava
 /help [command]
 /session list
 /session load <session-id>
-/approval inspect
-/approval approve <tool-call-id>
 /recovery inspect
 /recovery retry <tool-call-id>
 ```

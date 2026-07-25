@@ -10,9 +10,6 @@ pub enum CommandId {
     RecoveryFailed,
     RecoveryRetry,
     RecoveryAbandon,
-    ApprovalInspect,
-    ApprovalApprove,
-    ApprovalReject,
     SessionList,
     SessionLoad,
 }
@@ -94,7 +91,6 @@ pub struct CommandAssist {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionSource {
     CommandNames,
-    ApprovalToolCalls,
     RecoveryToolCalls,
     SessionIds,
 }
@@ -143,7 +139,6 @@ pub enum HistoryPolicy {
 enum Availability {
     Always,
     Idle,
-    ApprovalPending,
     RecoveryPending,
 }
 
@@ -151,11 +146,9 @@ enum Availability {
 pub struct CommandContext {
     pub revision: u64,
     pub is_streaming: bool,
-    pub approval_pending: bool,
     pub recovery_pending: bool,
 }
 
-const APPROVAL_ID: ArgumentKind = ArgumentKind::Completion(CompletionSource::ApprovalToolCalls);
 const RECOVERY_ID: ArgumentKind = ArgumentKind::Completion(CompletionSource::RecoveryToolCalls);
 const COMMAND_NAME: ArgumentKind = ArgumentKind::Completion(CompletionSource::CommandNames);
 const SESSION_ID: ArgumentKind = ArgumentKind::Completion(CompletionSource::SessionIds);
@@ -164,11 +157,6 @@ const HELP_ARGS: &[ArgumentSpec] = &[ArgumentSpec {
     name: "command",
     required: false,
     kind: COMMAND_NAME,
-}];
-const APPROVAL_CALL_ID: &[ArgumentSpec] = &[ArgumentSpec {
-    name: "tool-call-id",
-    required: true,
-    kind: APPROVAL_ID,
 }];
 const RECOVERY_CALL_ID: &[ArgumentSpec] = &[ArgumentSpec {
     name: "tool-call-id",
@@ -196,18 +184,6 @@ const RECOVERY_FAILURE: &[ArgumentSpec] = &[
     ArgumentSpec {
         name: "message",
         required: true,
-        kind: ArgumentKind::Rest,
-    },
-];
-const APPROVAL_REJECTION: &[ArgumentSpec] = &[
-    ArgumentSpec {
-        name: "tool-call-id",
-        required: true,
-        kind: APPROVAL_ID,
-    },
-    ArgumentSpec {
-        name: "reason",
-        required: false,
         kind: ArgumentKind::Rest,
     },
 ];
@@ -267,26 +243,6 @@ const RECOVERY_FORMS: &[CommandForm] = &[
         summary: "abandon the interrupted turn",
     },
 ];
-const APPROVAL_FORMS: &[CommandForm] = &[
-    CommandForm {
-        id: CommandId::ApprovalInspect,
-        path: &["inspect"],
-        arguments: &[],
-        summary: "show tool calls awaiting approval",
-    },
-    CommandForm {
-        id: CommandId::ApprovalApprove,
-        path: &["approve"],
-        arguments: APPROVAL_CALL_ID,
-        summary: "approve a pending tool call",
-    },
-    CommandForm {
-        id: CommandId::ApprovalReject,
-        path: &["reject"],
-        arguments: APPROVAL_REJECTION,
-        summary: "reject a pending tool call",
-    },
-];
 const SESSION_FORMS: &[CommandForm] = &[
     CommandForm {
         id: CommandId::SessionList,
@@ -344,16 +300,6 @@ const DEFINITIONS: &[CommandDefinition] = &[
         source: "builtin",
     },
     CommandDefinition {
-        name: "approval",
-        aliases: &[],
-        summary: "inspect or resolve tool approval",
-        target: CommandTarget::Runtime,
-        forms: APPROVAL_FORMS,
-        availability: Availability::ApprovalPending,
-        history: HistoryPolicy::Store,
-        source: "builtin",
-    },
-    CommandDefinition {
         name: "recovery",
         aliases: &[],
         summary: "inspect or reconcile interrupted tool calls",
@@ -367,7 +313,6 @@ const DEFINITIONS: &[CommandDefinition] = &[
 
 #[derive(Debug, Clone, Default)]
 pub struct CompletionContext<'a> {
-    pub approval_tool_calls: &'a [String],
     pub recovery_tool_calls: &'a [String],
     pub session_ids: &'a [String],
 }
@@ -385,7 +330,6 @@ impl CommandRegistry {
         self.classify_with_context(
             input,
             CommandContext {
-                approval_pending: true,
                 recovery_pending: true,
                 ..CommandContext::default()
             },
@@ -517,11 +461,6 @@ impl CommandRegistry {
                 ArgumentKind::Completion(CompletionSource::CommandNames) => DEFINITIONS
                     .iter()
                     .map(|definition| (definition.name, definition.summary))
-                    .collect(),
-                ArgumentKind::Completion(CompletionSource::ApprovalToolCalls) => context
-                    .approval_tool_calls
-                    .iter()
-                    .map(|value| (value.as_str(), "pending approval"))
                     .collect(),
                 ArgumentKind::Completion(CompletionSource::RecoveryToolCalls) => context
                     .recovery_tool_calls
@@ -766,9 +705,6 @@ fn unavailable_reason(availability: Availability, context: CommandContext) -> Op
         Availability::Idle if context.is_streaming => {
             Some("command is unavailable while a turn is active".to_owned())
         }
-        Availability::ApprovalPending if !context.approval_pending => {
-            Some("no tool approval is pending".to_owned())
-        }
         Availability::RecoveryPending if !context.recovery_pending => {
             Some("no tool recovery is pending".to_owned())
         }
@@ -911,21 +847,6 @@ mod tests {
             .unwrap();
         assert_eq!(recovery.replacement_range, 0..4);
         assert_eq!(recovery.replacement, "/recovery");
-    }
-
-    #[test]
-    fn pending_tool_ids_are_argument_candidates() {
-        let ids = vec!["call-1".to_owned()];
-        let assist = CommandRegistry::builtins().assist(
-            "/approval approve c",
-            "/approval approve c".len(),
-            CompletionContext {
-                approval_tool_calls: &ids,
-                recovery_tool_calls: &[],
-                session_ids: &[],
-            },
-        );
-        assert_eq!(assist.candidates[0].label, "call-1");
     }
 
     #[test]

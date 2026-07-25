@@ -1,8 +1,10 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 use crate::app::state::{
     AI_ACCENT, AppState, AppStatus, BG, BG_PANEL, BORDER, PRIMARY, SPINNER_FRAMES, SUCCESS,
@@ -300,17 +302,36 @@ fn render_command_assist(state: &AppState, frame: &mut Frame, area: Rect) {
             ])
         })
         .collect::<Vec<_>>();
+    let total = state.command_assist.candidates.len();
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" commands ")
+                    .title(format!(
+                        " commands {}/{} ",
+                        state.command_assist.selected + 1,
+                        total
+                    ))
                     .border_style(Style::default().fg(BORDER)),
             )
             .style(Style::default().bg(BG_PANEL)),
         popup,
     );
+    if total > rows as usize {
+        let mut scrollbar_state =
+            ScrollbarState::new(total).position(state.command_assist.selected);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓")),
+            popup.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn ghost_completion(state: &AppState) -> Option<String> {
@@ -374,5 +395,27 @@ mod tests {
             terminal.backend_mut().get_cursor_position().unwrap(),
             Position::new(7, 9)
         );
+    }
+
+    #[test]
+    fn command_popup_shows_position_total_and_scrollbar() {
+        let mut state = AppState::new();
+        state.composer.insert_str("/");
+        state.refresh_command_assist(&crate::app::CommandRegistry::builtins());
+        let total = state.command_assist.candidates.len();
+        assert!(total > 4);
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+
+        terminal.draw(|frame| draw(&state, frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("commands 1/{total}")));
+        assert!(rendered.contains('↓'));
     }
 }

@@ -23,7 +23,7 @@
 
 - 云同步、多设备并发编辑、协作 session；
 - conversation branch、merge、compaction 的最终交互；
-- 加密、密钥管理或 sandbox/approval 策略；
+- 加密、密钥管理或 sandbox 策略；
 - 为任意外部系统提供 exactly-once 副作用保证；
 - 持久化 provider stream 的逐 token draft 或 TUI scroll/fold state；
 - 并行 tool execution。
@@ -228,6 +228,10 @@ open session + acquire writer lock
 ```
 
 无法校验的中间 record 不是“尽力继续”的理由。Rua 应以只读 recovery report 打开 session，保留原始文件，并要求显式 repair/export；不得静默丢弃中间 committed conversation 或假设工具未执行。
+
+## 旧记录只用于兼容读取
+
+已经写入磁盘的 journal frame 不能因为交互策略简化而突然不可读。Rua 不再提供内建工具审批，但 decoder 仍识别旧版本的 approval request、resolution 和 awaiting phase：已明确拒绝的旧记录保持拒绝结果，尚未决定的旧记录在恢复时归一化为普通 `ExecutingTools`。新 runtime 不再生成这些记录，兼容分支也不重新暴露审批命令或状态。
 
 ## Runtime 与 UI 边界
 

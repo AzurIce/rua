@@ -37,7 +37,7 @@ Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider �
 - 持久化 session 的文件格式或会话分支模型；
 - 上下文压缩算法；
 - 多 provider 的认证或配置方式；
-- sandbox、approval 或工具级安全策略；
+- sandbox 或工具级安全策略；
 - 并行工具执行；
 - extension、skill 或 plugin 系统；
 - TUI 的布局、样式或编辑器行为。

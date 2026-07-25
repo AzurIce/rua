@@ -73,10 +73,15 @@ pub enum JournalRecord {
         arguments: Value,
         replay_class: ReplayClass,
     },
-    ToolApprovalRequested {
+    /// Legacy frame retained only so sessions written before D0004's direct
+    /// execution model remain readable. New runtimes never append it.
+    #[serde(rename = "ToolApprovalRequested")]
+    LegacyToolApprovalRequested {
         tool_call_id: ToolCallId,
     },
-    ToolApprovalResolved {
+    /// Legacy frame retained for backward-compatible replay.
+    #[serde(rename = "ToolApprovalResolved")]
+    LegacyToolApprovalResolved {
         tool_call_id: ToolCallId,
         approved: bool,
         reason: Option<String>,
@@ -152,11 +157,15 @@ pub struct DurableTurn {
 pub enum TurnPhase {
     AwaitingModel,
     WaitingToRetry,
-    AwaitingApproval,
+    /// Legacy persisted phase; recovery normalizes it to `ExecutingTools`.
+    #[serde(rename = "AwaitingApproval")]
+    LegacyAwaitingApproval,
     ExecutingTools,
     NeedsReconciliation,
     Completed,
-    Failed { recoverable: bool },
+    Failed {
+        recoverable: bool,
+    },
     Cancelled,
 }
 
@@ -179,7 +188,9 @@ pub struct DurableToolCall {
     pub name: String,
     pub arguments: Value,
     pub replay_class: ReplayClass,
-    pub approval: ToolApprovalState,
+    /// Legacy replay metadata. It is not consulted for new tool calls.
+    #[serde(rename = "approval", default)]
+    pub legacy_approval: LegacyToolApprovalState,
     #[serde(default)]
     pub execution_count: u64,
     pub execution_id: Option<ExecutionId>,
@@ -188,11 +199,16 @@ pub struct DurableToolCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolApprovalState {
+#[doc(hidden)]
+#[derive(Default)]
+pub enum LegacyToolApprovalState {
+    #[default]
     NotRequested,
     Pending,
     Approved,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
 }
 
 pub trait SessionStore: Send + Sync {
@@ -491,41 +507,42 @@ fn replay_entries(
                     name: name.clone(),
                     arguments: arguments.clone(),
                     replay_class: replay_class.clone(),
-                    approval: ToolApprovalState::NotRequested,
+                    legacy_approval: LegacyToolApprovalState::NotRequested,
                     execution_count: 0,
                     execution_id: None,
                     outcome: None,
                     result_committed: false,
                 });
             }
-            JournalRecord::ToolApprovalRequested { tool_call_id } => {
+            JournalRecord::LegacyToolApprovalRequested { tool_call_id } => {
                 let tool = pending_tool_mut(&mut active_turn, tool_call_id)?;
-                if tool.approval != ToolApprovalState::NotRequested {
+                if tool.legacy_approval != LegacyToolApprovalState::NotRequested {
                     return Err(StoreError::InvalidJournal(format!(
                         "approval already requested for tool: {tool_call_id}"
                     )));
                 }
-                tool.approval = ToolApprovalState::Pending;
-                active_turn.as_mut().expect("active tool turn").phase = TurnPhase::AwaitingApproval;
+                tool.legacy_approval = LegacyToolApprovalState::Pending;
+                active_turn.as_mut().expect("active tool turn").phase =
+                    TurnPhase::LegacyAwaitingApproval;
             }
-            JournalRecord::ToolApprovalResolved {
+            JournalRecord::LegacyToolApprovalResolved {
                 tool_call_id,
                 approved,
                 reason,
             } => {
                 let tool = pending_tool_mut(&mut active_turn, tool_call_id)?;
-                if tool.approval != ToolApprovalState::Pending {
+                if tool.legacy_approval != LegacyToolApprovalState::Pending {
                     return Err(StoreError::InvalidJournal(format!(
                         "approval resolution without pending request: {tool_call_id}"
                     )));
                 }
                 if *approved {
-                    tool.approval = ToolApprovalState::Approved;
+                    tool.legacy_approval = LegacyToolApprovalState::Approved;
                 } else {
                     let message = reason
                         .clone()
                         .unwrap_or_else(|| "tool execution rejected".to_owned());
-                    tool.approval = ToolApprovalState::Rejected {
+                    tool.legacy_approval = LegacyToolApprovalState::Rejected {
                         reason: message.clone(),
                     };
                     tool.outcome = Some(RecordedToolOutcome::FailedKnown { message });
@@ -534,9 +551,9 @@ fn replay_entries(
                 turn.phase = if turn
                     .pending_tools
                     .iter()
-                    .any(|tool| tool.approval == ToolApprovalState::Pending)
+                    .any(|tool| tool.legacy_approval == LegacyToolApprovalState::Pending)
                 {
-                    TurnPhase::AwaitingApproval
+                    TurnPhase::LegacyAwaitingApproval
                 } else {
                     TurnPhase::ExecutingTools
                 };
@@ -547,11 +564,11 @@ fn replay_entries(
             } => {
                 let tool = pending_tool_mut(&mut active_turn, tool_call_id)?;
                 if matches!(
-                    tool.approval,
-                    ToolApprovalState::Pending | ToolApprovalState::Rejected { .. }
+                    tool.legacy_approval,
+                    LegacyToolApprovalState::Rejected { .. }
                 ) {
                     return Err(StoreError::InvalidJournal(format!(
-                        "tool execution started without approval: {tool_call_id}"
+                        "rejected legacy tool execution started: {tool_call_id}"
                     )));
                 }
                 if tool.execution_id.is_some() {
@@ -565,6 +582,7 @@ fn replay_entries(
                     ))
                 })?;
                 tool.execution_id = Some(execution_id.clone());
+                active_turn.as_mut().expect("active tool turn").phase = TurnPhase::ExecutingTools;
             }
             JournalRecord::ToolOutcomeRecorded {
                 tool_call_id,
@@ -843,6 +861,18 @@ pub enum StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_approval_wire_names_remain_readable() {
+        let record: JournalRecord =
+            serde_json::from_str(r#"{"ToolApprovalRequested":{"tool_call_id":"call-1"}}"#).unwrap();
+        assert!(matches!(
+            record,
+            JournalRecord::LegacyToolApprovalRequested { .. }
+        ));
+        let phase: TurnPhase = serde_json::from_str(r#""AwaitingApproval""#).unwrap();
+        assert_eq!(phase, TurnPhase::LegacyAwaitingApproval);
+    }
 
     #[tokio::test]
     async fn assigns_monotonic_sequences_per_session() {

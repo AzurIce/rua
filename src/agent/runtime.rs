@@ -7,16 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::conversation::Conversation;
 use super::journal::{
-    DurableToolCall, DurableTurn, InMemorySessionStore, JournalRecord, ReconciliationDecision,
-    RecordedToolOutcome, RecoveredSession, SessionStore, StoreError, ToolApprovalState, TurnPhase,
+    DurableToolCall, DurableTurn, InMemorySessionStore, JournalRecord, LegacyToolApprovalState,
+    ReconciliationDecision, RecordedToolOutcome, RecoveredSession, SessionStore, StoreError,
+    TurnPhase,
 };
 use super::provider::{Provider, ProviderEvent, ResponseAccumulator};
 use super::tools::{ToolExecutor, ToolOutcome};
 use super::types::{
-    ApiFamily, ApprovalMode, AssistantMessage, ConversationRevision, ExecutionId, Message,
-    MessageId, ModelRef, ModelRequest, ProviderError, ProviderErrorKind, ProviderId, ReplayClass,
-    RetryHint, SessionId, StepId, StopReason, ToolCall, ToolResultContent, ToolResultMessage,
-    TurnId, UserContent, UserMessage,
+    ApiFamily, AssistantMessage, ConversationRevision, ExecutionId, Message, MessageId, ModelRef,
+    ModelRequest, ProviderError, ProviderErrorKind, ProviderId, RetryHint, SessionId, StepId,
+    StopReason, ToolCall, ToolResultContent, ToolResultMessage, TurnId, UserContent, UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,13 +29,6 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         tool_call_id: super::types::ToolCallId,
         message: String,
-    },
-    ApprovalRequired {
-        turn_id: TurnId,
-        tool_call_id: super::types::ToolCallId,
-        name: String,
-        arguments: serde_json::Value,
-        replay_class: ReplayClass,
     },
     PersistenceFailed {
         message: String,
@@ -135,8 +128,6 @@ pub enum RuntimeError {
     NoResumableTurn,
     #[error("turn is blocked: {0}")]
     Blocked(String),
-    #[error("tool approval is required: {0}")]
-    ApprovalRequired(super::types::ToolCallId),
     #[error("conversation error: {0}")]
     Conversation(String),
     #[error("turn limit exceeded: {0}")]
@@ -181,7 +172,6 @@ pub struct AgentRuntime {
     max_attempts: u32,
     max_model_steps: u32,
     max_tool_calls: u32,
-    approval_mode: ApprovalMode,
     next_attempt: AtomicU64,
     next_execution: AtomicU64,
 }
@@ -211,7 +201,6 @@ impl AgentRuntime {
             max_attempts: 2,
             max_model_steps: 16,
             max_tool_calls: 64,
-            approval_mode: ApprovalMode::Auto,
             next_attempt: AtomicU64::new(0),
             next_execution: AtomicU64::new(0),
         }
@@ -281,9 +270,7 @@ impl AgentRuntime {
                     "recovered tool execution has an unknown outcome; reconciliation is required"
                         .to_owned(),
                 ),
-                TurnPhase::AwaitingApproval => {
-                    Some("recovered tool execution is waiting for approval".to_owned())
-                }
+                TurnPhase::LegacyAwaitingApproval => None,
                 _ => None,
             };
             Some(ActiveTurn {
@@ -310,7 +297,6 @@ impl AgentRuntime {
             max_attempts: 2,
             max_model_steps: 16,
             max_tool_calls: 64,
-            approval_mode: ApprovalMode::Auto,
             next_attempt: AtomicU64::new(next_attempt),
             next_execution: AtomicU64::new(next_execution),
         }
@@ -341,26 +327,6 @@ impl AgentRuntime {
                 });
             }
         }
-        if let Some(recovery) = state
-            .active
-            .as_ref()
-            .and_then(|active| active.recovery.as_ref())
-            && matches!(recovery.phase, TurnPhase::AwaitingApproval)
-        {
-            for tool in recovery
-                .pending_tools
-                .iter()
-                .filter(|tool| tool.approval == ToolApprovalState::Pending)
-            {
-                let _ = emit.send(RuntimeEvent::ApprovalRequired {
-                    turn_id: recovery.turn_id.clone(),
-                    tool_call_id: tool.tool_call_id.clone(),
-                    name: tool.name.clone(),
-                    arguments: tool.arguments.clone(),
-                    replay_class: tool.replay_class.clone(),
-                });
-            }
-        }
     }
 
     pub async fn recovery_tools(&self) -> Vec<DurableToolCall> {
@@ -382,81 +348,6 @@ impl AgentRuntime {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    pub async fn approval_tools(&self) -> Vec<DurableToolCall> {
-        self.state
-            .lock()
-            .await
-            .active
-            .as_ref()
-            .and_then(|active| active.recovery.as_ref())
-            .map(|turn| {
-                turn.pending_tools
-                    .iter()
-                    .filter(|tool| tool.approval == ToolApprovalState::Pending)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub async fn resolve_tool_approval(
-        &self,
-        tool_call_id: super::types::ToolCallId,
-        approved: bool,
-        reason: Option<String>,
-        emit: &tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-        cancel: CancellationToken,
-    ) -> Result<(), RuntimeError> {
-        let mut state = self.state.lock().await;
-        let recovery = state
-            .active
-            .as_ref()
-            .and_then(|active| active.recovery.as_ref())
-            .ok_or_else(|| RuntimeError::Blocked("no tool approval is pending".to_owned()))?;
-        if !matches!(recovery.phase, TurnPhase::AwaitingApproval)
-            || !recovery.pending_tools.iter().any(|tool| {
-                tool.tool_call_id == tool_call_id && tool.approval == ToolApprovalState::Pending
-            })
-        {
-            return Err(RuntimeError::Blocked(format!(
-                "tool call {tool_call_id} is not awaiting approval"
-            )));
-        }
-        let rejection_reason = (!approved).then(|| {
-            reason
-                .clone()
-                .unwrap_or_else(|| "tool execution rejected by user".to_owned())
-        });
-        self.record(JournalRecord::ToolApprovalResolved {
-            tool_call_id: tool_call_id.clone(),
-            approved,
-            reason: rejection_reason.clone(),
-        })
-        .await?;
-
-        let active = state.active.as_mut().expect("approval active turn");
-        let durable = active.recovery.as_mut().expect("approval recovery state");
-        let tool = durable
-            .pending_tools
-            .iter_mut()
-            .find(|tool| tool.tool_call_id == tool_call_id)
-            .expect("validated approval tool");
-        if approved {
-            tool.approval = ToolApprovalState::Approved;
-        } else {
-            let message = rejection_reason.expect("rejection reason");
-            tool.approval = ToolApprovalState::Rejected {
-                reason: message.clone(),
-            };
-            tool.outcome = Some(RecordedToolOutcome::FailedKnown { message });
-        }
-        durable.phase = TurnPhase::ExecutingTools;
-        active.blocked = None;
-        self.resume_recovered_tools(&mut state, emit, cancel.clone())
-            .await?;
-        self.drive_locked(&mut state, emit, cancel).await
     }
 
     pub async fn reconcile_tool(
@@ -536,11 +427,6 @@ impl AgentRuntime {
     pub fn with_turn_limits(mut self, max_model_steps: u32, max_tool_calls: u32) -> Self {
         self.max_model_steps = max_model_steps.max(1);
         self.max_tool_calls = max_tool_calls.max(1);
-        self
-    }
-
-    pub fn with_approval_mode(mut self, approval_mode: ApprovalMode) -> Self {
-        self.approval_mode = approval_mode;
         self
     }
 
@@ -637,15 +523,10 @@ impl AgentRuntime {
             state.active.as_mut().expect("active turn").recovery = None;
             return Ok(());
         }
-        if matches!(recovery.phase, TurnPhase::AwaitingApproval) {
-            let tool = recovery
-                .pending_tools
-                .iter()
-                .find(|tool| tool.approval == ToolApprovalState::Pending)
-                .ok_or_else(|| {
-                    RuntimeError::Blocked("approval phase has no pending tool approval".to_owned())
-                })?;
-            return Err(RuntimeError::ApprovalRequired(tool.tool_call_id.clone()));
+        if matches!(recovery.phase, TurnPhase::LegacyAwaitingApproval) {
+            // Legacy sessions may contain this phase. The current runtime has
+            // no built-in approval gate, so pending calls continue normally.
+            recovery.phase = TurnPhase::ExecutingTools;
         }
         if !matches!(recovery.phase, TurnPhase::ExecutingTools) {
             return Err(RuntimeError::Blocked(format!(
@@ -666,7 +547,7 @@ impl AgentRuntime {
                 arguments: tool.arguments.clone(),
                 provider_state: None,
             };
-            if let ToolApprovalState::Rejected { reason } = &tool.approval {
+            if let LegacyToolApprovalState::Rejected { reason } = &tool.legacy_approval {
                 if let Err(error) = self
                     .append_tool_result(state, &call, reason.clone(), true)
                     .await
@@ -694,96 +575,6 @@ impl AgentRuntime {
                 })?;
                 (outcome.clone(), execution_id)
             } else if tool.execution_id.is_none() {
-                if requires_approval(&tool.replay_class) {
-                    match tool.approval {
-                        ToolApprovalState::NotRequested => match self.approval_mode {
-                            ApprovalMode::Auto => {}
-                            ApprovalMode::Ask => {
-                                if let Err(error) = self
-                                    .record(JournalRecord::ToolApprovalRequested {
-                                        tool_call_id: call.id.clone(),
-                                    })
-                                    .await
-                                {
-                                    block_recovery(state, &recovery, &error);
-                                    return Err(error);
-                                }
-                                recovery.pending_tools[index].approval = ToolApprovalState::Pending;
-                                recovery.phase = TurnPhase::AwaitingApproval;
-                                let active = state.active.as_mut().expect("active turn");
-                                active.blocked =
-                                    Some(format!("tool {} is waiting for approval", call.id));
-                                active.recovery = Some(recovery);
-                                let _ = emit.send(RuntimeEvent::ApprovalRequired {
-                                    turn_id: active.turn_id.clone(),
-                                    tool_call_id: call.id.clone(),
-                                    name: call.name,
-                                    arguments: call.arguments,
-                                    replay_class: tool.replay_class,
-                                });
-                                return Err(RuntimeError::ApprovalRequired(call.id));
-                            }
-                            ApprovalMode::Never => {
-                                let reason =
-                                    "tool execution rejected by approval mode 'never'".to_owned();
-                                if let Err(error) = self
-                                    .record(JournalRecord::ToolApprovalRequested {
-                                        tool_call_id: call.id.clone(),
-                                    })
-                                    .await
-                                {
-                                    block_recovery(state, &recovery, &error);
-                                    return Err(error);
-                                }
-                                if let Err(error) = self
-                                    .record(JournalRecord::ToolApprovalResolved {
-                                        tool_call_id: call.id.clone(),
-                                        approved: false,
-                                        reason: Some(reason.clone()),
-                                    })
-                                    .await
-                                {
-                                    block_recovery(state, &recovery, &error);
-                                    return Err(error);
-                                }
-                                recovery.pending_tools[index].approval =
-                                    ToolApprovalState::Rejected {
-                                        reason: reason.clone(),
-                                    };
-                                recovery.pending_tools[index].outcome =
-                                    Some(RecordedToolOutcome::FailedKnown {
-                                        message: reason.clone(),
-                                    });
-                                if let Err(error) = self
-                                    .append_tool_result(state, &call, reason.clone(), true)
-                                    .await
-                                {
-                                    block_recovery(state, &recovery, &error);
-                                    return Err(error);
-                                }
-                                let _ = emit.send(RuntimeEvent::ToolRejected {
-                                    turn_id: recovery.turn_id.clone(),
-                                    call_id: call.id,
-                                    name: call.name,
-                                    message: reason,
-                                });
-                                recovery.pending_tools[index].result_committed = true;
-                                completed_missing_result = true;
-                                continue;
-                            }
-                        },
-                        ToolApprovalState::Pending => {
-                            recovery.phase = TurnPhase::AwaitingApproval;
-                            let active = state.active.as_mut().expect("active turn");
-                            active.blocked =
-                                Some(format!("tool {} is waiting for approval", call.id));
-                            active.recovery = Some(recovery);
-                            return Err(RuntimeError::ApprovalRequired(call.id));
-                        }
-                        ToolApprovalState::Approved => {}
-                        ToolApprovalState::Rejected { .. } => unreachable!(),
-                    }
-                }
                 let execution_sequence = self.next_execution.fetch_add(1, Ordering::Relaxed) + 1;
                 let execution_id: ExecutionId =
                     format!("{}-execution-{execution_sequence}", call.id).into();
@@ -1320,10 +1111,6 @@ fn recorded_outcome(outcome: &ToolOutcome) -> RecordedToolOutcome {
     }
 }
 
-fn requires_approval(replay_class: &ReplayClass) -> bool {
-    !matches!(replay_class, ReplayClass::ReadOnly)
-}
-
 fn block_turn(state: &mut RuntimeState, error: &RuntimeError) {
     if let Some(active) = state.active.as_mut() {
         active.blocked = Some(error.to_string());
@@ -1362,7 +1149,6 @@ fn runtime_failure_kind(error: &RuntimeError) -> RuntimeFailureKind {
         RuntimeError::Busy
         | RuntimeError::NoResumableTurn
         | RuntimeError::Blocked(_)
-        | RuntimeError::ApprovalRequired(_)
         | RuntimeError::Conversation(_) => RuntimeFailureKind::Internal,
     }
 }
@@ -2240,100 +2026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_is_durable_and_precedes_effectful_tool_execution() {
-        let provider = Arc::new(ScriptedProvider::new([
-            Script::Events(vec![
-                started(),
-                ProviderEvent::ToolCallStarted {
-                    part: PartIndex(0),
-                    id: ToolCallId::new("call-approval"),
-                    name: "effect".to_owned(),
-                },
-                ProviderEvent::ToolArgumentsDelta {
-                    part: PartIndex(0),
-                    delta: "{}".to_owned(),
-                },
-                completed(StopReason::ToolUse),
-            ]),
-            Script::Events(vec![started(), completed(StopReason::EndTurn)]),
-        ]));
-        let executions = Arc::new(AtomicUsize::new(0));
-        let mut tools = ToolRegistry::new();
-        tools
-            .register(EffectfulCountingTool(executions.clone()))
-            .unwrap();
-        let store = Arc::new(InMemorySessionStore::new());
-        let runtime = AgentRuntime::new(provider.clone(), Arc::new(tools), "system", model())
-            .with_session_store(store.clone())
-            .with_approval_mode(ApprovalMode::Ask);
-        let session_id = runtime.session_id().clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let error = runtime
-            .run_user_turn("perform effect".to_owned(), &tx, CancellationToken::new())
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "tool approval is required: call-approval"
-        );
-        assert_eq!(executions.load(AtomicOrdering::SeqCst), 0);
-        assert!(
-            !store
-                .entries(&session_id)
-                .await
-                .iter()
-                .any(|entry| matches!(entry.record, JournalRecord::ToolExecutionStarted { .. }))
-        );
-        assert!(matches!(
-            store
-                .load(&session_id)
-                .await
-                .unwrap()
-                .active_turn
-                .unwrap()
-                .phase,
-            TurnPhase::AwaitingApproval
-        ));
-        let mut saw_approval = false;
-        while let Ok(event) = rx.try_recv() {
-            saw_approval |= matches!(event, RuntimeEvent::ApprovalRequired { .. });
-        }
-        assert!(saw_approval);
-
-        drop(runtime);
-        let mut recovered_tools = ToolRegistry::new();
-        recovered_tools
-            .register(EffectfulCountingTool(executions.clone()))
-            .unwrap();
-        let recovered = AgentRuntime::recover(
-            provider,
-            Arc::new(recovered_tools),
-            model(),
-            store,
-            session_id,
-        )
-        .await
-        .unwrap()
-        .with_approval_mode(ApprovalMode::Ask);
-        recovered
-            .resolve_tool_approval(
-                "call-approval".into(),
-                true,
-                None,
-                &tx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(executions.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(recovered.conversation_snapshot().await.messages().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn never_mode_rejects_effectful_tools_without_starting_them() {
+    async fn effectful_tools_execute_without_a_builtin_gate() {
         let provider = Arc::new(ScriptedProvider::new([
             Script::Events(vec![
                 started(),
@@ -2355,8 +2048,7 @@ mod tests {
         tools
             .register(EffectfulCountingTool(executions.clone()))
             .unwrap();
-        let runtime = AgentRuntime::new(provider, Arc::new(tools), "system", model())
-            .with_approval_mode(ApprovalMode::Never);
+        let runtime = AgentRuntime::new(provider, Arc::new(tools), "system", model());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         runtime
@@ -2364,17 +2056,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(executions.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(executions.load(AtomicOrdering::SeqCst), 1);
         let conversation = runtime.conversation_snapshot().await;
         let Message::ToolResult(result) = &conversation.messages()[2] else {
             panic!("expected rejected tool result");
         };
-        assert!(result.is_error);
-        assert!(matches!(
-            result.content[0],
-            ToolResultContent::Text { ref text }
-                if text.contains("approval mode 'never'")
-        ));
+        assert!(!result.is_error);
     }
 
     #[tokio::test]

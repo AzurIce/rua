@@ -126,9 +126,9 @@ RuntimeEvent -> AppState projection -> TUI
 - 旧 `src/session.rs`、`src/deepseek.rs` 和 `src/tools.rs` 已删除，仓库只保留新的 runtime/provider/tool 路径。
 - `src/tui` 已实现可报告首个恢复错误的 terminal guard、backend-neutral key event、grapheme-safe composer、paste 分流和真实硬件光标；Crossterm 类型不再进入 app 或 agent 层。
 - `AppController` 已串行处理 terminal/runtime 事件并产生显式 commands；terminal input 与 runtime projection 使用独立通道并优先处理输入，相邻 text/reasoning deltas 在 lifecycle boundary 前合并；frame scheduler 合并 dirty draw，并仅在动画活动时按 deadline 推进 spinner。
-- TUI 内部命令已由内建 `CommandRegistry` 统一解析 `/help`、`/clear`、`/quit`、`/session`、`/recovery` 与 `/approval`；结构化 grammar 同时驱动 usage、静态与动态资源补全、completion overlay 和 ghost text。命令与 prompt 使用分离的本地 history，availability 和 context revision 在 dispatch 前复核；session 列举与运行中加载由应用装配层协调，registry 不持有 store 或 runtime。
+- TUI 内部命令已由内建 `CommandRegistry` 统一解析 `/help`、`/clear`、`/quit`、`/session` 与 `/recovery`；结构化 grammar 同时驱动 usage、静态与动态资源补全、completion overlay 和 ghost text。命令与 prompt 使用统一时间顺序、按模式筛选的本地 history，availability 和 context revision 在 dispatch 前复核；session 列举与运行中加载由应用装配层协调，registry 不持有 store 或 runtime。
 - Tool registry 除 Bash 外已提供 workspace-scoped read/write/edit/glob/grep；只读工具声明 `ReadOnly` replay class，写工具声明 `Effectful`，输出与搜索结果均有界。
-- Effectful/Unknown 工具支持 durable `auto`/`ask`/`never` approval；pending approval 可跨进程恢复，且 approval resolution 在 `ToolExecutionStarted` 前落盘。
+- 与 pi 一致，内建工具不经过逐次审批，直接以 Rua 进程已有权限执行；journal 仍在外部动作前记录 `ToolExecutionStarted`，并对 outcome unknown 保持显式恢复。
 - 可选 `RUA_INPUT_TRACE` 记录脱敏的 terminal event 类型、修饰键、时间与环境能力，不记录键入字符或 paste 内容。
 
 D0005 的核心恢复路径已经落地：`SessionStore` 端口、conversation/tool write-ahead 记录、带长度与 checksum framing 的本地 WAL、原子 snapshot、单 writer 锁、journal replay、raw export/validation、崩溃尾部自动截断，以及 outcome unknown 的显式 reconciliation。Session ID 不能逃逸项目内目录，Unix session 目录和文件会收紧为用户私有权限。完整 frame 的 checksum 或中间记录损坏仍会被拒绝，不能被 repair 命令静默截断。尚未实现的关键部分是 schema migration、针对中间损坏的只读报告/显式修复流程、强隔离 sandbox、Windows IME 测试矩阵，以及配置与资源装配设计。
@@ -138,7 +138,7 @@ D0005 的核心恢复路径已经落地：`SessionStore` 端口、conversation/t
 当前建议顺序如下：
 
 1. 记录配置、凭据与应用装配设计，解除 `main.rs` 对单一 DeepSeek 配置的硬编码。
-2. 在 Tool Runtime 已有 approval、coding tools、workspace cwd、timeout 和进程树清理基础上，继续补强 OS sandbox 与 output streaming。
+2. 在 Tool Runtime 已有 coding tools、workspace cwd、timeout 和进程树清理基础上，继续补强 OS sandbox 与 output streaming。
 3. 为 D0005 增加 schema migration，并维持对非尾部损坏的拒绝与原始证据保留。
 4. 完成 Windows input backend trace 与 IME 测试矩阵，再决定 VT/legacy/cooked 模式。
 5. 设计项目规则、skills、prompt resources 与 context compaction。

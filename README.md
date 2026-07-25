@@ -59,7 +59,7 @@ main.rs              Application assembly + event routing loop
 ### Phase 2: Safety & Control
 
 - [x] **Persistent session recovery** — Snapshot/WAL storage, replay, and explicit reconciliation
-- [x] **Approval modes** — Durable auto / ask / never policy for effectful or unknown tools
+- [x] **Direct tool execution** — Built-in tools run with the Rua process permissions, following pi's core model
 - [ ] **Bash sandbox** — Workspace cwd, timeout, and process-tree cleanup are implemented; stronger OS isolation remains
 - [ ] **Git integration** — Auto-stage changes, generate commit messages
 - [ ] **Undo / rollback** — Revert last tool action
@@ -110,7 +110,7 @@ cargo build --release
 Sessions are created under the current project's `.rua/sessions` directory. Rua prints the session ID at startup; reopen one with:
 
 ```bash
-cargo run -- --session <session-id> --approval ask
+cargo run -- --session <session-id>
 ```
 
 Session maintenance is explicit and non-interactive:
@@ -125,7 +125,7 @@ Normal recovery automatically removes only an incomplete trailing frame after va
 
 If recovery finds a tool that may already have produced side effects, use `/recovery inspect`, then explicitly resolve it with `/recovery success`, `/recovery failed`, `/recovery retry`, or `/recovery abandon`.
 
-Approval defaults to `ask`. Use `/approval inspect`, `/approval approve <call-id>`, or `/approval reject <call-id> [reason]`. Read-only tools do not require approval; effectful and unknown tools do.
+Rua does not show built-in permission popups. Run it in a container or OS sandbox when stronger isolation is required.
 
 ## License
 

@@ -12,18 +12,12 @@ pub enum AppCommand {
     SubmitUserInput(String),
     ResumeTurn,
     InspectRecovery,
-    InspectApproval,
     ListSessions,
     LoadSession(SessionId),
     RequestSessionCompletions(super::command::CompletionRequest),
     ReconcileTool {
         tool_call_id: ToolCallId,
         decision: ReconciliationDecision,
-    },
-    ResolveApproval {
-        tool_call_id: ToolCallId,
-        approved: bool,
-        reason: Option<String>,
     },
     CancelTurn,
     Quit,
@@ -89,11 +83,11 @@ impl AppController {
                             self.state.close_command_assist();
                             return Vec::new();
                         }
-                        TuiKeyCode::Up => {
+                        TuiKeyCode::Up if !self.state.is_navigating_input_history() => {
                             self.state.move_command_selection(-1);
                             return Vec::new();
                         }
-                        TuiKeyCode::Down => {
+                        TuiKeyCode::Down if !self.state.is_navigating_input_history() => {
                             self.state.move_command_selection(1);
                             return Vec::new();
                         }
@@ -126,6 +120,7 @@ impl AppController {
                     self.state.begin_resume();
                     return vec![AppCommand::ResumeTurn];
                 }
+                self.state.reset_input_history_navigation();
                 input::handle_key(&mut self.state, key);
                 self.state.refresh_command_assist(&self.registry);
                 let mut commands: Vec<_> = self
@@ -149,6 +144,15 @@ impl AppController {
                     .collect()
             }
             TuiEvent::Resize { .. } => Vec::new(),
+            TuiEvent::MouseScroll { up } => {
+                const WHEEL_LINES: u16 = 3;
+                self.state.scroll_offset = if up {
+                    self.state.scroll_offset.saturating_sub(WHEEL_LINES)
+                } else {
+                    self.state.scroll_offset.saturating_add(WHEEL_LINES)
+                };
+                Vec::new()
+            }
         }
     }
 
@@ -231,7 +235,6 @@ impl AppController {
             }
             CommandId::Quit => vec![AppCommand::Quit],
             CommandId::RecoveryInspect => vec![AppCommand::InspectRecovery],
-            CommandId::ApprovalInspect => vec![AppCommand::InspectApproval],
             CommandId::SessionList => vec![AppCommand::ListSessions],
             CommandId::SessionLoad => vec![AppCommand::LoadSession(SessionId::new(
                 &invocation.arguments[0],
@@ -256,16 +259,6 @@ impl AppController {
                 tool_call_id: ToolCallId::new(&invocation.arguments[0]),
                 decision: ReconciliationDecision::AbandonTurn,
             }],
-            CommandId::ApprovalApprove => vec![AppCommand::ResolveApproval {
-                tool_call_id: ToolCallId::new(&invocation.arguments[0]),
-                approved: true,
-                reason: None,
-            }],
-            CommandId::ApprovalReject => vec![AppCommand::ResolveApproval {
-                tool_call_id: ToolCallId::new(&invocation.arguments[0]),
-                approved: false,
-                reason: invocation.arguments.get(1).cloned(),
-            }],
         };
         self.state.composer.clear();
         if !matches!(
@@ -281,8 +274,6 @@ impl AppController {
                 | CommandId::RecoveryFailed
                 | CommandId::RecoveryRetry
                 | CommandId::RecoveryAbandon
-                | CommandId::ApprovalApprove
-                | CommandId::ApprovalReject
         ) {
             self.state.begin_resume();
         }
@@ -331,19 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_command_keeps_the_draft_and_exposes_a_diagnostic() {
-        let mut controller = AppController::new(AppState::new());
-        controller
-            .state_mut()
-            .composer
-            .insert_str("/approval approve");
-
-        assert!(controller.handle(key(TuiKeyCode::Enter)).is_empty());
-        assert_eq!(controller.state().composer.text(), "/approval approve");
-        assert!(controller.state().command_assist.diagnostic.is_some());
-    }
-
-    #[test]
     fn tab_accepts_a_completion_without_dispatching_it() {
         let mut controller = AppController::new(AppState::new());
         controller.state_mut().composer.insert_str("/rec");
@@ -358,7 +336,7 @@ mod tests {
     #[test]
     fn help_is_a_local_command() {
         let mut controller = AppController::new(AppState::new());
-        controller.state_mut().composer.insert_str("/help approval");
+        controller.state_mut().composer.insert_str("/help recovery");
 
         assert!(controller.handle(key(TuiKeyCode::Enter)).is_empty());
         assert!(
@@ -368,7 +346,7 @@ mod tests {
                 .back()
                 .unwrap()
                 .text
-                .contains("/approval")
+                .contains("/recovery")
         );
     }
 
@@ -387,17 +365,29 @@ mod tests {
     }
 
     #[test]
-    fn command_history_is_separate_from_prompt_history() {
+    fn empty_composer_recalls_commands_and_prompts_in_chronological_order() {
         let mut controller = AppController::new(AppState::new());
         controller.state_mut().composer.insert_str("hello");
         controller.handle(key(TuiKeyCode::Enter));
         controller.state_mut().composer.insert_str("/help");
         controller.handle(key(TuiKeyCode::Enter));
-        controller.state_mut().composer.insert_str("/");
-
         controller.handle(key(TuiKeyCode::Up));
 
         assert_eq!(controller.state().composer.text(), "/help");
+
+        controller.handle(key(TuiKeyCode::Up));
+
+        assert_eq!(controller.state().composer.text(), "hello");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_transcript() {
+        let mut controller = AppController::new(AppState::new());
+
+        controller.handle(UiEvent::Terminal(TuiEvent::MouseScroll { up: false }));
+        assert_eq!(controller.state().scroll_offset, 3);
+        controller.handle(UiEvent::Terminal(TuiEvent::MouseScroll { up: true }));
+        assert_eq!(controller.state().scroll_offset, 0);
     }
 
     #[test]
