@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthStr;
 pub struct Composer {
     text: String,
     cursor: usize,
+    revision: u64,
 }
 
 /// The horizontally visible portion of a composer and its cursor column.
@@ -28,22 +29,58 @@ impl Composer {
         self.cursor
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
     pub fn clear(&mut self) {
+        if !self.text.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.text.clear();
         self.cursor = 0;
     }
 
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if self.text != text {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.text = text;
+        self.cursor = self.text.len();
+    }
+
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) -> bool {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+            || !is_grapheme_boundary(&self.text, range.start)
+            || !is_grapheme_boundary(&self.text, range.end)
+        {
+            return false;
+        }
+        self.text.replace_range(range.clone(), replacement);
+        self.revision = self.revision.wrapping_add(1);
+        self.cursor = range.start + replacement.len();
+        true
+    }
+
     pub fn insert_char(&mut self, ch: char) {
         self.text.insert(self.cursor, ch);
+        self.revision = self.revision.wrapping_add(1);
         self.cursor += ch.len_utf8();
     }
 
     pub fn insert_str(&mut self, text: &str) {
         self.text.insert_str(self.cursor, text);
+        if !text.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.cursor += text.len();
     }
 
@@ -67,6 +104,7 @@ impl Composer {
         let previous = previous_grapheme_boundary(&self.text, self.cursor);
         if previous != self.cursor {
             self.text.replace_range(previous..self.cursor, "");
+            self.revision = self.revision.wrapping_add(1);
             self.cursor = previous;
         }
     }
@@ -75,6 +113,7 @@ impl Composer {
         let next = next_grapheme_boundary(&self.text, self.cursor);
         if next != self.cursor {
             self.text.replace_range(self.cursor..next, "");
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -126,6 +165,13 @@ impl Composer {
             cursor_column: prefix_width as u16,
         }
     }
+}
+
+fn is_grapheme_boundary(text: &str, boundary: usize) -> bool {
+    boundary == text.len()
+        || text
+            .grapheme_indices(true)
+            .any(|(index, _)| index == boundary)
 }
 
 fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {

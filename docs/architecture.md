@@ -56,6 +56,16 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - AppController、display projection、commands 与 runtime events 的关系；
 - frame scheduling、背压、错误恢复和 Windows IME 分阶段策略。
 
+### [D0006：TUI 命令系统、补全与输入提示](designs/D0006-tui-command-system.md)
+
+定义：
+
+- prompt、命令、未完成输入、非法输入和字面 slash 转义的分类；
+- CommandRegistry、结构化参数 grammar 与 invocation 路由；
+- 命令名、参数和动态资源的补全查询及 stale result 丢弃；
+- completion overlay、ghost text、usage、诊断与 composer 的焦点边界；
+- 命令可用性、history 脱敏和有副作用操作的安全边界。
+
 ### [D0004：Tool Runtime 与执行语义](designs/D0004-tool-runtime.md)
 
 定义：
@@ -74,7 +84,7 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - crash recovery、已知 outcome 补交和 outcome unknown 的人工协调；
 - snapshot/WAL、校验、锁与 schema migration。
 
-D0001 回答“谁推进一个 turn”，D0002 回答“runtime 如何请求模型并提交响应”，D0003 回答“terminal 与 UI 如何投影 runtime”，D0004 回答“外部动作如何执行并记录结果”，D0005 回答“进程中断后如何安全恢复这些事实”。
+D0001 回答“谁推进一个 turn”，D0002 回答“runtime 如何请求模型并提交响应”，D0003 回答“terminal 与 UI 如何投影 runtime”，D0004 回答“外部动作如何执行并记录结果”，D0005 回答“进程中断后如何安全恢复这些事实”，D0006 回答“TUI 如何发现、补全并安全路由内部命令”。
 
 ## 待设计领域
 
@@ -116,6 +126,7 @@ RuntimeEvent -> AppState projection -> TUI
 - 旧 `src/session.rs`、`src/deepseek.rs` 和 `src/tools.rs` 已删除，仓库只保留新的 runtime/provider/tool 路径。
 - `src/tui` 已实现可报告首个恢复错误的 terminal guard、backend-neutral key event、grapheme-safe composer、paste 分流和真实硬件光标；Crossterm 类型不再进入 app 或 agent 层。
 - `AppController` 已串行处理 terminal/runtime 事件并产生显式 commands；terminal input 与 runtime projection 使用独立通道并优先处理输入，相邻 text/reasoning deltas 在 lifecycle boundary 前合并；frame scheduler 合并 dirty draw，并仅在动画活动时按 deadline 推进 spinner。
+- TUI 内部命令已由内建 `CommandRegistry` 统一解析 `/help`、`/clear`、`/quit`、`/session`、`/recovery` 与 `/approval`；结构化 grammar 同时驱动 usage、静态与动态资源补全、completion overlay 和 ghost text。命令与 prompt 使用分离的本地 history，availability 和 context revision 在 dispatch 前复核；session 列举与运行中加载由应用装配层协调，registry 不持有 store 或 runtime。
 - Tool registry 除 Bash 外已提供 workspace-scoped read/write/edit/glob/grep；只读工具声明 `ReadOnly` replay class，写工具声明 `Effectful`，输出与搜索结果均有界。
 - Effectful/Unknown 工具支持 durable `auto`/`ask`/`never` approval；pending approval 可跨进程恢复，且 approval resolution 在 `ToolExecutionStarted` 前落盘。
 - 可选 `RUA_INPUT_TRACE` 记录脱敏的 terminal event 类型、修饰键、时间与环境能力，不记录键入字符或 paste 内容。

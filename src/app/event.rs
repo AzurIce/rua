@@ -1,3 +1,4 @@
+use super::command::CompletionResponse;
 use crate::agent::RuntimeEvent;
 use crate::tui::TuiEvent;
 
@@ -8,4 +9,5 @@ pub enum UiEvent {
     Terminal(TuiEvent),
     TerminalFailure(String),
     Runtime(RuntimeEvent),
+    Completion(CompletionResponse),
 }

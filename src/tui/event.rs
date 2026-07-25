@@ -16,6 +16,7 @@ impl TuiKeyEvent {
 pub enum TuiKeyCode {
     Char(char),
     Backspace,
+    Tab,
     Enter,
     Left,
     Right,
@@ -76,6 +77,7 @@ fn normalize_key(key: KeyEvent) -> TuiKeyEvent {
     let code = match key.code {
         KeyCode::Char(value) => TuiKeyCode::Char(value),
         KeyCode::Backspace => TuiKeyCode::Backspace,
+        KeyCode::Tab => TuiKeyCode::Tab,
         KeyCode::Enter => TuiKeyCode::Enter,
         KeyCode::Left => TuiKeyCode::Left,
         KeyCode::Right => TuiKeyCode::Right,

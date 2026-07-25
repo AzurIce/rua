@@ -1,6 +1,11 @@
 use std::collections::VecDeque;
 
 use crate::agent::{AssistantPart, Message, RuntimeEvent, ToolResultContent, UserContent};
+use crate::app::command::CommandContext;
+use crate::app::command::{
+    CommandAssist, CommandRegistry, CompletionContext, CompletionItem, CompletionRequest,
+    CompletionResponse,
+};
 use crate::model::{ChatEntry, Role};
 use crate::tui::Composer;
 
@@ -69,6 +74,25 @@ pub struct AppState {
     pub spinner_frame: usize,
     pub token_count: usize,
     pub can_resume_turn: bool,
+    pub command_assist: CommandAssistState,
+    approval_tool_calls: Vec<String>,
+    recovery_tool_calls: Vec<String>,
+    session_ids: Vec<String>,
+    prompt_history: Vec<String>,
+    command_history: Vec<String>,
+    prompt_history_cursor: Option<usize>,
+    command_history_cursor: Option<usize>,
+    command_context_revision: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommandAssistState {
+    pub candidates: Vec<CompletionItem>,
+    pub selected: usize,
+    pub usage: Option<String>,
+    pub diagnostic: Option<String>,
+    pub open: bool,
+    pub active_request: Option<CompletionRequest>,
 }
 
 impl AppState {
@@ -85,6 +109,15 @@ impl AppState {
             spinner_frame: 0,
             token_count: 0,
             can_resume_turn: false,
+            command_assist: CommandAssistState::default(),
+            approval_tool_calls: Vec::new(),
+            recovery_tool_calls: Vec::new(),
+            session_ids: Vec::new(),
+            prompt_history: Vec::new(),
+            command_history: Vec::new(),
+            prompt_history_cursor: None,
+            command_history_cursor: None,
+            command_context_revision: 0,
         }
     }
 
@@ -99,17 +132,213 @@ impl AppState {
     }
 
     pub fn submit_input(&mut self) -> Option<String> {
-        let text = self.composer.text().trim().to_string();
+        let text = self.composer.text().to_owned();
+        self.submit_text(text)
+    }
+
+    pub fn submit_text(&mut self, text: String) -> Option<String> {
         if text.is_empty() {
             return None;
         }
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.prompt_history.push(text.clone());
+        self.prompt_history_cursor = None;
         self.composer.clear();
+        self.command_assist = CommandAssistState::default();
         self.current_response.clear();
         self.current_reasoning.clear();
         self.is_streaming = true;
         self.status = AppStatus::Sending;
         self.token_count = 0;
         Some(text)
+    }
+
+    pub fn refresh_command_assist(&mut self, registry: &CommandRegistry) {
+        let previous = self
+            .command_assist
+            .candidates
+            .get(self.command_assist.selected)
+            .map(|candidate| candidate.label.clone());
+        let active_request = self.command_assist.active_request.clone();
+        let CommandAssist {
+            candidates,
+            usage,
+            diagnostic,
+        } = registry.assist(
+            self.composer.text(),
+            self.composer.cursor(),
+            CompletionContext {
+                approval_tool_calls: &self.approval_tool_calls,
+                recovery_tool_calls: &self.recovery_tool_calls,
+                session_ids: &self.session_ids,
+            },
+        );
+        let selected = previous
+            .as_ref()
+            .and_then(|label| {
+                candidates
+                    .iter()
+                    .position(|candidate| &candidate.label == label)
+            })
+            .unwrap_or(0);
+        self.command_assist = CommandAssistState {
+            open: !candidates.is_empty(),
+            candidates,
+            selected,
+            usage,
+            diagnostic,
+            active_request,
+        };
+    }
+
+    pub fn close_command_assist(&mut self) {
+        self.command_assist.open = false;
+        self.command_assist.active_request = None;
+    }
+
+    pub fn begin_session_completion(&mut self) -> Option<CompletionRequest> {
+        let prefix = "/session load ";
+        if !self.composer.text().starts_with(prefix) || self.composer.cursor() < prefix.len() {
+            self.command_assist.active_request = None;
+            return None;
+        }
+        let cursor = self.composer.cursor();
+        let start = self.composer.text()[..cursor]
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(prefix.len(), |(index, character)| {
+                index + character.len_utf8()
+            });
+        let request_id = self
+            .command_context_revision
+            .wrapping_add(self.composer.revision())
+            .wrapping_add(cursor as u64);
+        let request = CompletionRequest {
+            request_id,
+            draft_revision: self.composer.revision(),
+            cursor,
+            context_revision: self.command_context_revision,
+            query: self.composer.text()[start..cursor].to_owned(),
+            replacement_range: start..cursor,
+        };
+        self.command_assist.active_request = Some(request.clone());
+        Some(request)
+    }
+
+    pub fn apply_completion_response(&mut self, response: CompletionResponse) {
+        let Some(request) = self.command_assist.active_request.as_ref() else {
+            return;
+        };
+        if request.request_id != response.request_id
+            || response.draft_revision != self.composer.revision()
+            || response.cursor != self.composer.cursor()
+            || response.context_revision != self.command_context_revision
+        {
+            return;
+        }
+        self.command_assist.active_request = None;
+        if let Some(error) = response.error {
+            self.command_assist.diagnostic = Some(error);
+            return;
+        }
+        self.command_assist.candidates = response.candidates;
+        self.command_assist.selected = 0;
+        self.command_assist.open = !self.command_assist.candidates.is_empty();
+    }
+
+    pub fn set_command_diagnostic(&mut self, diagnostic: impl Into<String>) {
+        self.command_assist.diagnostic = Some(diagnostic.into());
+        self.command_assist.open = false;
+    }
+
+    pub fn move_command_selection(&mut self, delta: isize) {
+        let len = self.command_assist.candidates.len();
+        if len == 0 {
+            return;
+        }
+        self.command_assist.selected = if delta.is_negative() {
+            self.command_assist
+                .selected
+                .checked_sub(delta.unsigned_abs())
+                .unwrap_or(len - 1)
+        } else {
+            (self.command_assist.selected + delta as usize) % len
+        };
+    }
+
+    pub fn accept_selected_completion(&mut self, registry: &CommandRegistry) -> bool {
+        let Some(candidate) = self
+            .command_assist
+            .candidates
+            .get(self.command_assist.selected)
+            .cloned()
+        else {
+            return false;
+        };
+        if !self
+            .composer
+            .replace_range(candidate.replacement_range, &candidate.replacement)
+        {
+            return false;
+        }
+        self.refresh_command_assist(registry);
+        true
+    }
+
+    pub fn clear_transcript(&mut self) {
+        self.history.clear();
+        self.current_response.clear();
+        self.current_reasoning.clear();
+        self.scroll_offset = 0;
+    }
+
+    pub fn command_context(&self) -> CommandContext {
+        CommandContext {
+            revision: self.command_context_revision,
+            is_streaming: self.is_streaming,
+            approval_pending: !self.approval_tool_calls.is_empty(),
+            recovery_pending: !self.recovery_tool_calls.is_empty(),
+        }
+    }
+
+    pub fn set_session_ids(&mut self, session_ids: Vec<String>) {
+        self.session_ids = session_ids;
+    }
+
+    pub fn record_command_history(&mut self, command: String) {
+        self.command_history.push(command);
+        self.command_history_cursor = None;
+    }
+
+    pub fn navigate_input_history(&mut self, older: bool) -> bool {
+        let command_mode = self.composer.text().starts_with('/');
+        let (entries, cursor) = if command_mode {
+            (&self.command_history, &mut self.command_history_cursor)
+        } else {
+            (&self.prompt_history, &mut self.prompt_history_cursor)
+        };
+        if entries.is_empty() {
+            return false;
+        }
+        let next = if older {
+            cursor.map_or(entries.len() - 1, |index| index.saturating_sub(1))
+        } else {
+            match cursor {
+                Some(index) if *index + 1 < entries.len() => *index + 1,
+                Some(_) => {
+                    *cursor = None;
+                    self.composer.clear();
+                    return true;
+                }
+                None => return false,
+            }
+        };
+        *cursor = Some(next);
+        self.composer.set_text(entries[next].clone());
+        true
     }
 
     pub fn begin_resume(&mut self) {
@@ -121,11 +350,15 @@ impl AppState {
     }
 
     pub fn apply_runtime_event(&mut self, event: &RuntimeEvent) {
+        self.command_context_revision = self.command_context_revision.wrapping_add(1);
         match event {
             RuntimeEvent::SessionRecovered {
                 session_id,
                 conversation,
             } => {
+                push_unique(&mut self.session_ids, session_id.to_string());
+                self.approval_tool_calls.clear();
+                self.recovery_tool_calls.clear();
                 self.history.clear();
                 self.add_system_message(&format!("recovered session {session_id}"));
                 for message in conversation.messages() {
@@ -192,6 +425,7 @@ impl AppState {
                 message,
                 ..
             } => {
+                push_unique(&mut self.recovery_tool_calls, tool_call_id.to_string());
                 self.is_streaming = false;
                 self.status = AppStatus::Idle;
                 self.current_response.clear();
@@ -208,6 +442,7 @@ impl AppState {
                 replay_class,
                 ..
             } => {
+                push_unique(&mut self.approval_tool_calls, tool_call_id.to_string());
                 self.is_streaming = false;
                 self.status = AppStatus::Idle;
                 self.can_resume_turn = false;
@@ -283,8 +518,15 @@ impl AppState {
                 self.status = AppStatus::Waiting;
             }
             RuntimeEvent::ToolStarted {
-                name, arguments, ..
+                call_id,
+                name,
+                arguments,
+                ..
             } => {
+                self.approval_tool_calls
+                    .retain(|id| id != &call_id.to_string());
+                self.recovery_tool_calls
+                    .retain(|id| id != &call_id.to_string());
                 self.add_tool_call(name, &arguments.to_string());
             }
             RuntimeEvent::ToolCompleted { content, .. } => self.add_tool_result("", content),
@@ -393,6 +635,12 @@ impl AppState {
     }
 }
 
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -459,4 +707,37 @@ pub(crate) fn wrap_paragraph(text: &str, max_width: usize) -> Vec<String> {
         all.extend(wrap_line(para, max_width));
     }
     all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_completion_response_cannot_replace_newer_assist_state() {
+        let mut state = AppState::new();
+        state.composer.insert_str("/session load s");
+        let request = state.begin_session_completion().unwrap();
+        state.composer.insert_char('2');
+
+        state.apply_completion_response(CompletionResponse {
+            request_id: request.request_id,
+            draft_revision: request.draft_revision,
+            cursor: request.cursor,
+            context_revision: request.context_revision,
+            candidates: vec![CompletionItem {
+                stable_key: "session:session-1".to_owned(),
+                label: "session-1".to_owned(),
+                detail: "local session".to_owned(),
+                replacement: "session-1".to_owned(),
+                replacement_range: request.replacement_range,
+                kind: crate::app::command::CompletionKind::Resource,
+                disabled_reason: None,
+            }],
+            error: None,
+        });
+
+        assert!(state.command_assist.candidates.is_empty());
+        assert_eq!(state.composer.text(), "/session load s2");
+    }
 }

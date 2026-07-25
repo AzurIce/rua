@@ -1,3 +1,4 @@
+pub mod command;
 pub mod controller;
 pub mod event;
 pub mod frame;
@@ -6,6 +7,7 @@ pub mod render;
 pub mod state;
 
 // Backwards-compatible re-exports
+pub use command::{CommandId, CommandRegistry, CompletionRequest, CompletionResponse};
 pub use controller::{AppCommand, AppController};
 pub use event::UiEvent;
 pub use frame::FrameScheduler;

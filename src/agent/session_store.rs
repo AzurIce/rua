@@ -42,6 +42,30 @@ impl LocalSessionStore {
         &self.sessions_root
     }
 
+    /// Return only direct, valid session directory names. Listing never opens a
+    /// session and therefore cannot repair, lock, or otherwise mutate it.
+    pub fn list_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+        if !self.sessions_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut sessions = std::fs::read_dir(&self.sessions_root)
+            .map_err(io_error)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_dir())
+                    .map(|_| entry)
+            })
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| session_directory(&self.sessions_root, &SessionId::new(name)).is_ok())
+            .map(SessionId::new)
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(sessions)
+    }
+
     pub async fn validate_session(
         &self,
         session_id: &SessionId,
@@ -666,6 +690,35 @@ mod tests {
 
         assert_eq!(recovered.last_sequence, JournalSequence(1));
         assert_eq!(recovered.conversation.instructions().text, "system");
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lists_sessions_in_stable_order_without_opening_them() {
+        let root = temp_root("list");
+        let store = LocalSessionStore::new(&root);
+        for name in ["second", "first"] {
+            store
+                .append(
+                    &SessionId::new(name),
+                    JournalRecord::SessionCreated {
+                        instructions: InstructionSet::new("system"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .list_session_ids()
+                .unwrap()
+                .iter()
+                .map(SessionId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

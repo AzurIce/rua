@@ -27,6 +27,7 @@ pub fn draw(state: &AppState, frame: &mut Frame) {
     let content_width = (chunks[0].width.saturating_sub(2)) as usize;
 
     render_messages(state, frame, chunks[0], content_width);
+    render_command_assist(state, frame, chunks[0]);
     render_status(state, frame, chunks[1]);
     render_input(state, frame, chunks[2]);
 }
@@ -173,6 +174,19 @@ fn render_status(state: &AppState, frame: &mut Frame, area: Rect) {
         ));
     }
 
+    if let Some(usage) = &state.command_assist.usage {
+        spans.push(Span::styled(
+            format!("  {usage}"),
+            Style::default().fg(TEXT_MUTED),
+        ));
+    }
+    if let Some(diagnostic) = &state.command_assist.diagnostic {
+        spans.push(Span::styled(
+            format!("  {diagnostic}"),
+            Style::default().fg(PRIMARY),
+        ));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -201,10 +215,14 @@ fn render_input(state: &AppState, frame: &mut Frame, area: Rect) {
             ),
         ])])
     } else {
-        Text::from(vec![Line::from(vec![
+        let mut spans = vec![
             prompt,
             Span::styled(viewport.text, Style::default().fg(TEXT)),
-        ])])
+        ];
+        if let Some(ghost) = ghost_completion(state) {
+            spans.push(Span::styled(ghost, Style::default().fg(TEXT_MUTED)));
+        }
+        Text::from(vec![Line::from(spans)])
     };
 
     frame.render_widget(
@@ -228,6 +246,91 @@ fn render_input(state: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
+fn render_command_assist(state: &AppState, frame: &mut Frame, area: Rect) {
+    if !state.command_assist.open || state.command_assist.candidates.is_empty() || area.height < 3 {
+        return;
+    }
+    let rows = u16::try_from(state.command_assist.candidates.len().min(4)).unwrap_or(4);
+    let first_row = state
+        .command_assist
+        .selected
+        .saturating_sub(rows.saturating_sub(1) as usize)
+        .min(
+            state
+                .command_assist
+                .candidates
+                .len()
+                .saturating_sub(rows as usize),
+        );
+    let height = rows.saturating_add(2).min(area.height);
+    let popup = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(height),
+        area.width,
+        height,
+    );
+    let lines = state
+        .command_assist
+        .candidates
+        .iter()
+        .skip(first_row)
+        .take(rows as usize)
+        .enumerate()
+        .map(|(offset, candidate)| {
+            let selected = first_row + offset == state.command_assist.selected;
+            Line::from(vec![
+                Span::styled(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(if selected { PRIMARY } else { TEXT_MUTED }),
+                ),
+                Span::styled(
+                    &candidate.label,
+                    Style::default()
+                        .fg(if selected { PRIMARY } else { TEXT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    format!("  {}", candidate.detail),
+                    Style::default().fg(TEXT_MUTED),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" commands ")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().bg(BG_PANEL)),
+        popup,
+    );
+}
+
+fn ghost_completion(state: &AppState) -> Option<String> {
+    let [candidate] = state.command_assist.candidates.as_slice() else {
+        return None;
+    };
+    if candidate.replacement_range.end != state.composer.cursor() {
+        return None;
+    }
+    let typed = state
+        .composer
+        .text()
+        .get(candidate.replacement_range.clone())?;
+    candidate
+        .replacement
+        .strip_prefix(typed)
+        .filter(|suffix| !suffix.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::{
@@ -248,6 +351,28 @@ mod tests {
         assert_eq!(
             terminal.backend_mut().get_cursor_position().unwrap(),
             Position::new(6, 5)
+        );
+    }
+
+    #[test]
+    fn draw_shows_command_candidates_without_moving_the_cursor() {
+        let mut state = AppState::new();
+        state.composer.insert_str("/rec");
+        state.refresh_command_assist(&crate::app::CommandRegistry::builtins());
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+
+        terminal.draw(|frame| draw(&state, frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("recovery"));
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            Position::new(7, 9)
         );
     }
 }

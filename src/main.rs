@@ -102,6 +102,7 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
     });
 
     // Agent core: canonical conversation, provider adapter and tool runtime.
+    let approval_mode = options.approval;
     let provider = Arc::new(DeepSeekProvider::new(&config.deepseek)?);
     let mut tools = ToolRegistry::new();
     tools.register(BashTool::for_workspace(&project_root)?)?;
@@ -114,14 +115,26 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
     };
     let store = Arc::new(LocalSessionStore::new(project_root));
     let recovered = options.session.is_some();
-    let runtime = Arc::new(
+    let mut runtime = Arc::new(
         (if let Some(session_id) = options.session {
-            AgentRuntime::recover(provider, tools, model, store, session_id).await?
+            AgentRuntime::recover(
+                provider.clone(),
+                tools.clone(),
+                model.clone(),
+                store.clone(),
+                session_id,
+            )
+            .await?
         } else {
-            AgentRuntime::new(provider, tools, "You are rua, an AI coding agent.", model)
-                .with_session_store(store)
+            AgentRuntime::new(
+                provider.clone(),
+                tools.clone(),
+                "You are rua, an AI coding agent.",
+                model.clone(),
+            )
+            .with_session_store(store.clone())
         })
-        .with_approval_mode(options.approval),
+        .with_approval_mode(approval_mode),
     );
     if !recovered {
         controller
@@ -217,6 +230,82 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
                             ));
                         }
                     }
+                }
+                AppCommand::ListSessions => match store.list_session_ids() {
+                    Ok(session_ids) => {
+                        controller
+                            .state_mut()
+                            .set_session_ids(session_ids.iter().map(ToString::to_string).collect());
+                        if session_ids.is_empty() {
+                            controller
+                                .state_mut()
+                                .add_system_message("no local sessions");
+                        } else {
+                            for session_id in session_ids {
+                                controller
+                                    .state_mut()
+                                    .add_system_message(session_id.as_str());
+                            }
+                        }
+                    }
+                    Err(error) => controller.state_mut().add_error(&error.to_string()),
+                },
+                AppCommand::LoadSession(session_id) => {
+                    if stream_task.is_some() {
+                        controller
+                            .state_mut()
+                            .add_error("cannot load a session while a turn is active");
+                    } else {
+                        match AgentRuntime::recover(
+                            provider.clone(),
+                            tools.clone(),
+                            model.clone(),
+                            store.clone(),
+                            session_id,
+                        )
+                        .await
+                        {
+                            Ok(next) => {
+                                runtime = Arc::new(next.with_approval_mode(approval_mode));
+                                runtime.publish_recovery(&runtime_tx).await;
+                            }
+                            Err(error) => controller.state_mut().add_error(&error.to_string()),
+                        }
+                    }
+                }
+                AppCommand::RequestSessionCompletions(request) => {
+                    let response = match store.list_session_ids() {
+                        Ok(session_ids) => rua::app::CompletionResponse {
+                            request_id: request.request_id,
+                            draft_revision: request.draft_revision,
+                            cursor: request.cursor,
+                            context_revision: request.context_revision,
+                            candidates: session_ids
+                                .into_iter()
+                                .filter(|session_id| session_id.as_str().contains(&request.query))
+                                .take(32)
+                                .map(|session_id| rua::app::command::CompletionItem {
+                                    stable_key: format!("session:{session_id}"),
+                                    label: session_id.to_string(),
+                                    detail: "local session".to_owned(),
+                                    replacement: session_id.to_string(),
+                                    replacement_range: request.replacement_range.clone(),
+                                    kind: rua::app::command::CompletionKind::Resource,
+                                    disabled_reason: None,
+                                })
+                                .collect(),
+                            error: None,
+                        },
+                        Err(error) => rua::app::CompletionResponse {
+                            request_id: request.request_id,
+                            draft_revision: request.draft_revision,
+                            cursor: request.cursor,
+                            context_revision: request.context_revision,
+                            candidates: Vec::new(),
+                            error: Some(error.to_string()),
+                        },
+                    };
+                    controller.handle(UiEvent::Completion(response));
                 }
                 AppCommand::ReconcileTool {
                     tool_call_id,
