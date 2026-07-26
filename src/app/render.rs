@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use crate::app::state::{
@@ -32,6 +32,7 @@ pub fn draw(state: &AppState, frame: &mut Frame) {
     render_command_assist(state, frame, chunks[0]);
     render_status(state, frame, chunks[1]);
     render_input(state, frame, chunks[2]);
+    render_tree_overlay(state, frame, area);
 }
 
 fn render_messages(state: &AppState, frame: &mut Frame, area: Rect, content_width: usize) {
@@ -238,13 +239,142 @@ fn render_input(state: &AppState, frame: &mut Frame, area: Rect) {
         area,
     );
 
-    if inner.width > prompt_width && inner.height > 0 {
+    if !state.tree_overlay.open && inner.width > prompt_width && inner.height > 0 {
         let cursor_x = inner
             .x
             .saturating_add(prompt_width)
             .saturating_add(viewport.cursor_column)
             .min(inner.right().saturating_sub(1));
         frame.set_cursor_position(Position::new(cursor_x, inner.y));
+    }
+}
+
+fn render_tree_overlay(state: &AppState, frame: &mut Frame, area: Rect) {
+    if !state.tree_overlay.open || area.width < 20 || area.height < 8 {
+        return;
+    }
+    let width = area
+        .width
+        .saturating_mul(4)
+        .checked_div(5)
+        .unwrap_or(area.width)
+        .max(20);
+    let height = area
+        .height
+        .saturating_mul(3)
+        .checked_div(4)
+        .unwrap_or(area.height)
+        .max(8);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width.min(area.width),
+        height.min(area.height),
+    );
+    frame.render_widget(Clear, popup);
+
+    let visible_rows = popup.height.saturating_sub(3) as usize;
+    let visible_indices = state
+        .tree_overlay
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| state.tree_item_visible(index).then_some(index))
+        .collect::<Vec<_>>();
+    let total = visible_indices.len();
+    let selected_position = visible_indices
+        .iter()
+        .position(|index| *index == state.tree_overlay.selected)
+        .unwrap_or(0);
+    let first = selected_position
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(total.saturating_sub(visible_rows));
+    let lines = visible_indices
+        .iter()
+        .skip(first)
+        .take(visible_rows)
+        .enumerate()
+        .map(|(offset, index)| {
+            let item = &state.tree_overlay.items[*index];
+            let selected = first + offset == selected_position;
+            let indent = "  ".repeat(item.depth);
+            let head = if item.is_head { " *" } else { "" };
+            let branch_color = if item.is_active_path { SUCCESS } else { BORDER };
+            Line::from(vec![
+                Span::styled(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(if selected { PRIMARY } else { TEXT_MUTED }),
+                ),
+                Span::styled(indent, Style::default().fg(branch_color)),
+                Span::styled("├─ ", Style::default().fg(branch_color)),
+                Span::styled(
+                    format!("[{}] ", item.kind),
+                    Style::default().fg(SYSTEM_ACCENT),
+                ),
+                Span::styled(
+                    &item.label,
+                    Style::default()
+                        .fg(if selected {
+                            PRIMARY
+                        } else if item.is_active_path {
+                            TEXT
+                        } else {
+                            TEXT_MUTED
+                        })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(head, Style::default().fg(SUCCESS)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let title = if total == 0 {
+        " session tree ".to_owned()
+    } else {
+        format!(
+            " session tree {}/{} · Enter checkout · e edit · history only, files unchanged · Esc close ",
+            selected_position + 1,
+            total,
+        )
+    };
+    let title = format!(
+        "{} · t tools:{} · d cwd:{} ",
+        title.trim_end(),
+        if state.tree_overlay.show_tools {
+            "on"
+        } else {
+            "off"
+        },
+        if state.tree_overlay.show_cwd {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(PRIMARY)),
+            )
+            .style(Style::default().bg(BG_PANEL)),
+        popup,
+    );
+    if total > visible_rows {
+        let mut scrollbar = ScrollbarState::new(total).position(selected_position);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            popup.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar,
+        );
     }
 }
 
@@ -417,5 +547,35 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains(&format!("commands 1/{total}")));
         assert!(rendered.contains('↓'));
+    }
+
+    #[test]
+    fn draw_renders_the_session_tree_overlay() {
+        let mut state = AppState::new();
+        state.open_tree_overlay(
+            vec![crate::app::TreeOverlayItem {
+                entry_id: None,
+                depth: 0,
+                kind: "root".to_owned(),
+                label: "virtual root".to_owned(),
+                is_head: true,
+                is_active_path: true,
+                editable: false,
+            }],
+            crate::agent::HeadRevision(0),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(&state, frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("session tree"));
+        assert!(rendered.contains("virtual root"));
     }
 }

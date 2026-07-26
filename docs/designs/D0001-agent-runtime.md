@@ -34,7 +34,7 @@ Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider �
 
 本设计不决定：
 
-- 持久化 session 的文件格式或会话分支模型；
+- 持久化 session 的文件格式或会话分支模型；后者由 [D0007](D0007-session-tree-and-working-directory.md) 定义；
 - 上下文压缩算法；
 - 多 provider 的认证或配置方式；
 - sandbox 或工具级安全策略；
@@ -47,6 +47,8 @@ Provider 与 canonical conversation 的具体数据契约由 [D0002：Provider �
 ## 谁拥有会话
 
 `AgentRuntime` 持有 canonical conversation，并且是唯一可以向其中追加具有协议意义消息的组件。Conversation 必须保留未来发起 provider 请求所需的全部信息，无需读取 UI 状态。
+
+当 session 采用 [D0007](D0007-session-tree-and-working-directory.md) 的 entry tree 后，runtime 拥有的是完整 tree、durable head 以及从 active root-to-head path 派生的 canonical conversation。UI 仍然不能直接移动 head 或拼接某段展示历史来制造 provider request；checkout 与 append 都必须经过 runtime 的 expected-head 校验。
 
 Canonical conversation 至少表达：
 

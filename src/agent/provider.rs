@@ -544,8 +544,9 @@ mod tests {
     use super::test_support::{Script, ScriptedProvider};
     use super::*;
     use crate::agent::types::{
-        ApiFamily, AttemptId, ConversationRevision, GenerationOptions, InstructionSet, MessageId,
-        ProviderErrorKind, ProviderId, ResponseProvenance, RetryHint, StepId, TurnId,
+        ApiFamily, AttemptId, ContextRevision, ConversationRevision, DirectoryRevision,
+        DirectorySnapshot, GenerationOptions, InstructionSet, MessageId, ProviderErrorKind,
+        ProviderId, ResponseProvenance, RetryHint, StepId, TurnContextSnapshot, TurnId,
     };
 
     fn model() -> ModelRef {
@@ -580,6 +581,13 @@ mod tests {
             step_id: StepId::new("step-1"),
             attempt_id: AttemptId::new("attempt-1"),
             conversation_revision: ConversationRevision(3),
+            context: TurnContextSnapshot {
+                directory: DirectorySnapshot {
+                    path: std::env::current_dir().unwrap(),
+                    revision: DirectoryRevision::default(),
+                },
+                context_revision: ContextRevision(3),
+            },
             instructions: InstructionSet::new("system"),
             messages: Vec::new(),
             tools: Vec::new(),

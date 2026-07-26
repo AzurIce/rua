@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -51,14 +52,130 @@ string_id!(StepId);
 string_id!(AttemptId);
 string_id!(ExecutionId);
 string_id!(SessionId);
+string_id!(EntryId);
 string_id!(ProviderId);
 string_id!(ApiFamily);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SessionEntryName(String);
+
+impl SessionEntryName {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, SessionEntryNameError> {
+        let value = value.into();
+        let mut components = std::path::Path::new(&value).components();
+        if value.is_empty()
+            || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(SessionEntryNameError(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionEntryName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionEntryName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid session entry name: {0}")]
+pub struct SessionEntryNameError(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionLocator {
+    pub project_root: PathBuf,
+    pub entry_name: SessionEntryName,
+}
+
+impl<'de> Deserialize<'de> for SessionLocator {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireLocator {
+            project_root: PathBuf,
+            entry_name: SessionEntryName,
+        }
+
+        let locator = WireLocator::deserialize(deserializer)?;
+        if !locator.project_root.is_absolute() {
+            return Err(serde::de::Error::custom(
+                "session locator project root must be absolute",
+            ));
+        }
+        Ok(Self {
+            project_root: locator.project_root,
+            entry_name: locator.entry_name,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentSessionRef {
+    pub session_id: SessionId,
+    pub fork_entry_id: Option<EntryId>,
+}
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(transparent)]
 pub struct ConversationRevision(pub u64);
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct DirectoryRevision(pub u64);
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct HeadRevision(pub u64);
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct ContextRevision(pub u64);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StableHead {
+    pub entry_id: Option<EntryId>,
+    pub revision: HeadRevision,
+    pub directory_revision: DirectoryRevision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectorySnapshot {
+    pub path: PathBuf,
+    pub revision: DirectoryRevision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnContextSnapshot {
+    pub directory: DirectorySnapshot,
+    pub context_revision: ContextRevision,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -236,6 +353,7 @@ pub struct ModelRequest {
     pub step_id: StepId,
     pub attempt_id: AttemptId,
     pub conversation_revision: ConversationRevision,
+    pub context: TurnContextSnapshot,
     pub instructions: InstructionSet,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
@@ -300,5 +418,31 @@ impl ProviderError {
             message: message.into(),
             retry: RetryHint::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_entry_name_deserialization_enforces_single_component_validation() {
+        assert_eq!(
+            serde_json::from_str::<SessionEntryName>(r#""friendly-name""#)
+                .unwrap()
+                .as_str(),
+            "friendly-name"
+        );
+        assert!(serde_json::from_str::<SessionEntryName>(r#""../outside""#).is_err());
+        assert!(serde_json::from_str::<SessionEntryName>(r#""nested/entry""#).is_err());
+    }
+
+    #[test]
+    fn session_locator_deserialization_rejects_relative_project_roots() {
+        let json = r#"{"project_root":"relative/project","entry_name":"session"}"#;
+
+        let error = serde_json::from_str::<SessionLocator>(json).unwrap_err();
+
+        assert!(error.to_string().contains("project root must be absolute"));
     }
 }

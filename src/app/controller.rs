@@ -1,4 +1,4 @@
-use crate::agent::{ReconciliationDecision, SessionId, ToolCallId};
+use crate::agent::{EntryId, HeadRevision, ReconciliationDecision, SessionId, ToolCallId};
 use crate::tui::{TuiEvent, TuiKeyCode, TuiKeyModifiers};
 
 use super::{
@@ -14,6 +14,25 @@ pub enum AppCommand {
     InspectRecovery,
     ListSessions,
     LoadSession(SessionId),
+    RenameSessionEntry(String),
+    MoveSessionEntry {
+        project_root: String,
+        entry_name: Option<String>,
+    },
+    ChangeDirectory {
+        path: String,
+        original_input: String,
+    },
+    PrintWorkingDirectory,
+    ListSessionTree,
+    CheckoutSessionEntry {
+        entry_id: Option<EntryId>,
+        expected_head_revision: Option<HeadRevision>,
+    },
+    EditFromSessionEntry {
+        entry_id: EntryId,
+        expected_head_revision: Option<HeadRevision>,
+    },
     RequestSessionCompletions(super::command::CompletionRequest),
     ReconcileTool {
         tool_call_id: ToolCallId,
@@ -74,6 +93,62 @@ impl AppController {
     fn handle_terminal(&mut self, event: TuiEvent) -> Vec<AppCommand> {
         match event {
             TuiEvent::Key(key) => {
+                if self.state.tree_overlay.open {
+                    match key.code {
+                        TuiKeyCode::Escape => {
+                            self.state.close_tree_overlay();
+                            return Vec::new();
+                        }
+                        TuiKeyCode::Up => {
+                            self.state.move_tree_selection(-1);
+                            return Vec::new();
+                        }
+                        TuiKeyCode::Down => {
+                            self.state.move_tree_selection(1);
+                            return Vec::new();
+                        }
+                        TuiKeyCode::Enter | TuiKeyCode::Char('c') => {
+                            let target = self
+                                .state
+                                .selected_tree_item()
+                                .map(|item| item.entry_id.clone());
+                            let revision = self.state.tree_overlay.head_revision;
+                            self.state.close_tree_overlay();
+                            return target
+                                .map(|entry_id| AppCommand::CheckoutSessionEntry {
+                                    entry_id,
+                                    expected_head_revision: Some(revision),
+                                })
+                                .into_iter()
+                                .collect();
+                        }
+                        TuiKeyCode::Char('e') => {
+                            let target = self.state.selected_tree_item().and_then(|item| {
+                                item.editable.then(|| item.entry_id.clone()).flatten()
+                            });
+                            if target.is_some() {
+                                self.state.close_tree_overlay();
+                            }
+                            let revision = self.state.tree_overlay.head_revision;
+                            return target
+                                .map(|entry_id| AppCommand::EditFromSessionEntry {
+                                    entry_id,
+                                    expected_head_revision: Some(revision),
+                                })
+                                .into_iter()
+                                .collect();
+                        }
+                        TuiKeyCode::Char('t') => {
+                            self.state.toggle_tree_tools();
+                            return Vec::new();
+                        }
+                        TuiKeyCode::Char('d') => {
+                            self.state.toggle_tree_cwd();
+                            return Vec::new();
+                        }
+                        _ => return Vec::new(),
+                    }
+                }
                 if is_ctrl_c(key.code, key.modifiers) && self.state.is_streaming {
                     return vec![AppCommand::CancelTurn];
                 }
@@ -145,6 +220,10 @@ impl AppController {
             }
             TuiEvent::Resize { .. } => Vec::new(),
             TuiEvent::MouseScroll { up } => {
+                if self.state.tree_overlay.open {
+                    self.state.move_tree_selection(if up { -1 } else { 1 });
+                    return Vec::new();
+                }
                 const WHEEL_LINES: u16 = 3;
                 self.state.scroll_offset = if up {
                     self.state.scroll_offset.saturating_sub(WHEEL_LINES)
@@ -239,6 +318,28 @@ impl AppController {
             CommandId::SessionLoad => vec![AppCommand::LoadSession(SessionId::new(
                 &invocation.arguments[0],
             ))],
+            CommandId::SessionRename => vec![AppCommand::RenameSessionEntry(
+                invocation.arguments[0].clone(),
+            )],
+            CommandId::SessionMove => vec![AppCommand::MoveSessionEntry {
+                project_root: invocation.arguments[0].clone(),
+                entry_name: invocation.arguments.get(1).cloned(),
+            }],
+            CommandId::ChangeDirectory => vec![AppCommand::ChangeDirectory {
+                path: invocation.arguments[0].clone(),
+                original_input: submitted_command.clone(),
+            }],
+            CommandId::PrintWorkingDirectory => vec![AppCommand::PrintWorkingDirectory],
+            CommandId::SessionTreeList => vec![AppCommand::ListSessionTree],
+            CommandId::SessionTreeCheckout => vec![AppCommand::CheckoutSessionEntry {
+                entry_id: (invocation.arguments[0] != "root")
+                    .then(|| EntryId::new(&invocation.arguments[0])),
+                expected_head_revision: None,
+            }],
+            CommandId::SessionTreeEdit => vec![AppCommand::EditFromSessionEntry {
+                entry_id: EntryId::new(&invocation.arguments[0]),
+                expected_head_revision: None,
+            }],
             CommandId::RecoverySuccess => vec![AppCommand::ReconcileTool {
                 tool_call_id: ToolCallId::new(&invocation.arguments[0]),
                 decision: ReconciliationDecision::MarkSucceeded {
@@ -361,6 +462,102 @@ mod tests {
         assert_eq!(
             controller.handle(key(TuiKeyCode::Enter)),
             vec![AppCommand::LoadSession(SessionId::new("session-1"))]
+        );
+    }
+
+    #[test]
+    fn cd_dispatches_a_runtime_command_and_enters_history() {
+        let mut controller = AppController::new(AppState::new());
+        controller.state_mut().composer.insert_str("/cd ../other");
+
+        assert_eq!(
+            controller.handle(key(TuiKeyCode::Enter)),
+            vec![AppCommand::ChangeDirectory {
+                path: "../other".to_owned(),
+                original_input: "/cd ../other".to_owned(),
+            }]
+        );
+        controller.handle(key(TuiKeyCode::Up));
+        assert_eq!(controller.state().composer.text(), "/cd ../other");
+    }
+
+    #[test]
+    fn tree_checkout_root_dispatches_an_explicit_head_move() {
+        let mut controller = AppController::new(AppState::new());
+        controller
+            .state_mut()
+            .composer
+            .insert_str("/tree checkout root");
+
+        assert_eq!(
+            controller.handle(key(TuiKeyCode::Enter)),
+            vec![AppCommand::CheckoutSessionEntry {
+                entry_id: None,
+                expected_head_revision: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn tree_overlay_navigates_and_dispatches_selected_actions() {
+        let mut controller = AppController::new(AppState::new());
+        controller.state_mut().open_tree_overlay(
+            vec![
+                crate::app::TreeOverlayItem {
+                    entry_id: None,
+                    depth: 0,
+                    kind: "root".to_owned(),
+                    label: "virtual root".to_owned(),
+                    is_head: true,
+                    is_active_path: true,
+                    editable: false,
+                },
+                crate::app::TreeOverlayItem {
+                    entry_id: Some(EntryId::new("entry-1")),
+                    depth: 1,
+                    kind: "user".to_owned(),
+                    label: "hello".to_owned(),
+                    is_head: false,
+                    is_active_path: false,
+                    editable: true,
+                },
+            ],
+            HeadRevision(7),
+        );
+
+        assert!(controller.handle(key(TuiKeyCode::Down)).is_empty());
+        assert_eq!(
+            controller.handle(key(TuiKeyCode::Char('e'))),
+            vec![AppCommand::EditFromSessionEntry {
+                entry_id: EntryId::new("entry-1"),
+                expected_head_revision: Some(HeadRevision(7)),
+            }]
+        );
+        assert!(!controller.state().tree_overlay.open);
+    }
+
+    #[test]
+    fn tree_overlay_enter_can_checkout_the_virtual_root() {
+        let mut controller = AppController::new(AppState::new());
+        controller.state_mut().open_tree_overlay(
+            vec![crate::app::TreeOverlayItem {
+                entry_id: None,
+                depth: 0,
+                kind: "root".to_owned(),
+                label: "virtual root".to_owned(),
+                is_head: true,
+                is_active_path: true,
+                editable: false,
+            }],
+            HeadRevision(3),
+        );
+
+        assert_eq!(
+            controller.handle(key(TuiKeyCode::Enter)),
+            vec![AppCommand::CheckoutSessionEntry {
+                entry_id: None,
+                expected_head_revision: Some(HeadRevision(3)),
+            }]
         );
     }
 

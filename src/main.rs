@@ -10,9 +10,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use rua::agent::{
-    AgentRuntime, ApiFamily, BashTool, DeepSeekProvider, LocalSessionStore, ModelRef, ProviderId,
-    ReconciliationDecision, RuntimeEvent, SessionId, ToolCallId, ToolRegistry,
-    register_coding_tools,
+    AgentRuntime, ApiFamily, BashTool, ChangeDirectoryTool, DeepSeekProvider, LocalSessionStore,
+    ModelRef, ProviderId, ReconciliationDecision, RuntimeEvent, SessionId, ToolCallId,
+    ToolRegistry, register_coding_tools,
 };
 use rua::app::{App, AppCommand, AppController, FrameScheduler, UiEvent};
 use rua::config::Config;
@@ -53,7 +53,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
-    let project_root = std::env::current_dir()?;
+    let startup_cwd = std::env::current_dir()?;
+    let project_root = LocalSessionStore::discover_project_root(&startup_cwd)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -104,15 +105,16 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
     // Agent core: canonical conversation, provider adapter and tool runtime.
     let provider = Arc::new(DeepSeekProvider::new(&config.deepseek)?);
     let mut tools = ToolRegistry::new();
-    tools.register(BashTool::for_workspace(&project_root)?)?;
-    register_coding_tools(&mut tools, &project_root)?;
+    tools.register(BashTool::default())?;
+    tools.register(ChangeDirectoryTool)?;
+    register_coding_tools(&mut tools)?;
     let tools = Arc::new(tools);
     let model = ModelRef {
         provider: ProviderId::new("deepseek"),
         api_family: ApiFamily::new("openai-chat"),
         model: config.deepseek.model.clone(),
     };
-    let store = Arc::new(LocalSessionStore::new(project_root));
+    let store = Arc::new(LocalSessionStore::new(&project_root));
     let recovered = options.session.is_some();
     let mut runtime = Arc::new(if let Some(session_id) = options.session {
         AgentRuntime::recover(
@@ -124,19 +126,32 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
         )
         .await?
     } else {
-        AgentRuntime::new(
+        let runtime = AgentRuntime::new_in(
             provider.clone(),
             tools.clone(),
             "You are rua, an AI coding agent.",
             model.clone(),
-        )
-        .with_session_store(store.clone())
+            &startup_cwd,
+        )?;
+        let locator = store.default_locator(runtime.session_id())?;
+        runtime
+            .with_session_store(store.clone())
+            .with_session_locator(locator)
     });
     if !recovered {
         controller
             .state_mut()
             .add_system_message(&format!("session {}", runtime.session_id()));
     }
+    controller.state_mut().set_session_entry_ids(
+        runtime
+            .session_tree_snapshot()
+            .await
+            .entries()
+            .keys()
+            .map(ToString::to_string)
+            .collect(),
+    );
     let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
     if recovered {
         runtime.publish_recovery(&runtime_tx).await;
@@ -249,9 +264,152 @@ async fn run_app(config: Config, options: StartupOptions) -> Result<()> {
                             Ok(next) => {
                                 runtime = Arc::new(next);
                                 runtime.publish_recovery(&runtime_tx).await;
+                                controller.state_mut().set_session_entry_ids(
+                                    runtime
+                                        .session_tree_snapshot()
+                                        .await
+                                        .entries()
+                                        .keys()
+                                        .map(ToString::to_string)
+                                        .collect(),
+                                );
                             }
                             Err(error) => controller.state_mut().add_error(&error.to_string()),
                         }
+                    }
+                }
+                AppCommand::RenameSessionEntry(name) => {
+                    match rua::agent::SessionEntryName::try_new(name) {
+                        Ok(name) => match runtime.rename_session_entry(name).await {
+                            Ok(locator) => controller.state_mut().add_system_message(&format!(
+                                "session entry renamed to {}",
+                                locator.entry_name
+                            )),
+                            Err(error) => controller.state_mut().add_error(&error.to_string()),
+                        },
+                        Err(error) => controller.state_mut().add_error(&error.to_string()),
+                    }
+                }
+                AppCommand::MoveSessionEntry {
+                    project_root,
+                    entry_name,
+                } => {
+                    let entry_name = entry_name
+                        .map(rua::agent::SessionEntryName::try_new)
+                        .transpose();
+                    match entry_name {
+                        Ok(entry_name) => match runtime
+                            .move_session_entry(PathBuf::from(project_root), entry_name)
+                            .await
+                        {
+                            Ok(locator) => controller.state_mut().add_system_message(&format!(
+                                "session moved to {}/{}",
+                                locator.project_root.display(),
+                                locator.entry_name
+                            )),
+                            Err(error) => controller.state_mut().add_error(&error.to_string()),
+                        },
+                        Err(error) => controller.state_mut().add_error(&error.to_string()),
+                    }
+                }
+                AppCommand::ChangeDirectory {
+                    path,
+                    original_input,
+                } => match runtime
+                    .change_directory_from_command(path, original_input, &runtime_tx)
+                    .await
+                {
+                    Ok(_) => {
+                        controller.state_mut().set_session_entry_ids(
+                            runtime
+                                .session_tree_snapshot()
+                                .await
+                                .entries()
+                                .keys()
+                                .map(ToString::to_string)
+                                .collect(),
+                        );
+                    }
+                    Err(error) => controller.state_mut().add_error(&error.to_string()),
+                },
+                AppCommand::PrintWorkingDirectory => match runtime.directory_availability().await {
+                    rua::agent::DirectoryAvailability::Available(directory) => controller
+                        .state_mut()
+                        .add_system_message(&directory.path.display().to_string()),
+                    rua::agent::DirectoryAvailability::Unavailable {
+                        recorded_path,
+                        reason,
+                    } => controller.state_mut().add_error(&format!(
+                        "{}: {reason}",
+                        recorded_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "working directory unavailable".to_owned())
+                    )),
+                },
+                AppCommand::ListSessionTree => {
+                    let tree = runtime.session_tree_snapshot().await;
+                    controller.state_mut().set_session_entry_ids(
+                        tree.entries().keys().map(ToString::to_string).collect(),
+                    );
+                    controller
+                        .state_mut()
+                        .open_tree_overlay(session_tree_overlay_items(&tree), tree.head().revision);
+                }
+                AppCommand::CheckoutSessionEntry {
+                    entry_id,
+                    expected_head_revision,
+                } => {
+                    match runtime
+                        .checkout_expected(entry_id, expected_head_revision)
+                        .await
+                    {
+                        Ok(()) => {
+                            runtime.publish_recovery(&runtime_tx).await;
+                            controller
+                                .state_mut()
+                                .add_system_message("session head moved");
+                        }
+                        Err(error) => controller.state_mut().add_error(&error.to_string()),
+                    }
+                }
+                AppCommand::EditFromSessionEntry {
+                    entry_id,
+                    expected_head_revision,
+                } => {
+                    let tree = runtime.session_tree_snapshot().await;
+                    let Some(entry) = tree.entries().get(&entry_id) else {
+                        controller
+                            .state_mut()
+                            .add_error(&format!("session entry does not exist: {entry_id}"));
+                        continue;
+                    };
+                    let rua::agent::SessionEntryPayload::Message(rua::agent::Message::User(user)) =
+                        &entry.payload
+                    else {
+                        controller
+                            .state_mut()
+                            .add_error("tree edit requires a user-message entry");
+                        continue;
+                    };
+                    let text = user
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            rua::agent::UserContent::Text { text } => text.as_str(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    match runtime
+                        .checkout_expected(entry.parent_id.clone(), expected_head_revision)
+                        .await
+                    {
+                        Ok(()) => {
+                            runtime.publish_recovery(&runtime_tx).await;
+                            controller.state_mut().composer.clear();
+                            controller.state_mut().composer.insert_str(&text);
+                        }
+                        Err(error) => controller.state_mut().add_error(&error.to_string()),
                     }
                 }
                 AppCommand::RequestSessionCompletions(request) => {
@@ -376,6 +534,141 @@ fn merge_runtime_event(buffer: &mut VecDeque<RuntimeEvent>, event: RuntimeEvent)
     }
 }
 
+fn session_tree_overlay_items(tree: &rua::agent::SessionTree) -> Vec<rua::app::TreeOverlayItem> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut children: HashMap<Option<rua::agent::EntryId>, Vec<&rua::agent::SessionEntry>> =
+        HashMap::new();
+    for entry in tree.entries().values() {
+        children
+            .entry(entry.parent_id.clone())
+            .or_default()
+            .push(entry);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(|left, right| {
+            left.timestamp_unix_ms
+                .cmp(&right.timestamp_unix_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+    let active_path = tree
+        .path_to_head()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.id.clone())
+        .collect::<HashSet<_>>();
+
+    fn append_children(
+        parent: Option<rua::agent::EntryId>,
+        depth: usize,
+        head: Option<&rua::agent::EntryId>,
+        active_path: &HashSet<rua::agent::EntryId>,
+        children: &HashMap<Option<rua::agent::EntryId>, Vec<&rua::agent::SessionEntry>>,
+        items: &mut Vec<rua::app::TreeOverlayItem>,
+    ) {
+        let Some(entries) = children.get(&parent) else {
+            return;
+        };
+        for entry in entries {
+            let (kind, label, editable) = match &entry.payload {
+                rua::agent::SessionEntryPayload::Message(rua::agent::Message::User(user)) => {
+                    let text = user
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            rua::agent::UserContent::Text { text } => text.as_str(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ("user", compact_tree_label(&text), true)
+                }
+                rua::agent::SessionEntryPayload::Message(rua::agent::Message::Assistant(
+                    assistant,
+                )) => {
+                    let text = assistant.parts.iter().find_map(|part| match part {
+                        rua::agent::AssistantPart::Text(text) if !text.text.trim().is_empty() => {
+                            Some(text.text.as_str())
+                        }
+                        _ => None,
+                    });
+                    if let Some(text) = text {
+                        ("assistant", compact_tree_label(text), false)
+                    } else if let Some(call) = assistant.tool_calls().next() {
+                        ("tool", format!("{} call", call.name), false)
+                    } else {
+                        ("assistant", "reasoning response".to_owned(), false)
+                    }
+                }
+                rua::agent::SessionEntryPayload::Message(rua::agent::Message::ToolResult(
+                    result,
+                )) => ("tool", result.name.clone(), false),
+                rua::agent::SessionEntryPayload::CwdChanged { from, to, .. } => (
+                    "cwd",
+                    format!(
+                        "{} → {}",
+                        from.as_ref()
+                            .map(|directory| directory.path.display().to_string())
+                            .unwrap_or_else(|| "(unknown)".to_owned()),
+                        to.path.display()
+                    ),
+                    false,
+                ),
+            };
+            items.push(rua::app::TreeOverlayItem {
+                entry_id: Some(entry.id.clone()),
+                depth,
+                kind: kind.to_owned(),
+                label,
+                is_head: head == Some(&entry.id),
+                is_active_path: active_path.contains(&entry.id),
+                editable,
+            });
+            append_children(
+                Some(entry.id.clone()),
+                depth.saturating_add(1),
+                head,
+                active_path,
+                children,
+                items,
+            );
+        }
+    }
+
+    let mut items = vec![rua::app::TreeOverlayItem {
+        entry_id: None,
+        depth: 0,
+        kind: "root".to_owned(),
+        label: "virtual root".to_owned(),
+        is_head: tree.head().entry_id.is_none(),
+        is_active_path: true,
+        editable: false,
+    }];
+    append_children(
+        None,
+        1,
+        tree.head().entry_id.as_ref(),
+        &active_path,
+        &children,
+        &mut items,
+    );
+    items
+}
+
+fn compact_tree_label(text: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let prefix = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else if prefix.is_empty() {
+        "(empty)".to_owned()
+    } else {
+        prefix
+    }
+}
+
 async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
     if let Some(deadline) = deadline {
         tokio::time::sleep_until(deadline).await;
@@ -469,6 +762,9 @@ enum MaintenanceAction {
     Repair {
         session_id: SessionId,
     },
+    RecoverRelocation {
+        session_id: SessionId,
+    },
 }
 
 fn startup_options() -> Result<StartupOptions> {
@@ -511,9 +807,17 @@ fn startup_options() -> Result<StartupOptions> {
                     session_id: SessionId::new(value),
                 });
             }
+            "--recover-session-relocation" => {
+                let value = args.next().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("--recover-session-relocation requires a session id")
+                })?;
+                maintenance = Some(MaintenanceAction::RecoverRelocation {
+                    session_id: SessionId::new(value),
+                });
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: rua [--session <session-id>]\n       rua --validate-session <session-id>\n       rua --export-session <session-id> <destination>\n       rua --repair-session <session-id>"
+                    "Usage: rua [--session <session-id>]\n       rua --validate-session <session-id>\n       rua --export-session <session-id> <destination>\n       rua --repair-session <session-id>\n       rua --recover-session-relocation <session-id>"
                 );
                 std::process::exit(0);
             }
@@ -532,7 +836,8 @@ fn startup_options() -> Result<StartupOptions> {
 }
 
 async fn run_maintenance(action: &MaintenanceAction) -> Result<()> {
-    let store = LocalSessionStore::new(std::env::current_dir()?);
+    let project_root = LocalSessionStore::discover_project_root(std::env::current_dir()?)?;
+    let store = LocalSessionStore::new(project_root);
     match action {
         MaintenanceAction::Validate { session_id } => {
             let recovered = store.validate_session(session_id).await?;
@@ -558,6 +863,14 @@ async fn run_maintenance(action: &MaintenanceAction) -> Result<()> {
                 session_id,
                 report.removed_bytes,
                 report.backup_path.display()
+            );
+        }
+        MaintenanceAction::RecoverRelocation { session_id } => {
+            let locator = store.recover_relocation(session_id).await?;
+            println!(
+                "recovered session relocation to {}/{}",
+                locator.project_root.display(),
+                locator.entry_name
             );
         }
     }

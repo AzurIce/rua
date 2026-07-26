@@ -5,6 +5,7 @@ pub mod journal;
 pub mod provider;
 pub mod runtime;
 pub mod session_store;
+pub mod session_tree;
 pub mod tools;
 pub mod types;
 
@@ -12,14 +13,22 @@ pub use coding_tools::{CodingToolError, register_coding_tools};
 pub use conversation::{Conversation, ConversationError};
 pub use deepseek::DeepSeekProvider;
 pub use journal::{
-    AttemptFailure, AttemptRecord, DurableToolCall, DurableTurn, InMemorySessionStore,
-    JournalEntry, JournalRecord, JournalSequence, ReconciliationDecision, RecoveredSession,
-    SessionStore, StoreError, TurnPhase,
+    AttemptFailure, AttemptRecord, DurableRelocation, DurableToolCall, DurableTurn,
+    InMemorySessionStore, JournalEntry, JournalRecord, JournalSequence, ReconciliationDecision,
+    RecoveredSession, SessionStore, StoreError, TurnPhase,
 };
 pub use provider::{
     AccumulatorOutcome, Provider, ProviderEvent, ProviderStream, ResponseAccumulator,
 };
-pub use runtime::{AgentRuntime, RuntimeError, RuntimeEvent, RuntimeFailureKind};
+pub use runtime::{
+    AgentRuntime, DirectoryAvailability, RuntimeError, RuntimeEvent, RuntimeFailureKind,
+};
 pub use session_store::LocalSessionStore;
-pub use tools::{BashTool, ToolExecutor, ToolOutcome, ToolRegistry};
+pub use session_tree::{
+    ConversationHead, DirectoryChangeSource, MaterializedBranch, SessionEntry, SessionEntryPayload,
+    SessionTree, SessionTreeError,
+};
+pub use tools::{
+    BashTool, ChangeDirectoryTool, ToolEffect, ToolExecutor, ToolOutcome, ToolRegistry,
+};
 pub use types::*;

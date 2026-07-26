@@ -6,24 +6,45 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use command_group::AsyncCommandGroup;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use super::types::{ToolCall, ToolDefinition};
+use super::types::{DirectorySnapshot, ToolCall, ToolDefinition};
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutcome {
     Completed { content: String },
+    CompletedWithEffect { content: String, effect: ToolEffect },
     FailedKnown { message: String },
     OutcomeUnknown { message: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolEffect {
+    ChangeDirectory {
+        input: String,
+        from: DirectorySnapshot,
+        to: DirectorySnapshot,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionContext {
+    pub directory: DirectorySnapshot,
+}
+
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
-    fn execute(&self, arguments: Value, cancel: CancellationToken) -> ToolFuture<'_>;
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'_>;
 }
 
 pub trait ToolExecutor: Send + Sync {
@@ -33,7 +54,12 @@ pub trait ToolExecutor: Send + Sync {
             .into_iter()
             .find(|definition| definition.name == name)
     }
-    fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolFuture<'_>;
+    fn execute(
+        &self,
+        call: ToolCall,
+        context: ToolExecutionContext,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'_>;
 }
 
 pub struct ToolRegistry {
@@ -104,7 +130,12 @@ impl ToolExecutor for ToolRegistry {
         definitions
     }
 
-    fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolFuture<'_> {
+    fn execute(
+        &self,
+        call: ToolCall,
+        context: ToolExecutionContext,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
         let Some(registered) = self.tools.get(&call.name) else {
             return Box::pin(async move {
                 ToolOutcome::FailedKnown {
@@ -127,7 +158,7 @@ impl ToolExecutor for ToolRegistry {
             return Box::pin(async move { ToolOutcome::FailedKnown { message } });
         }
         let tool = registered.tool.clone();
-        Box::pin(async move { tool.execute(call.arguments, cancel).await })
+        Box::pin(async move { tool.execute(call.arguments, context, cancel).await })
     }
 }
 
@@ -144,7 +175,6 @@ pub enum ToolRegistryError {
 #[derive(Debug, Clone)]
 pub struct BashTool {
     max_output_bytes: usize,
-    cwd: std::path::PathBuf,
     timeout: Duration,
 }
 
@@ -152,17 +182,8 @@ impl BashTool {
     pub fn new(max_output_bytes: usize) -> Self {
         Self {
             max_output_bytes,
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             timeout: Duration::from_secs(120),
         }
-    }
-
-    pub fn for_workspace(root: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            max_output_bytes: 64 * 1024,
-            cwd: root.as_ref().canonicalize()?,
-            timeout: Duration::from_secs(120),
-        })
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -197,9 +218,14 @@ impl Tool for BashTool {
         }
     }
 
-    fn execute(&self, arguments: Value, cancel: CancellationToken) -> ToolFuture<'_> {
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
         let max_output_bytes = self.max_output_bytes;
-        let cwd = self.cwd.clone();
+        let cwd = context.directory.path;
         let timeout = self.timeout;
         Box::pin(async move {
             let Some(arguments) = arguments.as_object() else {
@@ -332,6 +358,88 @@ impl Tool for BashTool {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChangeDirectoryTool;
+
+impl Tool for ChangeDirectoryTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "change_directory".to_owned(),
+            description:
+                "Change Rua's durable working directory for subsequent model steps and tools."
+                    .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path or path relative to the current working directory"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            replay_class: super::types::ReplayClass::ReadOnly,
+        }
+    }
+
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let Some(input) = arguments.get("path").and_then(Value::as_str) else {
+                return ToolOutcome::FailedKnown {
+                    message: "missing string argument: path".to_owned(),
+                };
+            };
+            if input.trim().is_empty() {
+                return ToolOutcome::FailedKnown {
+                    message: "directory path cannot be empty".to_owned(),
+                };
+            }
+            let requested = std::path::PathBuf::from(input.trim());
+            let target = if requested.is_absolute() {
+                requested
+            } else {
+                context.directory.path.join(requested)
+            };
+            let canonical = match target.canonicalize() {
+                Ok(path) if path.is_dir() => path,
+                Ok(path) => {
+                    return ToolOutcome::FailedKnown {
+                        message: format!("not a directory: {}", path.display()),
+                    };
+                }
+                Err(error) => {
+                    return ToolOutcome::FailedKnown {
+                        message: format!("cannot open {}: {error}", target.display()),
+                    };
+                }
+            };
+            let Some(next_revision) = context.directory.revision.0.checked_add(1) else {
+                return ToolOutcome::FailedKnown {
+                    message: "working directory revision overflow".to_owned(),
+                };
+            };
+            let to = DirectorySnapshot {
+                path: canonical,
+                revision: super::types::DirectoryRevision(next_revision),
+            };
+            ToolOutcome::CompletedWithEffect {
+                content: format!("working directory: {}", to.path.display()),
+                effect: ToolEffect::ChangeDirectory {
+                    input: input.to_owned(),
+                    from: context.directory,
+                    to,
+                },
+            }
+        })
+    }
+}
+
 struct CapturedPipe {
     bytes: Vec<u8>,
     truncated: bool,
@@ -410,6 +518,15 @@ mod tests {
 
     use super::*;
 
+    fn execution_context() -> ToolExecutionContext {
+        ToolExecutionContext {
+            directory: DirectorySnapshot {
+                path: std::env::current_dir().unwrap(),
+                revision: super::super::types::DirectoryRevision::default(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn unknown_tool_is_a_known_failure() {
         let registry = ToolRegistry::new();
@@ -421,6 +538,7 @@ mod tests {
                     arguments: json!({}),
                     provider_state: None,
                 },
+                execution_context(),
                 CancellationToken::new(),
             )
             .await;
@@ -445,7 +563,12 @@ mod tests {
             }
         }
 
-        fn execute(&self, _arguments: Value, _cancel: CancellationToken) -> ToolFuture<'_> {
+        fn execute(
+            &self,
+            _arguments: Value,
+            _context: ToolExecutionContext,
+            _cancel: CancellationToken,
+        ) -> ToolFuture<'_> {
             panic!("schema-invalid arguments reached the tool")
         }
     }
@@ -463,6 +586,7 @@ mod tests {
                     arguments: json!({}),
                     provider_state: None,
                 },
+                execution_context(),
                 CancellationToken::new(),
             )
             .await;
@@ -483,11 +607,47 @@ mod tests {
                     arguments: json!({ "value": "this is larger than the configured limit" }),
                     provider_state: None,
                 },
+                execution_context(),
                 CancellationToken::new(),
             )
             .await;
 
         assert!(matches!(outcome, ToolOutcome::FailedKnown { .. }));
+    }
+
+    #[tokio::test]
+    async fn bash_uses_the_captured_working_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "rua-bash-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let context = ToolExecutionContext {
+            directory: DirectorySnapshot {
+                path: root.canonicalize().unwrap(),
+                revision: super::super::types::DirectoryRevision(7),
+            },
+        };
+        #[cfg(windows)]
+        let command = "Set-Content -Path cwd-probe.txt -Value ok";
+        #[cfg(not(windows))]
+        let command = "printf ok > cwd-probe.txt";
+
+        let outcome = BashTool::default()
+            .execute(
+                json!({ "command": command }),
+                context,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(matches!(outcome, ToolOutcome::Completed { .. }));
+        assert!(root.join("cwd-probe.txt").is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -510,7 +670,11 @@ mod tests {
         cancel.cancel();
 
         let outcome = BashTool::default()
-            .execute(json!({ "command": long_running_command() }), cancel)
+            .execute(
+                json!({ "command": long_running_command() }),
+                execution_context(),
+                cancel,
+            )
             .await;
 
         assert!(matches!(outcome, ToolOutcome::FailedKnown { .. }));
@@ -522,6 +686,7 @@ mod tests {
             .with_timeout(Duration::from_millis(10))
             .execute(
                 json!({ "command": long_running_command() }),
+                execution_context(),
                 CancellationToken::new(),
             )
             .await;

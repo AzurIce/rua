@@ -236,11 +236,16 @@ struct ChatRequest {
 
 impl ChatRequest {
     fn from_request(request: &ModelRequest) -> Self {
+        let system = format!(
+            "{}\n\nCurrent working directory: {}",
+            request.instructions.text,
+            request.context.directory.path.display()
+        );
         Self {
             model: request.model.model.clone(),
             messages: std::iter::once(WireMessage {
                 role: "system".to_owned(),
-                content: Some(request.instructions.text.clone()),
+                content: Some(system),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -655,8 +660,9 @@ mod tests {
     use serde_json::json;
 
     use super::super::types::{
-        ApiFamily, AttemptId, ConversationRevision, GenerationOptions, InstructionSet, MessageId,
-        ModelRef, ProviderId, StepId, TurnId,
+        ApiFamily, AttemptId, ContextRevision, ConversationRevision, DirectoryRevision,
+        DirectorySnapshot, GenerationOptions, InstructionSet, MessageId, ModelRef, ProviderId,
+        StepId, TurnContextSnapshot, TurnId,
     };
     use super::*;
 
@@ -667,6 +673,13 @@ mod tests {
             step_id: StepId::new("s"),
             attempt_id: AttemptId::new("a"),
             conversation_revision: ConversationRevision(1),
+            context: TurnContextSnapshot {
+                directory: DirectorySnapshot {
+                    path: std::env::current_dir().unwrap(),
+                    revision: DirectoryRevision::default(),
+                },
+                context_revision: ContextRevision(1),
+            },
             instructions: InstructionSet::new("system"),
             messages: vec![Message::User(super::super::types::UserMessage {
                 id: MessageId::new("m"),

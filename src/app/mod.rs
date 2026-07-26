@@ -11,7 +11,7 @@ pub use command::{CommandId, CommandRegistry, CompletionRequest, CompletionRespo
 pub use controller::{AppCommand, AppController};
 pub use event::UiEvent;
 pub use frame::FrameScheduler;
-pub use state::{AppState, AppStatus};
+pub use state::{AppState, AppStatus, TreeOverlayItem, TreeOverlayState};
 
 /// Alias for backwards compatibility with code using `App`.
 pub type App = AppState;

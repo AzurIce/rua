@@ -84,7 +84,17 @@ AgentRuntime 是业务语义的中心，但不是所有功能的容器。Provide
 - crash recovery、已知 outcome 补交和 outcome unknown 的人工协调；
 - snapshot/WAL、校验、锁与 schema migration。
 
-D0001 回答“谁推进一个 turn”，D0002 回答“runtime 如何请求模型并提交响应”，D0003 回答“terminal 与 UI 如何投影 runtime”，D0004 回答“外部动作如何执行并记录结果”，D0005 回答“进程中断后如何安全恢复这些事实”，D0006 回答“TUI 如何发现、补全并安全路由内部命令”。
+### [D0007：Session Tree 与可变工作目录](designs/D0007-session-tree-and-working-directory.md)
+
+定义：
+
+- session locator、branch-local working directory 与 durable conversation head 的区别，以及显式 relocation 与 `/cd` 的边界；
+- immutable session entry tree、checkout、重新编辑和 active-turn 边界；
+- 用户与模型共享的 change-directory protocol，以及显式 directory snapshot；
+- tree state 与线性 execution journal、crash recovery 和旧 session migration 的关系；
+- 单 session entry tree 与多 session lineage tree 的分层。
+
+D0001 回答“谁推进一个 turn”，D0002 回答“runtime 如何请求模型并提交响应”，D0003 回答“terminal 与 UI 如何投影 runtime”，D0004 回答“外部动作如何执行并记录结果”，D0005 回答“进程中断后如何安全恢复这些事实”，D0006 回答“TUI 如何发现、补全并安全路由内部命令”，D0007 回答“session 怎样保留分支，以及目录变化如何随 branch 恢复而不改变存储归属”。
 
 ## 待设计领域
 

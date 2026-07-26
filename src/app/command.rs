@@ -12,6 +12,13 @@ pub enum CommandId {
     RecoveryAbandon,
     SessionList,
     SessionLoad,
+    SessionRename,
+    SessionMove,
+    ChangeDirectory,
+    PrintWorkingDirectory,
+    SessionTreeList,
+    SessionTreeCheckout,
+    SessionTreeEdit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,11 +100,13 @@ enum CompletionSource {
     CommandNames,
     RecoveryToolCalls,
     SessionIds,
+    SessionEntryIds,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ArgumentKind {
     Completion(CompletionSource),
+    Value,
     Rest,
 }
 
@@ -152,6 +161,7 @@ pub struct CommandContext {
 const RECOVERY_ID: ArgumentKind = ArgumentKind::Completion(CompletionSource::RecoveryToolCalls);
 const COMMAND_NAME: ArgumentKind = ArgumentKind::Completion(CompletionSource::CommandNames);
 const SESSION_ID: ArgumentKind = ArgumentKind::Completion(CompletionSource::SessionIds);
+const SESSION_ENTRY_ID: ArgumentKind = ArgumentKind::Completion(CompletionSource::SessionEntryIds);
 
 const HELP_ARGS: &[ArgumentSpec] = &[ArgumentSpec {
     name: "command",
@@ -192,6 +202,33 @@ const SESSION_LOAD: &[ArgumentSpec] = &[ArgumentSpec {
     required: true,
     kind: SESSION_ID,
 }];
+const SESSION_RENAME: &[ArgumentSpec] = &[ArgumentSpec {
+    name: "entry-name",
+    required: true,
+    kind: ArgumentKind::Rest,
+}];
+const SESSION_MOVE: &[ArgumentSpec] = &[
+    ArgumentSpec {
+        name: "project-root",
+        required: true,
+        kind: ArgumentKind::Value,
+    },
+    ArgumentSpec {
+        name: "entry-name",
+        required: false,
+        kind: ArgumentKind::Value,
+    },
+];
+const CHANGE_DIRECTORY_ARGS: &[ArgumentSpec] = &[ArgumentSpec {
+    name: "path",
+    required: true,
+    kind: ArgumentKind::Rest,
+}];
+const TREE_ENTRY_ARGS: &[ArgumentSpec] = &[ArgumentSpec {
+    name: "entry-id|root",
+    required: true,
+    kind: SESSION_ENTRY_ID,
+}];
 
 const HELP_FORMS: &[CommandForm] = &[CommandForm {
     id: CommandId::Help,
@@ -211,6 +248,38 @@ const QUIT_FORMS: &[CommandForm] = &[CommandForm {
     arguments: &[],
     summary: "exit Rua",
 }];
+const CHANGE_DIRECTORY_FORMS: &[CommandForm] = &[CommandForm {
+    id: CommandId::ChangeDirectory,
+    path: &[],
+    arguments: CHANGE_DIRECTORY_ARGS,
+    summary: "change the session working directory",
+}];
+const PRINT_WORKING_DIRECTORY_FORMS: &[CommandForm] = &[CommandForm {
+    id: CommandId::PrintWorkingDirectory,
+    path: &[],
+    arguments: &[],
+    summary: "show the session working directory",
+}];
+const SESSION_TREE_FORMS: &[CommandForm] = &[
+    CommandForm {
+        id: CommandId::SessionTreeCheckout,
+        path: &["checkout"],
+        arguments: TREE_ENTRY_ARGS,
+        summary: "move the durable head to an entry or virtual root",
+    },
+    CommandForm {
+        id: CommandId::SessionTreeEdit,
+        path: &["edit"],
+        arguments: TREE_ENTRY_ARGS,
+        summary: "edit a user prompt from its parent as a new branch",
+    },
+    CommandForm {
+        id: CommandId::SessionTreeList,
+        path: &[],
+        arguments: &[],
+        summary: "show the current session entry tree",
+    },
+];
 const RECOVERY_FORMS: &[CommandForm] = &[
     CommandForm {
         id: CommandId::RecoveryInspect,
@@ -256,6 +325,18 @@ const SESSION_FORMS: &[CommandForm] = &[
         arguments: SESSION_LOAD,
         summary: "load a local session",
     },
+    CommandForm {
+        id: CommandId::SessionRename,
+        path: &["rename"],
+        arguments: SESSION_RENAME,
+        summary: "rename the current session entry without changing its stable id",
+    },
+    CommandForm {
+        id: CommandId::SessionMove,
+        path: &["move"],
+        arguments: SESSION_MOVE,
+        summary: "move the current session entry to another project store",
+    },
 ];
 
 const DEFINITIONS: &[CommandDefinition] = &[
@@ -275,6 +356,36 @@ const DEFINITIONS: &[CommandDefinition] = &[
         summary: "list or load local sessions",
         target: CommandTarget::Application,
         forms: SESSION_FORMS,
+        availability: Availability::Idle,
+        history: HistoryPolicy::Store,
+        source: "builtin",
+    },
+    CommandDefinition {
+        name: "cd",
+        aliases: &[],
+        summary: "change the session working directory",
+        target: CommandTarget::Runtime,
+        forms: CHANGE_DIRECTORY_FORMS,
+        availability: Availability::Idle,
+        history: HistoryPolicy::Store,
+        source: "builtin",
+    },
+    CommandDefinition {
+        name: "pwd",
+        aliases: &[],
+        summary: "show the session working directory",
+        target: CommandTarget::Runtime,
+        forms: PRINT_WORKING_DIRECTORY_FORMS,
+        availability: Availability::Idle,
+        history: HistoryPolicy::Store,
+        source: "builtin",
+    },
+    CommandDefinition {
+        name: "tree",
+        aliases: &[],
+        summary: "browse or move within the session entry tree",
+        target: CommandTarget::Runtime,
+        forms: SESSION_TREE_FORMS,
         availability: Availability::Idle,
         history: HistoryPolicy::Store,
         source: "builtin",
@@ -315,6 +426,7 @@ const DEFINITIONS: &[CommandDefinition] = &[
 pub struct CompletionContext<'a> {
     pub recovery_tool_calls: &'a [String],
     pub session_ids: &'a [String],
+    pub session_entry_ids: &'a [String],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -472,6 +584,11 @@ impl CommandRegistry {
                     .iter()
                     .map(|value| (value.as_str(), "local session"))
                     .collect(),
+                ArgumentKind::Completion(CompletionSource::SessionEntryIds) => context
+                    .session_entry_ids
+                    .iter()
+                    .map(|value| (value.as_str(), "session tree entry"))
+                    .collect(),
                 _ => Vec::new(),
             };
             values
@@ -571,6 +688,20 @@ impl CommandRegistry {
         for argument in form.arguments {
             match argument.kind {
                 ArgumentKind::Completion(_) => {
+                    if let Some(token) = argument_tokens.get(token_index) {
+                        arguments.push(token.value.clone());
+                        token_index += 1;
+                    } else if argument.required {
+                        return ParseState::Incomplete {
+                            message: format!(
+                                "missing <{}>; usage: {}",
+                                argument.name,
+                                form_usage(definition.name, form)
+                            ),
+                        };
+                    }
+                }
+                ArgumentKind::Value => {
                     if let Some(token) = argument_tokens.get(token_index) {
                         arguments.push(token.value.clone());
                         token_index += 1;
@@ -852,5 +983,65 @@ mod tests {
     #[test]
     fn registry_has_no_name_or_alias_collisions() {
         assert!(registry_is_valid());
+    }
+
+    #[test]
+    fn parses_working_directory_commands() {
+        assert_eq!(
+            CommandRegistry::builtins().classify("/cd crates/runtime"),
+            InputClassification::Command(ParseState::Complete(CommandInvocation {
+                id: CommandId::ChangeDirectory,
+                arguments: vec!["crates/runtime".to_owned()],
+                context_revision: 0,
+            }))
+        );
+        assert_eq!(
+            CommandRegistry::builtins().classify("/pwd"),
+            InputClassification::Command(ParseState::Complete(CommandInvocation {
+                id: CommandId::PrintWorkingDirectory,
+                arguments: Vec::new(),
+                context_revision: 0,
+            }))
+        );
+        assert!(matches!(
+            CommandRegistry::builtins().classify("/cd"),
+            InputClassification::Command(ParseState::Incomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_tree_navigation_and_session_rename_commands() {
+        assert_eq!(
+            CommandRegistry::builtins().classify("/tree checkout entry-2"),
+            InputClassification::Command(ParseState::Complete(CommandInvocation {
+                id: CommandId::SessionTreeCheckout,
+                arguments: vec!["entry-2".to_owned()],
+                context_revision: 0,
+            }))
+        );
+        assert_eq!(
+            CommandRegistry::builtins().classify("/tree edit entry-1"),
+            InputClassification::Command(ParseState::Complete(CommandInvocation {
+                id: CommandId::SessionTreeEdit,
+                arguments: vec!["entry-1".to_owned()],
+                context_revision: 0,
+            }))
+        );
+        assert_eq!(
+            CommandRegistry::builtins().classify("/session rename investigation"),
+            InputClassification::Command(ParseState::Complete(CommandInvocation {
+                id: CommandId::SessionRename,
+                arguments: vec!["investigation".to_owned()],
+                context_revision: 0,
+            }))
+        );
+        assert_eq!(
+            CommandRegistry::builtins().classify("/session move ../other-project moved-name"),
+            InputClassification::Command(ParseState::Complete(CommandInvocation {
+                id: CommandId::SessionMove,
+                arguments: vec!["../other-project".to_owned(), "moved-name".to_owned()],
+                context_revision: 0,
+            }))
+        );
     }
 }

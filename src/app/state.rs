@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use crate::agent::{AssistantPart, Message, RuntimeEvent, ToolResultContent, UserContent};
+use crate::agent::{
+    AssistantPart, EntryId, HeadRevision, Message, RuntimeEvent, ToolResultContent, UserContent,
+};
 use crate::app::command::CommandContext;
 use crate::app::command::{
     CommandAssist, CommandRegistry, CompletionContext, CompletionItem, CompletionRequest,
@@ -75,12 +77,48 @@ pub struct AppState {
     pub token_count: usize,
     pub can_resume_turn: bool,
     pub command_assist: CommandAssistState,
+    pub tree_overlay: TreeOverlayState,
     recovery_tool_calls: Vec<String>,
     session_ids: Vec<String>,
+    session_entry_ids: Vec<String>,
     input_history: Vec<InputHistoryEntry>,
     input_history_cursor: Option<usize>,
     input_history_filter: Option<InputHistoryKind>,
     command_context_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeOverlayState {
+    pub open: bool,
+    pub items: Vec<TreeOverlayItem>,
+    pub selected: usize,
+    pub show_tools: bool,
+    pub show_cwd: bool,
+    pub head_revision: HeadRevision,
+}
+
+impl Default for TreeOverlayState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            items: Vec::new(),
+            selected: 0,
+            show_tools: true,
+            show_cwd: true,
+            head_revision: HeadRevision::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeOverlayItem {
+    pub entry_id: Option<EntryId>,
+    pub depth: usize,
+    pub kind: String,
+    pub label: String,
+    pub is_head: bool,
+    pub is_active_path: bool,
+    pub editable: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -121,8 +159,10 @@ impl AppState {
             token_count: 0,
             can_resume_turn: false,
             command_assist: CommandAssistState::default(),
+            tree_overlay: TreeOverlayState::default(),
             recovery_tool_calls: Vec::new(),
             session_ids: Vec::new(),
+            session_entry_ids: vec!["root".to_owned()],
             input_history: Vec::new(),
             input_history_cursor: None,
             input_history_filter: None,
@@ -184,6 +224,7 @@ impl AppState {
             CompletionContext {
                 recovery_tool_calls: &self.recovery_tool_calls,
                 session_ids: &self.session_ids,
+                session_entry_ids: &self.session_entry_ids,
             },
         );
         let selected = previous
@@ -318,6 +359,86 @@ impl AppState {
         self.session_ids = session_ids;
     }
 
+    pub fn set_session_entry_ids(&mut self, mut session_entry_ids: Vec<String>) {
+        session_entry_ids.sort();
+        session_entry_ids.insert(0, "root".to_owned());
+        self.session_entry_ids = session_entry_ids;
+        self.command_context_revision = self.command_context_revision.wrapping_add(1);
+    }
+
+    pub fn open_tree_overlay(&mut self, items: Vec<TreeOverlayItem>, head_revision: HeadRevision) {
+        let selected = items.iter().position(|item| item.is_head).unwrap_or(0);
+        self.tree_overlay = TreeOverlayState {
+            open: true,
+            items,
+            selected,
+            show_tools: true,
+            show_cwd: true,
+            head_revision,
+        };
+        self.command_assist.open = false;
+    }
+
+    pub fn close_tree_overlay(&mut self) {
+        self.tree_overlay.open = false;
+    }
+
+    pub fn move_tree_selection(&mut self, delta: isize) {
+        let len = self.tree_overlay.items.len();
+        if len == 0 {
+            return;
+        }
+        let forward = !delta.is_negative();
+        let mut selected = self.tree_overlay.selected;
+        for _ in 0..len {
+            selected = if forward {
+                (selected + 1) % len
+            } else {
+                selected.checked_sub(1).unwrap_or(len - 1)
+            };
+            if self.tree_item_visible(selected) {
+                self.tree_overlay.selected = selected;
+                break;
+            }
+        }
+    }
+
+    pub fn selected_tree_item(&self) -> Option<&TreeOverlayItem> {
+        self.tree_item_visible(self.tree_overlay.selected)
+            .then(|| self.tree_overlay.items.get(self.tree_overlay.selected))
+            .flatten()
+    }
+
+    pub fn toggle_tree_tools(&mut self) {
+        self.tree_overlay.show_tools = !self.tree_overlay.show_tools;
+        self.ensure_visible_tree_selection();
+    }
+
+    pub fn toggle_tree_cwd(&mut self) {
+        self.tree_overlay.show_cwd = !self.tree_overlay.show_cwd;
+        self.ensure_visible_tree_selection();
+    }
+
+    pub fn tree_item_visible(&self, index: usize) -> bool {
+        self.tree_overlay.items.get(index).is_some_and(|item| {
+            (self.tree_overlay.show_tools || item.kind != "tool")
+                && (self.tree_overlay.show_cwd || item.kind != "cwd")
+        })
+    }
+
+    fn ensure_visible_tree_selection(&mut self) {
+        if !self.tree_item_visible(self.tree_overlay.selected) {
+            self.tree_overlay.selected = self
+                .tree_overlay
+                .items
+                .iter()
+                .enumerate()
+                .find(|(index, _)| self.tree_item_visible(*index))
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+        }
+    }
+
     pub fn record_command_history(&mut self, command: String) {
         self.input_history.push(InputHistoryEntry {
             kind: InputHistoryKind::Command,
@@ -392,7 +513,10 @@ impl AppState {
             RuntimeEvent::SessionRecovered {
                 session_id,
                 conversation,
+                entry_ids,
+                head_revision: _,
             } => {
+                self.set_session_entry_ids(entry_ids.iter().map(ToString::to_string).collect());
                 push_unique(&mut self.session_ids, session_id.to_string());
                 self.recovery_tool_calls.clear();
                 self.history.clear();
@@ -409,7 +533,7 @@ impl AppState {
                                             tool_call_id: None,
                                             reasoning_content: None,
                                             reasoning_expanded: false,
-                                        })
+                                        });
                                     }
                                 }
                             }
@@ -455,6 +579,30 @@ impl AppState {
                     }
                 }
                 self.finish_stream();
+            }
+            RuntimeEvent::SessionTreeChanged {
+                entry_ids,
+                head_revision: _,
+            } => {
+                self.set_session_entry_ids(entry_ids.iter().map(ToString::to_string).collect());
+            }
+            RuntimeEvent::WorkingDirectoryChanged { directory } => {
+                self.add_system_message(&format!(
+                    "working directory: {}",
+                    directory.path.display()
+                ));
+            }
+            RuntimeEvent::DirectoryUnavailable {
+                recorded_path,
+                reason,
+            } => {
+                let path = recorded_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "(unrecorded)".to_owned());
+                self.add_error(&format!(
+                    "working directory unavailable: {path}: {reason}; use /cd <absolute-path>"
+                ));
             }
             RuntimeEvent::RecoveryRequired {
                 tool_call_id,
@@ -731,6 +879,52 @@ pub(crate) fn wrap_paragraph(text: &str, max_width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree_item(kind: &str, label: &str, is_head: bool) -> TreeOverlayItem {
+        TreeOverlayItem {
+            entry_id: Some(EntryId::new(label)),
+            depth: 0,
+            kind: kind.to_owned(),
+            label: label.to_owned(),
+            is_head,
+            is_active_path: is_head,
+            editable: kind == "user",
+        }
+    }
+
+    #[test]
+    fn tree_filters_keep_selection_visible_and_navigation_skips_hidden_entries() {
+        let mut state = AppState::new();
+        state.open_tree_overlay(
+            vec![
+                TreeOverlayItem {
+                    entry_id: None,
+                    depth: 0,
+                    kind: "root".to_owned(),
+                    label: "virtual root".to_owned(),
+                    is_head: false,
+                    is_active_path: true,
+                    editable: false,
+                },
+                tree_item("tool", "tool-entry", false),
+                tree_item("cwd", "cwd-entry", true),
+                tree_item("user", "user-entry", false),
+            ],
+            HeadRevision(3),
+        );
+        assert_eq!(state.selected_tree_item().unwrap().label, "cwd-entry");
+
+        state.toggle_tree_cwd();
+        assert_eq!(state.selected_tree_item().unwrap().label, "virtual root");
+
+        state.move_tree_selection(1);
+        assert_eq!(state.selected_tree_item().unwrap().label, "tool-entry");
+        state.toggle_tree_tools();
+        assert_eq!(state.selected_tree_item().unwrap().label, "virtual root");
+
+        state.move_tree_selection(1);
+        assert_eq!(state.selected_tree_item().unwrap().label, "user-entry");
+    }
 
     #[test]
     fn stale_completion_response_cannot_replace_newer_assist_state() {

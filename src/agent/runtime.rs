@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,11 +13,14 @@ use super::journal::{
     TurnPhase,
 };
 use super::provider::{Provider, ProviderEvent, ResponseAccumulator};
-use super::tools::{ToolExecutor, ToolOutcome};
+use super::session_tree::{DirectoryChangeSource, SessionEntry, SessionEntryPayload, SessionTree};
+use super::tools::{ToolEffect, ToolExecutionContext, ToolExecutor, ToolOutcome};
 use super::types::{
-    ApiFamily, AssistantMessage, ConversationRevision, ExecutionId, Message, MessageId, ModelRef,
-    ModelRequest, ProviderError, ProviderErrorKind, ProviderId, RetryHint, SessionId, StepId,
-    StopReason, ToolCall, ToolResultContent, ToolResultMessage, TurnId, UserContent, UserMessage,
+    ApiFamily, AssistantMessage, ContextRevision, ConversationRevision, DirectoryRevision,
+    DirectorySnapshot, EntryId, ExecutionId, HeadRevision, Message, MessageId, ModelRef,
+    ModelRequest, ProviderError, ProviderErrorKind, ProviderId, RetryHint, SessionId,
+    SessionLocator, StableHead, StepId, StopReason, ToolCall, ToolResultContent, ToolResultMessage,
+    TurnContextSnapshot, TurnId, UserContent, UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +28,19 @@ pub enum RuntimeEvent {
     SessionRecovered {
         session_id: SessionId,
         conversation: Conversation,
+        entry_ids: Vec<EntryId>,
+        head_revision: HeadRevision,
+    },
+    SessionTreeChanged {
+        entry_ids: Vec<EntryId>,
+        head_revision: HeadRevision,
+    },
+    WorkingDirectoryChanged {
+        directory: DirectorySnapshot,
+    },
+    DirectoryUnavailable {
+        recorded_path: Option<PathBuf>,
+        reason: String,
     },
     RecoveryRequired {
         turn_id: TurnId,
@@ -109,6 +126,15 @@ pub enum RuntimeEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryAvailability {
+    Available(DirectorySnapshot),
+    Unavailable {
+        recorded_path: Option<PathBuf>,
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFailureKind {
     Provider,
@@ -130,6 +156,8 @@ pub enum RuntimeError {
     Blocked(String),
     #[error("conversation error: {0}")]
     Conversation(String),
+    #[error("working directory error: {0}")]
+    WorkingDirectory(String),
     #[error("turn limit exceeded: {0}")]
     Limit(String),
     #[error("provider error: {0}")]
@@ -147,10 +175,15 @@ struct ActiveTurn {
 }
 
 struct RuntimeState {
+    locator: Option<SessionLocator>,
     conversation: Conversation,
+    tree: SessionTree,
+    initial_directory: Option<DirectorySnapshot>,
+    directory: Option<DirectorySnapshot>,
     active: Option<ActiveTurn>,
     session_initialized: bool,
     next_message: u64,
+    next_entry: u64,
     next_turn: u64,
 }
 
@@ -160,6 +193,8 @@ struct ModelStepContext {
     revision: ConversationRevision,
     messages: Vec<Message>,
     instructions: super::types::InstructionSet,
+    context: TurnContextSnapshot,
+    stable_head: StableHead,
 }
 
 pub struct AgentRuntime {
@@ -183,6 +218,13 @@ impl AgentRuntime {
         instructions: impl Into<String>,
         model: ModelRef,
     ) -> Self {
+        let directory = std::env::current_dir()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .map(|path| DirectorySnapshot {
+                path,
+                revision: DirectoryRevision::default(),
+            });
         static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
         let session_sequence = NEXT_SESSION.fetch_add(1, Ordering::Relaxed) + 1;
         Self {
@@ -192,10 +234,15 @@ impl AgentRuntime {
             session_id: new_session_id(session_sequence),
             store: Arc::new(InMemorySessionStore::new()),
             state: Mutex::new(RuntimeState {
+                locator: None,
                 conversation: Conversation::new(super::types::InstructionSet::new(instructions)),
+                tree: SessionTree::default(),
+                initial_directory: directory.clone(),
+                directory,
                 active: None,
                 session_initialized: false,
                 next_message: 0,
+                next_entry: 0,
                 next_turn: 0,
             }),
             max_attempts: 2,
@@ -206,13 +253,240 @@ impl AgentRuntime {
         }
     }
 
+    pub fn new_in(
+        provider: Arc<dyn Provider>,
+        tools: Arc<dyn ToolExecutor>,
+        instructions: impl Into<String>,
+        model: ModelRef,
+        directory: impl AsRef<Path>,
+    ) -> Result<Self, RuntimeError> {
+        let canonical = canonical_directory(directory.as_ref())?;
+        let mut runtime = Self::new(provider, tools, instructions, model);
+        let directory = DirectorySnapshot {
+            path: canonical,
+            revision: DirectoryRevision::default(),
+        };
+        runtime.state.get_mut().initial_directory = Some(directory.clone());
+        runtime.state.get_mut().directory = Some(directory);
+        Ok(runtime)
+    }
+
     pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.store = store;
         self
     }
 
+    pub fn with_session_locator(mut self, locator: SessionLocator) -> Self {
+        self.state.get_mut().locator = Some(locator);
+        self
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub async fn session_locator(&self) -> Option<SessionLocator> {
+        self.state.lock().await.locator.clone()
+    }
+
+    pub async fn rename_session_entry(
+        &self,
+        new_name: super::types::SessionEntryName,
+    ) -> Result<SessionLocator, RuntimeError> {
+        let mut state = self.state.lock().await;
+        if state.active.is_some() {
+            return Err(RuntimeError::Busy);
+        }
+        let current = state
+            .locator
+            .clone()
+            .ok_or_else(|| RuntimeError::Blocked("session has no filesystem locator".to_owned()))?;
+        let target = SessionLocator {
+            project_root: current.project_root,
+            entry_name: new_name,
+        };
+        let relocated = self.store.relocate(&self.session_id, target).await?;
+        state.locator = Some(relocated.clone());
+        Ok(relocated)
+    }
+
+    pub async fn move_session_entry(
+        &self,
+        project_root: PathBuf,
+        entry_name: Option<super::types::SessionEntryName>,
+    ) -> Result<SessionLocator, RuntimeError> {
+        let mut state = self.state.lock().await;
+        if state.active.is_some() {
+            return Err(RuntimeError::Busy);
+        }
+        let current = state
+            .locator
+            .clone()
+            .ok_or_else(|| RuntimeError::Blocked("session has no filesystem locator".to_owned()))?;
+        let target = SessionLocator {
+            project_root,
+            entry_name: entry_name.unwrap_or(current.entry_name),
+        };
+        let relocated = self.store.relocate(&self.session_id, target).await?;
+        state.locator = Some(relocated.clone());
+        Ok(relocated)
+    }
+
+    pub async fn working_directory(&self) -> Result<DirectorySnapshot, RuntimeError> {
+        self.state.lock().await.directory.clone().ok_or_else(|| {
+            RuntimeError::WorkingDirectory("session has no recorded working directory".to_owned())
+        })
+    }
+
+    pub async fn directory_availability(&self) -> DirectoryAvailability {
+        let directory = self.state.lock().await.directory.clone();
+        match directory {
+            Some(directory) => match validate_recorded_directory(&directory) {
+                Ok(()) => DirectoryAvailability::Available(directory),
+                Err(error) => DirectoryAvailability::Unavailable {
+                    recorded_path: Some(directory.path),
+                    reason: error.to_string(),
+                },
+            },
+            None => DirectoryAvailability::Unavailable {
+                recorded_path: None,
+                reason: "session has no recorded working directory".to_owned(),
+            },
+        }
+    }
+
+    pub async fn session_tree_snapshot(&self) -> SessionTree {
+        self.state.lock().await.tree.clone()
+    }
+
+    pub async fn checkout(&self, target_entry_id: Option<EntryId>) -> Result<(), RuntimeError> {
+        self.checkout_expected(target_entry_id, None).await
+    }
+
+    pub async fn checkout_expected(
+        &self,
+        target_entry_id: Option<EntryId>,
+        expected_head_revision: Option<HeadRevision>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().await;
+        if state.active.is_some() {
+            return Err(RuntimeError::Busy);
+        }
+        if expected_head_revision.is_some_and(|revision| revision != state.tree.head().revision) {
+            return Err(RuntimeError::Conversation(
+                "session head changed; reopen /tree and try again".to_owned(),
+            ));
+        }
+        let expected_head = state.tree.head().clone();
+        let resulting_revision =
+            HeadRevision(
+                expected_head.revision.0.checked_add(1).ok_or_else(|| {
+                    RuntimeError::Conversation("head revision overflow".to_owned())
+                })?,
+            );
+        let mut next_tree = state.tree.clone();
+        let branch = next_tree
+            .move_head(
+                &expected_head,
+                target_entry_id.clone(),
+                resulting_revision,
+                state.conversation.instructions(),
+                state.initial_directory.as_ref(),
+            )
+            .map_err(|error| RuntimeError::Conversation(error.to_string()))?;
+        if let Some(directory) = &branch.directory {
+            validate_recorded_directory(directory)?;
+        }
+        self.ensure_session_initialized(&mut state).await?;
+        self.record(JournalRecord::ConversationHeadMoved {
+            expected_head,
+            target_entry_id,
+            resulting_head_revision: resulting_revision,
+        })
+        .await?;
+        state.tree = next_tree;
+        state.conversation = branch.conversation;
+        state.directory = branch.directory;
+        Ok(())
+    }
+
+    pub async fn change_directory(
+        &self,
+        input: impl Into<String>,
+    ) -> Result<DirectorySnapshot, RuntimeError> {
+        let path = input.into();
+        self.change_directory_recorded(path.clone(), path).await
+    }
+
+    pub async fn change_directory_from_command(
+        &self,
+        path: impl Into<String>,
+        original_input: impl Into<String>,
+        emit: &tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<DirectorySnapshot, RuntimeError> {
+        let directory = self
+            .change_directory_recorded(path.into(), original_input.into())
+            .await?;
+        {
+            let state = self.state.lock().await;
+            emit_tree_changed(&state, emit);
+        }
+        let _ = emit.send(RuntimeEvent::WorkingDirectoryChanged {
+            directory: directory.clone(),
+        });
+        Ok(directory)
+    }
+
+    async fn change_directory_recorded(
+        &self,
+        path: String,
+        recorded_input: String,
+    ) -> Result<DirectorySnapshot, RuntimeError> {
+        if path.trim().is_empty() {
+            return Err(RuntimeError::WorkingDirectory(
+                "directory path cannot be empty".to_owned(),
+            ));
+        }
+        let mut state = self.state.lock().await;
+        if state.active.is_some() {
+            return Err(RuntimeError::Busy);
+        }
+        let from = state.directory.clone();
+        let requested = PathBuf::from(path.trim());
+        let target = if requested.is_absolute() {
+            requested
+        } else {
+            from.as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::WorkingDirectory(
+                        "relative directory changes require a recorded working directory; use an absolute path"
+                            .to_owned(),
+                    )
+                })?
+                .path
+                .join(requested)
+        };
+        let to = DirectorySnapshot {
+            path: canonical_directory(&target)?,
+            revision: DirectoryRevision(match from.as_ref() {
+                Some(from) => from.revision.0.checked_add(1).ok_or_else(|| {
+                    RuntimeError::WorkingDirectory("working directory revision overflow".to_owned())
+                })?,
+                None => 0,
+            }),
+        };
+        self.ensure_session_initialized(&mut state).await?;
+        self.append_session_entry(
+            &mut state,
+            SessionEntryPayload::CwdChanged {
+                input: recorded_input,
+                from,
+                to: to.clone(),
+                source: DirectoryChangeSource::UserCommand,
+            },
+        )
+        .await?;
+        Ok(to)
     }
 
     pub async fn recover(
@@ -222,9 +496,20 @@ impl AgentRuntime {
         store: Arc<dyn SessionStore>,
         session_id: SessionId,
     ) -> Result<Self, RuntimeError> {
-        let recovered = store.load(&session_id).await?;
+        let mut recovered = store.load(&session_id).await?;
+        let mut locator = store.locator(&session_id).await?;
+        if let Some(pending) = recovered.pending_relocation.clone() {
+            if locator.as_ref() != Some(&pending.to) {
+                return Err(RuntimeError::Blocked(
+                    "session relocation requires explicit recovery".to_owned(),
+                ));
+            }
+            store.complete_relocation(&session_id, pending).await?;
+            recovered = store.load(&session_id).await?;
+            locator = store.locator(&session_id).await?;
+        }
         Ok(Self::from_recovered(
-            provider, tools, model, store, recovered,
+            provider, tools, model, store, recovered, locator,
         ))
     }
 
@@ -234,8 +519,16 @@ impl AgentRuntime {
         model: ModelRef,
         store: Arc<dyn SessionStore>,
         recovered: RecoveredSession,
+        locator: Option<SessionLocator>,
     ) -> Self {
         let next_message = max_numbered_message(&recovered.conversation);
+        let next_entry = recovered
+            .tree
+            .entries()
+            .keys()
+            .filter_map(|entry_id| numbered_suffix(entry_id.as_str(), "entry-"))
+            .max()
+            .unwrap_or(0);
         let next_turn = recovered
             .active_turn
             .as_ref()
@@ -288,10 +581,15 @@ impl AgentRuntime {
             session_id: recovered.session_id,
             store,
             state: Mutex::new(RuntimeState {
+                locator,
                 conversation: recovered.conversation,
+                tree: recovered.tree,
+                initial_directory: recovered.initial_directory,
+                directory: recovered.directory,
                 active,
                 session_initialized: true,
                 next_message,
+                next_entry,
                 next_turn,
             }),
             max_attempts: 2,
@@ -307,7 +605,28 @@ impl AgentRuntime {
         let _ = emit.send(RuntimeEvent::SessionRecovered {
             session_id: self.session_id.clone(),
             conversation: state.conversation.clone(),
+            entry_ids: state.tree.entries().keys().cloned().collect(),
+            head_revision: state.tree.head().revision,
         });
+        match state.directory.clone() {
+            Some(directory) => match validate_recorded_directory(&directory) {
+                Ok(()) => {
+                    let _ = emit.send(RuntimeEvent::WorkingDirectoryChanged { directory });
+                }
+                Err(error) => {
+                    let _ = emit.send(RuntimeEvent::DirectoryUnavailable {
+                        recorded_path: Some(directory.path),
+                        reason: error.to_string(),
+                    });
+                }
+            },
+            None => {
+                let _ = emit.send(RuntimeEvent::DirectoryUnavailable {
+                    recorded_path: None,
+                    reason: "session has no recorded working directory".to_owned(),
+                });
+            }
+        }
         if let Some(recovery) = state
             .active
             .as_ref()
@@ -441,10 +760,16 @@ impl AgentRuntime {
         cancel: CancellationToken,
     ) -> Result<(), RuntimeError> {
         let mut state = self.state.lock().await;
-        self.ensure_session_initialized(&mut state).await?;
         if state.active.is_some() {
             return Err(RuntimeError::Busy);
         }
+        let directory = state.directory.as_ref().ok_or_else(|| {
+            RuntimeError::WorkingDirectory(
+                "cannot start a turn without a recorded working directory".to_owned(),
+            )
+        })?;
+        validate_recorded_directory(directory)?;
+        self.ensure_session_initialized(&mut state).await?;
         if text.trim().is_empty() {
             return Err(RuntimeError::Conversation(
                 "user message is empty".to_owned(),
@@ -460,6 +785,7 @@ impl AgentRuntime {
             }),
         )
         .await?;
+        emit_tree_changed(&state, emit);
         state.active = Some(ActiveTurn {
             turn_id: turn_id.clone(),
             next_step: 0,
@@ -471,6 +797,10 @@ impl AgentRuntime {
             .record(JournalRecord::TurnOpened {
                 turn_id: turn_id.clone(),
                 stable_revision: state.conversation.revision(),
+                stable_head: state
+                    .directory
+                    .as_ref()
+                    .map(|directory| state.tree.stable_head(directory)),
             })
             .await
         {
@@ -555,6 +885,7 @@ impl AgentRuntime {
                     block_recovery(state, &recovery, &error);
                     return Err(error);
                 }
+                emit_tree_changed(state, emit);
                 let _ = emit.send(RuntimeEvent::ToolRejected {
                     turn_id: recovery.turn_id.clone(),
                     call_id: call.id,
@@ -596,8 +927,25 @@ impl AgentRuntime {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
-                let outcome = self.tools.execute(call.clone(), cancel.clone()).await;
-                let recorded = recorded_outcome(&outcome);
+                let directory = tool
+                    .directory
+                    .clone()
+                    .or_else(|| state.directory.clone())
+                    .ok_or_else(|| {
+                        RuntimeError::WorkingDirectory(
+                            "cannot execute a tool without a recorded working directory".to_owned(),
+                        )
+                    })?;
+                validate_recorded_directory(&directory)?;
+                let outcome = self
+                    .tools
+                    .execute(
+                        call.clone(),
+                        ToolExecutionContext { directory },
+                        cancel.clone(),
+                    )
+                    .await;
+                let recorded = recorded_outcome(&outcome, state.directory.as_ref());
                 if let Err(error) = self
                     .record(JournalRecord::ToolOutcomeRecorded {
                         tool_call_id: call.id.clone(),
@@ -629,6 +977,37 @@ impl AgentRuntime {
                         block_recovery(state, &recovery, &error);
                         return Err(error);
                     }
+                    emit_tree_changed(state, emit);
+                    let _ = emit.send(RuntimeEvent::ToolCompleted {
+                        turn_id: recovery.turn_id.clone(),
+                        call_id: call.id,
+                        execution_id,
+                        name: call.name,
+                        content,
+                    });
+                }
+                RecordedToolOutcome::CompletedWithEffect { content, effect } => {
+                    if !recovery.pending_tools[index].effect_committed {
+                        if let Err(error) = self
+                            .commit_tool_effect(state, &call.id, effect.clone())
+                            .await
+                        {
+                            block_recovery(state, &recovery, &error);
+                            return Err(error);
+                        }
+                        recovery.pending_tools[index].effect_committed = true;
+                        if let Some(directory) = state.directory.clone() {
+                            let _ = emit.send(RuntimeEvent::WorkingDirectoryChanged { directory });
+                        }
+                    }
+                    if let Err(error) = self
+                        .append_tool_result(state, &call, content.clone(), false)
+                        .await
+                    {
+                        block_recovery(state, &recovery, &error);
+                        return Err(error);
+                    }
+                    emit_tree_changed(state, emit);
                     let _ = emit.send(RuntimeEvent::ToolCompleted {
                         turn_id: recovery.turn_id.clone(),
                         call_id: call.id,
@@ -645,6 +1024,7 @@ impl AgentRuntime {
                         block_recovery(state, &recovery, &error);
                         return Err(error);
                     }
+                    emit_tree_changed(state, emit);
                     let _ = emit.send(RuntimeEvent::ToolFailed {
                         turn_id: recovery.turn_id.clone(),
                         call_id: call.id,
@@ -742,6 +1122,12 @@ impl AgentRuntime {
             let step_id: StepId = format!("{}-step-{}", turn_id, step_number).into();
             let request_messages = state.conversation.messages().to_vec();
             let revision = state.conversation.revision();
+            let directory = state.directory.clone().ok_or_else(|| {
+                RuntimeError::WorkingDirectory(
+                    "cannot start a model step without a recorded working directory".to_owned(),
+                )
+            })?;
+            validate_recorded_directory(&directory)?;
             let assistant = match self
                 .run_model_step(
                     ModelStepContext {
@@ -750,6 +1136,11 @@ impl AgentRuntime {
                         revision,
                         messages: request_messages,
                         instructions: state.conversation.instructions().clone(),
+                        context: TurnContextSnapshot {
+                            directory: directory.clone(),
+                            context_revision: ContextRevision(state.tree.head().revision.0),
+                        },
+                        stable_head: state.tree.stable_head(&directory),
                     },
                     emit,
                     cancel.clone(),
@@ -830,15 +1221,18 @@ impl AgentRuntime {
                 }
             }
 
-            let resulting_revision = self
+            let entry_id = self
                 .durable_append(state, Message::Assistant(Box::new(assistant.clone())))
                 .await?;
+            emit_tree_changed(state, emit);
             if let Err(error) = self
                 .record(JournalRecord::AssistantCommitted {
                     turn_id: turn_id.clone(),
                     step_id: step_id.clone(),
                     message_id: assistant.id.clone(),
-                    resulting_revision,
+                    resulting_revision: state.conversation.revision(),
+                    entry_id: Some(entry_id),
+                    resulting_head_revision: Some(state.tree.head().revision),
                 })
                 .await
             {
@@ -885,6 +1279,11 @@ impl AgentRuntime {
                             .definition(&call.name)
                             .map(|definition| definition.replay_class)
                             .unwrap_or(super::types::ReplayClass::Unknown),
+                        directory: state.directory.clone(),
+                        stable_head: state
+                            .directory
+                            .as_ref()
+                            .map(|directory| state.tree.stable_head(directory)),
                     })
                     .await
                 {
@@ -914,6 +1313,8 @@ impl AgentRuntime {
             turn_id: context.turn_id.clone(),
             step_id: context.step_id.clone(),
             revision: context.revision,
+            context: Some(context.context.clone()),
+            stable_head: Some(context.stable_head.clone()),
         })
         .await?;
         let tools = self.tools.definitions();
@@ -945,6 +1346,7 @@ impl AgentRuntime {
                 step_id: context.step_id.clone(),
                 attempt_id: attempt_id.clone(),
                 conversation_revision: context.revision,
+                context: context.context.clone(),
                 instructions: context.instructions.clone(),
                 messages: context.messages.clone(),
                 tools: tools.clone(),
@@ -1035,7 +1437,7 @@ impl AgentRuntime {
         is_error: bool,
     ) -> Result<(), RuntimeError> {
         let message_id: MessageId = format!("{}-result", call.id).into();
-        let resulting_revision = self
+        let entry_id = self
             .durable_append(
                 state,
                 Message::ToolResult(ToolResultMessage {
@@ -1050,10 +1452,43 @@ impl AgentRuntime {
         self.record(JournalRecord::ToolResultCommitted {
             tool_call_id: call.id.clone(),
             message_id,
-            resulting_revision,
+            resulting_revision: state.conversation.revision(),
+            entry_id: Some(entry_id),
+            resulting_head_revision: Some(state.tree.head().revision),
         })
         .await?;
         Ok(())
+    }
+
+    async fn commit_tool_effect(
+        &self,
+        state: &mut RuntimeState,
+        tool_call_id: &super::types::ToolCallId,
+        effect: ToolEffect,
+    ) -> Result<(), RuntimeError> {
+        match effect {
+            ToolEffect::ChangeDirectory { input, from, to } => {
+                if state.directory.as_ref() != Some(&from) {
+                    return Err(RuntimeError::WorkingDirectory(format!(
+                        "directory effect for {tool_call_id} expected {:?}, found {:?}",
+                        from, state.directory
+                    )));
+                }
+                self.append_session_entry(
+                    state,
+                    SessionEntryPayload::CwdChanged {
+                        input,
+                        from: Some(from),
+                        to,
+                        source: DirectoryChangeSource::ModelTool {
+                            tool_call_id: tool_call_id.clone(),
+                        },
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+        }
     }
 
     async fn ensure_session_initialized(
@@ -1065,6 +1500,7 @@ impl AgentRuntime {
         }
         self.record(JournalRecord::SessionCreated {
             instructions: state.conversation.instructions().clone(),
+            initial_directory: state.initial_directory.clone(),
         })
         .await?;
         state.session_initialized = true;
@@ -1075,20 +1511,50 @@ impl AgentRuntime {
         &self,
         state: &mut RuntimeState,
         message: Message,
-    ) -> Result<ConversationRevision, RuntimeError> {
-        let expected_revision = state.conversation.revision();
-        let mut next = state.conversation.clone();
-        let resulting_revision = next
-            .append(message.clone())
+    ) -> Result<EntryId, RuntimeError> {
+        self.append_session_entry(state, SessionEntryPayload::Message(message))
+            .await
+    }
+
+    async fn append_session_entry(
+        &self,
+        state: &mut RuntimeState,
+        payload: SessionEntryPayload,
+    ) -> Result<EntryId, RuntimeError> {
+        let expected_head = state.tree.head().clone();
+        let resulting_revision =
+            HeadRevision(
+                expected_head.revision.0.checked_add(1).ok_or_else(|| {
+                    RuntimeError::Conversation("head revision overflow".to_owned())
+                })?,
+            );
+        let entry_id: EntryId = next_id("entry", &mut state.next_entry).into();
+        let entry = SessionEntry {
+            id: entry_id.clone(),
+            parent_id: expected_head.entry_id.clone(),
+            timestamp_unix_ms: unix_timestamp_ms(),
+            payload,
+        };
+        let mut next_tree = state.tree.clone();
+        let branch = next_tree
+            .append(
+                entry.clone(),
+                &expected_head,
+                resulting_revision,
+                state.conversation.instructions(),
+                state.initial_directory.as_ref(),
+            )
             .map_err(|error| RuntimeError::Conversation(error.to_string()))?;
-        self.record(JournalRecord::ConversationAppended {
-            message,
-            expected_revision,
-            resulting_revision,
+        self.record(JournalRecord::SessionEntryAppended {
+            entry,
+            expected_head,
+            resulting_head_revision: resulting_revision,
         })
         .await?;
-        state.conversation = next;
-        Ok(resulting_revision)
+        state.tree = next_tree;
+        state.conversation = branch.conversation;
+        state.directory = branch.directory;
+        Ok(entry_id)
     }
 
     async fn record(&self, record: JournalRecord) -> Result<(), RuntimeError> {
@@ -1097,11 +1563,30 @@ impl AgentRuntime {
     }
 }
 
-fn recorded_outcome(outcome: &ToolOutcome) -> RecordedToolOutcome {
+fn recorded_outcome(
+    outcome: &ToolOutcome,
+    current_directory: Option<&DirectorySnapshot>,
+) -> RecordedToolOutcome {
     match outcome {
         ToolOutcome::Completed { content } => RecordedToolOutcome::Completed {
             content: content.clone(),
         },
+        ToolOutcome::CompletedWithEffect { content, effect } => {
+            if let ToolEffect::ChangeDirectory { from, .. } = effect
+                && current_directory != Some(from)
+            {
+                return RecordedToolOutcome::FailedKnown {
+                    message: format!(
+                        "change_directory context is stale: expected {:?}, found {:?}",
+                        from, current_directory
+                    ),
+                };
+            }
+            RecordedToolOutcome::CompletedWithEffect {
+                content: content.clone(),
+                effect: effect.clone(),
+            }
+        }
         ToolOutcome::FailedKnown { message } => RecordedToolOutcome::FailedKnown {
             message: message.clone(),
         },
@@ -1115,6 +1600,16 @@ fn block_turn(state: &mut RuntimeState, error: &RuntimeError) {
     if let Some(active) = state.active.as_mut() {
         active.blocked = Some(error.to_string());
     }
+}
+
+fn emit_tree_changed(
+    state: &RuntimeState,
+    emit: &tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    let _ = emit.send(RuntimeEvent::SessionTreeChanged {
+        entry_ids: state.tree.entries().keys().cloned().collect(),
+        head_revision: state.tree.head().revision,
+    });
 }
 
 fn block_recovery(state: &mut RuntimeState, recovery: &DurableTurn, error: &RuntimeError) {
@@ -1149,8 +1644,41 @@ fn runtime_failure_kind(error: &RuntimeError) -> RuntimeFailureKind {
         RuntimeError::Busy
         | RuntimeError::NoResumableTurn
         | RuntimeError::Blocked(_)
-        | RuntimeError::Conversation(_) => RuntimeFailureKind::Internal,
+        | RuntimeError::Conversation(_)
+        | RuntimeError::WorkingDirectory(_) => RuntimeFailureKind::Internal,
     }
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf, RuntimeError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        RuntimeError::WorkingDirectory(format!("cannot open {}: {error}", path.display()))
+    })?;
+    if !canonical.is_dir() {
+        return Err(RuntimeError::WorkingDirectory(format!(
+            "not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn validate_recorded_directory(directory: &DirectorySnapshot) -> Result<(), RuntimeError> {
+    let canonical = canonical_directory(&directory.path)?;
+    if canonical != directory.path {
+        return Err(RuntimeError::WorkingDirectory(format!(
+            "recorded working directory now resolves to a different path: {} -> {}",
+            directory.path.display(),
+            canonical.display()
+        )));
+    }
+    Ok(())
+}
+
+fn unix_timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn next_id(prefix: &str, counter: &mut u64) -> String {
@@ -1198,13 +1726,14 @@ mod tests {
     use crate::agent::journal::StoreFuture;
     use crate::agent::provider::ProviderEvent;
     use crate::agent::provider::test_support::{Script, ScriptedProvider};
-    use crate::agent::tools::{Tool, ToolFuture, ToolRegistry};
+    use crate::agent::tools::{ChangeDirectoryTool, Tool, ToolFuture, ToolRegistry};
     use crate::agent::types::{
         ModelCapabilities, PartIndex, ProviderCompletion, ResponseInfo, ResponseProvenance,
         ToolCallId, ToolDefinition,
     };
     use crate::agent::{
-        InMemorySessionStore, JournalRecord, JournalSequence, LocalSessionStore, SessionStore,
+        InMemorySessionStore, InstructionSet, JournalRecord, JournalSequence, LocalSessionStore,
+        SessionStore,
     };
 
     fn model() -> ModelRef {
@@ -1227,6 +1756,366 @@ mod tests {
             usage: None,
             provider_state: None,
         })
+    }
+
+    fn temp_directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rua-runtime-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn cwd_change_is_durable_and_frozen_into_the_next_model_request() {
+        let root = temp_directory("cwd");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let provider = Arc::new(ScriptedProvider::new([Script::Events(vec![
+            started(),
+            completed(StopReason::EndTurn),
+        ])]));
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new_in(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            "system",
+            model(),
+            &root,
+        )
+        .unwrap()
+        .with_session_store(store.clone());
+        let session_id = runtime.session_id().clone();
+
+        let changed = runtime.change_directory("child").await.unwrap();
+        assert_eq!(changed.path, child.canonicalize().unwrap());
+        runtime
+            .run_user_turn(
+                "where am I?".to_owned(),
+                &tokio::sync::mpsc::unbounded_channel().0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(provider.requests()[0].context.directory, changed);
+        let recovered = AgentRuntime::recover(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            model(),
+            store,
+            session_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.working_directory().await.unwrap(), changed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_cwd_entry_preserves_original_input_and_publishes_the_result() {
+        let root = temp_directory("cwd-command-input");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let runtime = AgentRuntime::new_in(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            "system",
+            model(),
+            &root,
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime
+            .change_directory_from_command("child", "/cd child", &tx)
+            .await
+            .unwrap();
+
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, RuntimeEvent::WorkingDirectoryChanged { .. }))
+        );
+        let tree = runtime.session_tree_snapshot().await;
+        let entry = tree
+            .entries()
+            .get(tree.head().entry_id.as_ref().unwrap())
+            .unwrap();
+        assert!(matches!(
+            &entry.payload,
+            SessionEntryPayload::CwdChanged { input, .. } if input == "/cd child"
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_cwd_change_does_not_initialize_or_mutate_the_session() {
+        let root = temp_directory("failed-cwd");
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new_in(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            "system",
+            model(),
+            &root,
+        )
+        .unwrap()
+        .with_session_store(store.clone());
+        let session_id = runtime.session_id().clone();
+        let before = runtime.working_directory().await.unwrap();
+
+        assert!(runtime.change_directory("missing").await.is_err());
+        assert_eq!(runtime.working_directory().await.unwrap(), before);
+        assert!(store.entries(&session_id).await.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkout_includes_a_cwd_node_but_its_parent_does_not() {
+        let root = temp_directory("cwd-checkout");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let runtime = AgentRuntime::new_in(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            "system",
+            model(),
+            &root,
+        )
+        .unwrap();
+
+        runtime.change_directory("child").await.unwrap();
+        assert!(
+            runtime
+                .checkout_expected(None, Some(HeadRevision::default()))
+                .await
+                .is_err()
+        );
+        let cwd_entry = runtime
+            .session_tree_snapshot()
+            .await
+            .head()
+            .entry_id
+            .clone()
+            .unwrap();
+        runtime.checkout(None).await.unwrap();
+        assert_eq!(
+            runtime.working_directory().await.unwrap().path,
+            root.canonicalize().unwrap()
+        );
+        runtime.checkout(Some(cwd_entry)).await.unwrap();
+        assert_eq!(
+            runtime.working_directory().await.unwrap().path,
+            child.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_recorded_cwd_blocks_turns_but_accepts_an_absolute_replacement() {
+        let root = temp_directory("cwd-unavailable");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new_in(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            "system",
+            model(),
+            &root,
+        )
+        .unwrap()
+        .with_session_store(store.clone());
+        let session_id = runtime.session_id().clone();
+        runtime.change_directory("child").await.unwrap();
+        std::fs::remove_dir_all(&child).unwrap();
+        let before = store.entries(&session_id).await.len();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(matches!(
+            runtime
+                .run_user_turn("do work".to_owned(), &tx, CancellationToken::new())
+                .await,
+            Err(RuntimeError::WorkingDirectory(_))
+        ));
+        assert_eq!(store.entries(&session_id).await.len(), before);
+
+        runtime
+            .change_directory(root.canonicalize().unwrap().display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.working_directory().await.unwrap().path,
+            root.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn absolute_cd_establishes_a_branch_directory_when_legacy_cwd_is_unknown() {
+        let root = temp_directory("cwd-establish");
+        let store = Arc::new(InMemorySessionStore::new());
+        let session_id = SessionId::new("legacy-unknown-cwd");
+        store
+            .append(
+                &session_id,
+                JournalRecord::SessionCreated {
+                    instructions: InstructionSet::new("system"),
+                    initial_directory: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AgentRuntime::recover(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            model(),
+            store.clone(),
+            session_id.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            runtime.change_directory("relative").await,
+            Err(RuntimeError::WorkingDirectory(message)) if message.contains("absolute path")
+        ));
+        let established = runtime
+            .change_directory(root.canonicalize().unwrap().display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(established.revision, DirectoryRevision(0));
+        let tree = runtime.session_tree_snapshot().await;
+        let cwd_entry = tree.head().entry_id.clone().unwrap();
+        assert!(matches!(
+            &tree.entries()[&cwd_entry].payload,
+            SessionEntryPayload::CwdChanged { from: None, to, .. }
+                if to == &established
+        ));
+
+        runtime.checkout(None).await.unwrap();
+        assert!(matches!(
+            runtime.directory_availability().await,
+            DirectoryAvailability::Unavailable {
+                recorded_path: None,
+                ..
+            }
+        ));
+        runtime.checkout(Some(cwd_entry)).await.unwrap();
+        assert_eq!(runtime.working_directory().await.unwrap(), established);
+        assert_eq!(
+            store.load(&session_id).await.unwrap().directory,
+            Some(established)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkout_then_append_creates_a_branch_without_deleting_the_old_path() {
+        let root = temp_directory("branch");
+        let provider = Arc::new(ScriptedProvider::new([
+            Script::Events(vec![started(), completed(StopReason::EndTurn)]),
+            Script::Events(vec![started(), completed(StopReason::EndTurn)]),
+        ]));
+        let runtime = AgentRuntime::new_in(
+            provider,
+            Arc::new(ToolRegistry::new()),
+            "system",
+            model(),
+            &root,
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime
+            .run_user_turn("first".to_owned(), &tx, CancellationToken::new())
+            .await
+            .unwrap();
+        let first_leaf = runtime
+            .session_tree_snapshot()
+            .await
+            .head()
+            .entry_id
+            .clone()
+            .unwrap();
+        runtime.checkout(None).await.unwrap();
+        runtime
+            .run_user_turn("second".to_owned(), &tx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let tree = runtime.session_tree_snapshot().await;
+        assert_eq!(tree.entries().len(), 4);
+        assert!(tree.entries().contains_key(&first_leaf));
+        let root_entries = tree
+            .entries()
+            .values()
+            .filter(|entry| entry.parent_id.is_none())
+            .count();
+        assert_eq!(root_entries, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_snapshot_and_wal_recover_the_durable_tree_head() {
+        let root = temp_directory("tree-snapshot");
+        let session_id;
+        {
+            let store = Arc::new(LocalSessionStore::new(&root));
+            let provider = Arc::new(ScriptedProvider::new([
+                Script::Events(vec![started(), completed(StopReason::EndTurn)]),
+                Script::Events(vec![started(), completed(StopReason::EndTurn)]),
+            ]));
+            let runtime = AgentRuntime::new_in(
+                provider,
+                Arc::new(ToolRegistry::new()),
+                "system",
+                model(),
+                &root,
+            )
+            .unwrap()
+            .with_session_store(store.clone());
+            session_id = runtime.session_id().clone();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            runtime
+                .run_user_turn("first".to_owned(), &tx, CancellationToken::new())
+                .await
+                .unwrap();
+            runtime.checkout(None).await.unwrap();
+            runtime
+                .run_user_turn("second".to_owned(), &tx, CancellationToken::new())
+                .await
+                .unwrap();
+        }
+
+        let store = Arc::new(LocalSessionStore::new(&root));
+        let recovered = AgentRuntime::recover(
+            Arc::new(ScriptedProvider::new([])),
+            Arc::new(ToolRegistry::new()),
+            model(),
+            store,
+            session_id,
+        )
+        .await
+        .unwrap();
+        let tree = recovered.session_tree_snapshot().await;
+        assert_eq!(tree.entries().len(), 4);
+        assert_eq!(
+            tree.entries()
+                .values()
+                .filter(|entry| entry.parent_id.is_none())
+                .count(),
+            2
+        );
+        assert_eq!(recovered.conversation_snapshot().await.messages().len(), 2);
+        drop(recovered);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1362,6 +2251,7 @@ mod tests {
         fn execute(
             &self,
             arguments: serde_json::Value,
+            _context: ToolExecutionContext,
             _cancel: CancellationToken,
         ) -> ToolFuture<'_> {
             Box::pin(async move {
@@ -1370,6 +2260,227 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn model_directory_effect_commits_before_tool_result_and_changes_next_step() {
+        let root = temp_directory("model-cwd");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let provider = Arc::new(ScriptedProvider::new([
+            Script::Events(vec![
+                started(),
+                ProviderEvent::ToolCallStarted {
+                    part: PartIndex(0),
+                    id: ToolCallId::new("call-cd"),
+                    name: "change_directory".to_owned(),
+                },
+                ProviderEvent::ToolArgumentsDelta {
+                    part: PartIndex(0),
+                    delta: r#"{"path":"child"}"#.to_owned(),
+                },
+                completed(StopReason::ToolUse),
+            ]),
+            Script::Events(vec![started(), completed(StopReason::EndTurn)]),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(ChangeDirectoryTool).unwrap();
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime =
+            AgentRuntime::new_in(provider.clone(), Arc::new(tools), "system", model(), &root)
+                .unwrap()
+                .with_session_store(store.clone());
+        let session_id = runtime.session_id().clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime
+            .run_user_turn("move there".to_owned(), &tx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].context.directory.path,
+            child.canonicalize().unwrap()
+        );
+        let tree = runtime.session_tree_snapshot().await;
+        let path = tree.path_to_head().unwrap();
+        let effect_index = path
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.payload,
+                    SessionEntryPayload::CwdChanged {
+                        source: DirectoryChangeSource::ModelTool { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            path[effect_index + 1].payload,
+            SessionEntryPayload::Message(Message::ToolResult(_))
+        ));
+        let recovered = store.load(&session_id).await.unwrap();
+        assert_eq!(
+            recovered.directory.unwrap().path,
+            child.canonicalize().unwrap()
+        );
+        let entries = store.entries(&session_id).await;
+        let outcome_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.record,
+                    JournalRecord::ToolOutcomeRecorded {
+                        outcome: RecordedToolOutcome::CompletedWithEffect { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let started_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.record,
+                    JournalRecord::ToolExecutionStarted { tool_call_id, .. }
+                        if tool_call_id == &ToolCallId::new("call-cd")
+                )
+            })
+            .unwrap();
+        let effect_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.record,
+                    JournalRecord::SessionEntryAppended {
+                        entry: SessionEntry {
+                            payload: SessionEntryPayload::CwdChanged {
+                                source: DirectoryChangeSource::ModelTool { .. },
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(outcome_index < effect_index);
+        let after_started =
+            crate::agent::journal::replay_session(&session_id, &entries[..=started_index]).unwrap();
+        let retryable_tool = &after_started.active_turn.unwrap().pending_tools[0];
+        assert!(retryable_tool.execution_id.is_none());
+        assert!(retryable_tool.outcome.is_none());
+        let before_effect =
+            crate::agent::journal::replay_session(&session_id, &entries[..=outcome_index]).unwrap();
+        assert!(!before_effect.active_turn.unwrap().pending_tools[0].effect_committed);
+        let after_effect =
+            crate::agent::journal::replay_session(&session_id, &entries[..=effect_index]).unwrap();
+        assert!(after_effect.active_turn.unwrap().pending_tools[0].effect_committed);
+        assert_eq!(
+            after_effect.directory.unwrap().path,
+            child.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_directory_effect_from_the_same_batch_becomes_a_stale_tool_failure() {
+        let root = temp_directory("model-cwd-stale-batch");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let provider = Arc::new(ScriptedProvider::new([
+            Script::Events(vec![
+                started(),
+                ProviderEvent::ToolCallStarted {
+                    part: PartIndex(0),
+                    id: ToolCallId::new("call-first"),
+                    name: "change_directory".to_owned(),
+                },
+                ProviderEvent::ToolArgumentsDelta {
+                    part: PartIndex(0),
+                    delta: r#"{"path":"first"}"#.to_owned(),
+                },
+                ProviderEvent::ToolCallStarted {
+                    part: PartIndex(1),
+                    id: ToolCallId::new("call-second"),
+                    name: "change_directory".to_owned(),
+                },
+                ProviderEvent::ToolArgumentsDelta {
+                    part: PartIndex(1),
+                    delta: r#"{"path":"second"}"#.to_owned(),
+                },
+                completed(StopReason::ToolUse),
+            ]),
+            Script::Events(vec![started(), completed(StopReason::EndTurn)]),
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.register(ChangeDirectoryTool).unwrap();
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new_in(provider, Arc::new(tools), "system", model(), &root)
+            .unwrap()
+            .with_session_store(store.clone());
+        let session_id = runtime.session_id().clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime
+            .run_user_turn("move twice".to_owned(), &tx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.working_directory().await.unwrap().path,
+            first.canonicalize().unwrap()
+        );
+        assert_eq!(
+            runtime
+                .session_tree_snapshot()
+                .await
+                .entries()
+                .values()
+                .filter(|entry| matches!(entry.payload, SessionEntryPayload::CwdChanged { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            runtime
+                .conversation_snapshot()
+                .await
+                .messages()
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    Message::ToolResult(result)
+                        if result.tool_call_id == ToolCallId::new("call-second")
+                            && result.is_error
+                            && result.content.iter().any(|part| matches!(
+                                part,
+                                ToolResultContent::Text { text } if text.contains("context is stale")
+                            ))
+                ))
+        );
+        assert!(
+            store
+                .entries(&session_id)
+                .await
+                .iter()
+                .any(|entry| matches!(
+                    &entry.record,
+                    JournalRecord::ToolOutcomeRecorded {
+                        tool_call_id,
+                        outcome: RecordedToolOutcome::FailedKnown { message },
+                        ..
+                    } if tool_call_id == &ToolCallId::new("call-second")
+                        && message.contains("context is stale")
+                ))
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     struct UnknownOutcomeTool;
@@ -1387,6 +2498,7 @@ mod tests {
         fn execute(
             &self,
             _arguments: serde_json::Value,
+            _context: ToolExecutionContext,
             _cancel: CancellationToken,
         ) -> ToolFuture<'_> {
             Box::pin(async {
@@ -1598,10 +2710,13 @@ mod tests {
             recovery_rx.recv().await,
             Some(RuntimeEvent::SessionRecovered { .. })
         ));
-        assert!(matches!(
-            recovery_rx.recv().await,
-            Some(RuntimeEvent::RecoveryRequired { .. })
-        ));
+        let mut saw_recovery = false;
+        while let Ok(event) = recovery_rx.try_recv() {
+            if matches!(event, RuntimeEvent::RecoveryRequired { .. }) {
+                saw_recovery = true;
+            }
+        }
+        assert!(saw_recovery);
         assert!(matches!(
             blocked_runtime
                 .resume_turn(&recovery_tx, CancellationToken::new())
@@ -1839,6 +2954,7 @@ mod tests {
         fn execute(
             &self,
             _arguments: serde_json::Value,
+            _context: ToolExecutionContext,
             _cancel: CancellationToken,
         ) -> ToolFuture<'_> {
             self.0.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1865,6 +2981,7 @@ mod tests {
         fn execute(
             &self,
             _arguments: serde_json::Value,
+            _context: ToolExecutionContext,
             _cancel: CancellationToken,
         ) -> ToolFuture<'_> {
             self.0.fetch_add(1, AtomicOrdering::SeqCst);

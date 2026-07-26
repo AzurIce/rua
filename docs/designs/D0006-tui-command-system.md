@@ -105,6 +105,8 @@ Recognizer + CommandRegistry
 
 命令提交后，controller 清空 draft 的时机取决于是否已经接受 invocation：解析失败或上下文已过期时保留原文；同步 local command 成功接受后可以立即清空；异步 application/runtime command 一旦进入命令通道便清空，并在 projection 中显示 accepted、pending、completed 或 failed。local command 的输出是 UI projection item，不自动成为 canonical model message。
 
+命令文本、命令结果与 durable session state 不能混为一种记录。Composer 的 command history 保存用户输入过的 `/cd ../runtime`，用于上下键恢复；当 runtime 成功接受一个会改变后续模型语义的命令时，它按照对应设计追加 typed session entry，例如 [D0007](D0007-session-tree-and-working-directory.md) 的 `CwdChanged`。`/help`、`/pwd` 等查询命令不会因此进入 session tree，失败或过期的 `/cd` 也不会伪造一次状态变化。这样 command parser 的语法演进不会改变旧 session 的回放含义。
+
 ## 补全是一种带替换范围的查询
 
 每次补全都针对 draft revision、cursor 和当前 parse state 创建查询：

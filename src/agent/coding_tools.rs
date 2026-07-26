@@ -1,5 +1,4 @@
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
@@ -7,22 +6,20 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use super::tools::{Tool, ToolFuture, ToolOutcome, ToolRegistry, ToolRegistryError};
+use super::tools::{
+    Tool, ToolExecutionContext, ToolFuture, ToolOutcome, ToolRegistry, ToolRegistryError,
+};
 use super::types::{ReplayClass, ToolDefinition};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 
-pub fn register_coding_tools(
-    registry: &mut ToolRegistry,
-    root: impl AsRef<Path>,
-) -> Result<(), CodingToolError> {
-    let workspace = Arc::new(Workspace::new(root.as_ref())?);
-    registry.register(ReadFileTool(workspace.clone()))?;
-    registry.register(WriteFileTool(workspace.clone()))?;
-    registry.register(EditFileTool(workspace.clone()))?;
-    registry.register(GlobTool(workspace.clone()))?;
-    registry.register(GrepTool(workspace))?;
+pub fn register_coding_tools(registry: &mut ToolRegistry) -> Result<(), CodingToolError> {
+    registry.register(ReadFileTool)?;
+    registry.register(WriteFileTool)?;
+    registry.register(EditFileTool)?;
+    registry.register(GlobTool)?;
+    registry.register(GrepTool)?;
     Ok(())
 }
 
@@ -40,10 +37,10 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(root: &Path) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            root: root.canonicalize()?,
-        })
+    fn from_context(context: ToolExecutionContext) -> Self {
+        Self {
+            root: context.directory.path,
+        }
     }
 
     fn existing(&self, value: &str) -> Result<PathBuf, String> {
@@ -114,7 +111,7 @@ fn safe_relative(value: &str) -> Result<&Path, String> {
     Ok(path)
 }
 
-struct ReadFileTool(Arc<Workspace>);
+struct ReadFileTool;
 
 impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
@@ -137,8 +134,13 @@ impl Tool for ReadFileTool {
         }
     }
 
-    fn execute(&self, arguments: Value, _cancel: CancellationToken) -> ToolFuture<'_> {
-        let workspace = self.0.clone();
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
+        let workspace = Workspace::from_context(context);
         Box::pin(async move {
             let path = match string_argument(&arguments, "path")
                 .and_then(|path| workspace.existing(path))
@@ -182,7 +184,7 @@ impl Tool for ReadFileTool {
     }
 }
 
-struct WriteFileTool(Arc<Workspace>);
+struct WriteFileTool;
 
 impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
@@ -202,8 +204,13 @@ impl Tool for WriteFileTool {
         }
     }
 
-    fn execute(&self, arguments: Value, _cancel: CancellationToken) -> ToolFuture<'_> {
-        let workspace = self.0.clone();
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
+        let workspace = Workspace::from_context(context);
         Box::pin(async move {
             let path = match string_argument(&arguments, "path")
                 .and_then(|path| workspace.writable(path))
@@ -238,7 +245,7 @@ impl Tool for WriteFileTool {
     }
 }
 
-struct EditFileTool(Arc<Workspace>);
+struct EditFileTool;
 
 impl Tool for EditFileTool {
     fn definition(&self) -> ToolDefinition {
@@ -260,8 +267,13 @@ impl Tool for EditFileTool {
         }
     }
 
-    fn execute(&self, arguments: Value, _cancel: CancellationToken) -> ToolFuture<'_> {
-        let workspace = self.0.clone();
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
+        let workspace = Workspace::from_context(context);
         Box::pin(async move {
             let path = match string_argument(&arguments, "path")
                 .and_then(|path| workspace.existing(path))
@@ -325,7 +337,7 @@ impl Tool for EditFileTool {
     }
 }
 
-struct GlobTool(Arc<Workspace>);
+struct GlobTool;
 
 impl Tool for GlobTool {
     fn definition(&self) -> ToolDefinition {
@@ -342,8 +354,13 @@ impl Tool for GlobTool {
         }
     }
 
-    fn execute(&self, arguments: Value, cancel: CancellationToken) -> ToolFuture<'_> {
-        let workspace = self.0.clone();
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
+        let workspace = Workspace::from_context(context);
         Box::pin(async move {
             let pattern = match string_argument(&arguments, "pattern") {
                 Ok(pattern) => pattern,
@@ -386,7 +403,7 @@ impl Tool for GlobTool {
     }
 }
 
-struct GrepTool(Arc<Workspace>);
+struct GrepTool;
 
 impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
@@ -406,8 +423,13 @@ impl Tool for GrepTool {
         }
     }
 
-    fn execute(&self, arguments: Value, cancel: CancellationToken) -> ToolFuture<'_> {
-        let workspace = self.0.clone();
+    fn execute(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'_> {
+        let workspace = Workspace::from_context(context);
         Box::pin(async move {
             let pattern = match string_argument(&arguments, "pattern") {
                 Ok(pattern) => pattern,
@@ -522,7 +544,7 @@ fn bounded(mut text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::ToolExecutor;
+    use crate::agent::{DirectoryRevision, DirectorySnapshot, ToolExecutor};
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -537,7 +559,12 @@ mod tests {
         root
     }
 
-    async fn execute(registry: &ToolRegistry, name: &str, arguments: Value) -> ToolOutcome {
+    async fn execute(
+        registry: &ToolRegistry,
+        root: &Path,
+        name: &str,
+        arguments: Value,
+    ) -> ToolOutcome {
         registry
             .execute(
                 crate::agent::ToolCall {
@@ -545,6 +572,12 @@ mod tests {
                     name: name.to_owned(),
                     arguments,
                     provider_state: None,
+                },
+                ToolExecutionContext {
+                    directory: DirectorySnapshot {
+                        path: root.canonicalize().unwrap(),
+                        revision: DirectoryRevision::default(),
+                    },
                 },
                 CancellationToken::new(),
             )
@@ -556,11 +589,12 @@ mod tests {
         let root = temp_root("edit");
         std::fs::write(root.join("sample.txt"), "one\ntwo\nthree\n").unwrap();
         let mut registry = ToolRegistry::new();
-        register_coding_tools(&mut registry, &root).unwrap();
+        register_coding_tools(&mut registry).unwrap();
 
         assert_eq!(
             execute(
                 &registry,
+                &root,
                 "read_file",
                 json!({"path":"sample.txt", "start_line":2, "end_line":2}),
             )
@@ -572,6 +606,7 @@ mod tests {
         assert!(matches!(
             execute(
                 &registry,
+                &root,
                 "edit_file",
                 json!({"path":"sample.txt", "old_text":"two", "new_text":"second"}),
             )
@@ -583,7 +618,13 @@ mod tests {
             "one\nsecond\nthree\n"
         );
         assert!(matches!(
-            execute(&registry, "read_file", json!({"path":"../outside.txt"})).await,
+            execute(
+                &registry,
+                &root,
+                "read_file",
+                json!({"path":"../outside.txt"})
+            )
+            .await,
             ToolOutcome::FailedKnown { .. }
         ));
         std::fs::remove_dir_all(root).unwrap();
@@ -596,10 +637,10 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "fn durable_runtime() {}\n").unwrap();
         std::fs::write(root.join("README.md"), "runtime\n").unwrap();
         let mut registry = ToolRegistry::new();
-        register_coding_tools(&mut registry, &root).unwrap();
+        register_coding_tools(&mut registry).unwrap();
 
         assert_eq!(
-            execute(&registry, "glob", json!({"pattern":"src/*.rs"})).await,
+            execute(&registry, &root, "glob", json!({"pattern":"src/*.rs"})).await,
             ToolOutcome::Completed {
                 content: "src/lib.rs".to_owned()
             }
@@ -607,6 +648,7 @@ mod tests {
         assert_eq!(
             execute(
                 &registry,
+                &root,
                 "grep",
                 json!({"pattern":"durable_.*", "glob":"**/*.rs"}),
             )
