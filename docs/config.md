@@ -10,15 +10,17 @@ auto-created with sensible defaults on first run if it does not exist.
 ```
 
 You can also inspect the resolved path at runtime via
-`rua::config::config_path()`.
+`rua_core::config::config_path()`.
 
-## `deepseek` section
+## `provider` section
 
-| Key       | Default                     | Description                           |
-|-----------|----------------------------|---------------------------------------|
-| `api_key` | `"!echo $DEEPSEEK_API_KEY"` | DeepSeek API key (see formats below)  |
-| `base_url`| `"https://api.deepseek.com"`| API base URL                          |
-| `model`   | `"deepseek-v4-pro"`         | Model name passed to the API          |
+| Key                 | Default                        | Description                                  |
+|---------------------|--------------------------------|----------------------------------------------|
+| `kind`              | `"openai"`                     | `"openai"` = OpenAI-compatible endpoint (incl. LM Studio); `"deepseek"` = DeepSeek API |
+| `api_key`           | `"lm-studio"`                  | API key (see formats below)                  |
+| `base_url`          | `"http://127.0.0.1:1234/v1"`   | API base URL                                 |
+| `model`             | `"qwen3.8-27b-uncensored-mlx"` | Model name passed to the API                 |
+| `additional_params` | `{}`                           | Provider-specific request params, passed through verbatim |
 
 ### `api_key` value formats
 
@@ -45,10 +47,40 @@ following order:
    api_key = "sk-xxxxxxxx"
    ```
 
+### `additional_params`
+
+Arbitrary provider-specific request parameters, merged verbatim into every
+completion request. Example (DeepSeek thinking toggle):
+
+```toml
+[provider.additional_params]
+thinking = { type = "enabled" }
+```
+
+## `server` section
+
+| Key    | Default | Description                              |
+|--------|---------|------------------------------------------|
+| `port` | `3080`  | Daemon listen port (always `127.0.0.1`)  |
+
 ## Example config
 
 ```toml
-[deepseek]
+# LM Studio local server (default)
+[provider]
+kind = "openai"
+api_key = "lm-studio"
+base_url = "http://127.0.0.1:1234/v1"
+model = "qwen3.8-27b-uncensored-mlx"
+
+[server]
+port = 3080
+```
+
+```toml
+# DeepSeek API
+[provider]
+kind = "deepseek"
 api_key = "!echo $DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-pro"

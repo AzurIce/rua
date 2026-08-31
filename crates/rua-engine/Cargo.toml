@@ -1,0 +1,21 @@
+[package]
+name = "rua-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rua-core = { path = "../rua-core" }
+rig-core = "0.42"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+futures.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+wiremock = "0.6"

@@ -1,0 +1,12 @@
+[application]
+name = "rua-ui"
+default_platform = "web"
+out_dir = "dist"
+asset_dir = "assets"
+
+[web.app]
+title = "rua"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]

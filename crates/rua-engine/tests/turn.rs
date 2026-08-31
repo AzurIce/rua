@@ -1,0 +1,569 @@
+//! Integration tests for `run_turn` against a mock OpenAI-compatible
+//! (DeepSeek-shaped) SSE endpoint.
+
+use rua_core::config::ProviderConfig;
+use rua_core::events::TurnEvent;
+use rua_core::id::{CursorId, NodeId};
+use rua_core::message::CoreMessage;
+use rua_core::node::{NodeKind, Outcome, Step};
+use rua_engine::{Engine, TurnParams};
+use tokio_util::sync::CancellationToken;
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn sse(frames: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for frame in frames {
+        body.push_str("data: ");
+        body.push_str(&frame.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn text_chunk(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "cmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "deepseek-v4-pro",
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": text},
+            "finish_reason": null
+        }]
+    })
+}
+
+fn reasoning_chunk(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "cmpl-1",
+        "choices": [{
+            "index": 0,
+            "delta": {"reasoning_content": text},
+            "finish_reason": null
+        }]
+    })
+}
+
+fn tool_call_chunk(id: &str, name: &str, arguments: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "cmpl-1",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                }]
+            },
+            "finish_reason": null
+        }]
+    })
+}
+
+fn final_chunk(finish_reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "cmpl-1",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "prompt_cache_hit_tokens": 4,
+            "prompt_cache_miss_tokens": 6,
+            "total_tokens": 15
+        }
+    })
+}
+
+fn sse_response(body: String) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+}
+
+fn engine_for(server: &MockServer) -> Engine {
+    let config = ProviderConfig {
+        kind: "deepseek".to_string(),
+        api_key: "test-key".to_string(),
+        base_url: server.uri(),
+        model: "deepseek-v4-pro".to_string(),
+        additional_params: serde_json::Map::new(),
+    };
+    Engine::new(&config, std::env::current_dir().unwrap()).unwrap()
+}
+
+fn params(history: Vec<CoreMessage>) -> TurnParams {
+    TurnParams {
+        cursor_id: CursorId::new(),
+        node_id: NodeId::new(),
+        parent: None,
+        context_refs: vec![],
+        actor: "human".to_string(),
+        model: "deepseek-v4-pro".to_string(),
+        history,
+        system_prompt: Some("You are helpful.".to_string()),
+        depth: 0,
+    }
+}
+
+#[tokio::test]
+async fn plain_text_turn_completes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            reasoning_chunk("let me think"),
+            text_chunk("Hello, "),
+            text_chunk("world!"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "hi".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let NodeKind::Turn {
+        steps,
+        outcome,
+        actor,
+        model,
+        usage,
+    } = &node.kind
+    else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Completed);
+    assert_eq!(actor, "human");
+    assert_eq!(model, "deepseek-v4-pro");
+    assert_eq!(steps.len(), 1);
+    let Step::LlmCall {
+        request,
+        response_text,
+        tool_calls,
+        reasoning,
+        usage: step_usage,
+    } = &steps[0]
+    else {
+        panic!("expected llm call step");
+    };
+    assert_eq!(response_text, "Hello, world!");
+    assert!(tool_calls.is_empty());
+    assert_eq!(reasoning.as_deref(), Some("let me think"));
+    // Snapshot: system prompt + the user message.
+    assert_eq!(request.len(), 2);
+    assert!(matches!(&request[0], CoreMessage::System { .. }));
+    assert_eq!(step_usage.input_tokens, 10);
+    assert_eq!(step_usage.output_tokens, 5);
+    assert_eq!(step_usage.cached_input_tokens, 4);
+    assert_eq!(usage.input_tokens, 10);
+
+    // Events: Started, reasoning delta, two text deltas.
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert!(matches!(events[0], TurnEvent::Started { .. }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ReasoningDelta { delta, .. } if delta == "let me think"))
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            TurnEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "Hello, world!");
+    // Engine never emits Committed (the server does).
+    assert!(!events.iter().any(|e| matches!(e, TurnEvent::Committed { .. })));
+}
+
+#[tokio::test]
+async fn tool_call_turn_executes_bash_and_feeds_back_result() {
+    let server = MockServer::start().await;
+    // Mounted first: matches the *second* request (the one carrying the
+    // tool result). wiremock tries newer mocks first, so this only wins
+    // once the request body contains a `tool` role message.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(sse_response(sse(&[
+            text_chunk("done with tools"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+    // Mounted second (newer): matches any POST, loses to the above on the
+    // tool-result request.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk("call_abc", "bash", r#"{"command":"echo rua-tool-ok"}"#),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "run something".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Completed);
+    assert_eq!(steps.len(), 3, "llm call + tool exec + llm call");
+
+    let Step::LlmCall { tool_calls, .. } = &steps[0] else {
+        panic!("expected llm call");
+    };
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].id, "call_abc");
+    assert_eq!(tool_calls[0].name, "bash");
+
+    let Step::ToolExec {
+        call_id,
+        name,
+        output,
+        ..
+    } = &steps[1]
+    else {
+        panic!("expected tool exec");
+    };
+    assert_eq!(call_id, "call_abc");
+    assert_eq!(name, "bash");
+    assert_eq!(output.trim_end(), "rua-tool-ok");
+
+    let Step::LlmCall { request, response_text, .. } = &steps[2] else {
+        panic!("expected llm call");
+    };
+    assert_eq!(response_text, "done with tools");
+    // Second request snapshot carries assistant tool call + tool result.
+    assert!(
+        request.iter().any(|m| matches!(
+            m,
+            CoreMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+        )),
+        "snapshot should contain the assistant tool call"
+    );
+    assert!(
+        request.iter().any(|m| matches!(
+            m,
+            CoreMessage::ToolResult { call_id, output, .. }
+                if call_id == "call_abc" && output.contains("rua-tool-ok")
+        )),
+        "snapshot should contain the tool result"
+    );
+
+    // The tool result actually went back over the wire.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let second_str = second.to_string();
+    assert!(second_str.contains("\"role\":\"tool\""), "got: {second_str}");
+    assert!(second_str.contains("rua-tool-ok"), "got: {second_str}");
+
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(|e| matches!(
+        e,
+        TurnEvent::ToolExecStarted { call_id, name, .. } if call_id == "call_abc" && name == "bash"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        TurnEvent::ToolExecFinished { call_id, output_preview, .. }
+            if call_id == "call_abc" && output_preview.contains("rua-tool-ok")
+    )));
+}
+
+#[tokio::test]
+async fn cancelled_turn_yields_cancelled_node_with_steps_preserved() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("partial"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "hi".to_string(),
+            }]),
+            tx,
+            cancel,
+        )
+        .await
+        .unwrap();
+
+    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Cancelled);
+    // The in-flight LLM call is still recorded (empty response).
+    assert_eq!(steps.len(), 1);
+    assert!(matches!(&steps[0], Step::LlmCall { response_text, .. } if response_text.is_empty()));
+}
+
+#[tokio::test]
+async fn provider_error_yields_failed_node() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "hi".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Failed);
+    assert_eq!(steps.len(), 1);
+}
+
+#[tokio::test]
+async fn empty_history_is_a_parameter_error() {
+    let server = MockServer::start().await;
+    let engine = engine_for(&server);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = engine
+        .run_turn(params(vec![]), tx, CancellationToken::new())
+        .await;
+    assert!(matches!(result, Err(rua_engine::Error::EmptyHistory)));
+}
+
+// ---- spawn_turn / inspect tools ----
+
+#[derive(Default)]
+struct MockSpawner {
+    spawned: std::sync::Mutex<Vec<(Option<NodeId>, String, usize)>>,
+    inspected: std::sync::Mutex<Vec<NodeId>>,
+}
+
+impl rua_engine::TurnSpawner for MockSpawner {
+    fn spawn_turn(
+        &self,
+        parent: Option<NodeId>,
+        text: String,
+        _actor: String,
+        _created_by: NodeId,
+        depth: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<rua_engine::SpawnedTurn, String>> + Send>,
+    > {
+        self.spawned
+            .lock()
+            .unwrap()
+            .push((parent, text.clone(), depth));
+        Box::pin(async move {
+            Ok(rua_engine::SpawnedTurn {
+                cursor_id: "cur-child".to_string(),
+                input_node_id: NodeId::new().to_string(),
+                turn_node_id: NodeId::new().to_string(),
+            })
+        })
+    }
+
+    fn inspect(
+        &self,
+        node: NodeId,
+        _wait: Option<std::time::Duration>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<rua_engine::InspectOutcome, String>> + Send>,
+    > {
+        self.inspected.lock().unwrap().push(node);
+        Box::pin(async move {
+            Ok(rua_engine::InspectOutcome::Committed {
+                outcome: Some("completed".to_string()),
+                text: "child result".to_string(),
+                usage: None,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn spawn_turn_then_inspect_roundtrip() {
+    let server = MockServer::start().await;
+    // wiremock 按挂载顺序（先挂先匹配）尝试。History 会累积，后面的请求
+    // 同时包含更早的工具结果，所以越晚出现的标记越要先挂。
+    // Request 3（带 inspect 结果）：最终文本。
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("child result"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("all done"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+    // Request 2（带 spawn 结果）：inspect 调用。
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("turn_node_id"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk("call_inspect", "inspect", r#"{"pointer":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+    // Request 1（无标记）：spawn_turn 调用。
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk(
+                "call_spawn",
+                "spawn_turn",
+                r#"{"pointer":null,"content":"subtask"}"#,
+            ),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let spawner = std::sync::Arc::new(MockSpawner::default());
+    engine.set_spawner(spawner.clone());
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "delegate".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Completed);
+    assert_eq!(steps.len(), 5, "llm + spawn + llm + inspect + llm");
+
+    // spawn_turn reached the runtime with parent=None, content, depth+1.
+    let spawned = spawner.spawned.lock().unwrap();
+    assert_eq!(spawned.len(), 1);
+    assert_eq!(spawned[0].0, None);
+    assert_eq!(spawned[0].1, "subtask");
+    assert_eq!(spawned[0].2, 1, "child runs at depth 1");
+
+    // inspect reached the runtime with the pointer from the tool args.
+    let inspected = spawner.inspected.lock().unwrap();
+    assert_eq!(inspected.len(), 1);
+    assert_eq!(
+        inspected[0].to_string(),
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    );
+
+    // The inspect result fed back into history (and matched mock 3).
+    let Step::ToolExec { name, output, .. } = &steps[3] else {
+        panic!("expected tool exec at steps[3]");
+    };
+    assert_eq!(name, "inspect");
+    assert!(output.contains("child result"), "got: {output}");
+
+    // The spawn tool defs went over the wire (depth 0 < MAX_SPAWN_DEPTH).
+    let requests = server.received_requests().await.unwrap();
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let tools = first["tools"].to_string();
+    assert!(tools.contains("spawn_turn"), "got: {tools}");
+    assert!(tools.contains("inspect"), "got: {tools}");
+}
+
+#[tokio::test]
+async fn spawn_tools_gated_by_spawner_and_depth() {
+    // No spawner injected -> spawn/inspect not advertised.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[text_chunk("ok"), final_chunk("stop")])))
+        .mount(&server)
+        .await;
+    let engine = engine_for(&server);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "hi".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let tools = serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap()["tools"]
+        .to_string();
+    assert!(tools.contains("bash"), "got: {tools}");
+    assert!(!tools.contains("spawn_turn"), "got: {tools}");
+    assert!(!tools.contains("\"inspect\""), "got: {tools}");
+
+    // Spawner injected but depth exhausted -> still not advertised.
+    let server2 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[text_chunk("ok"), final_chunk("stop")])))
+        .mount(&server2)
+        .await;
+    let engine2 = engine_for(&server2);
+    engine2.set_spawner(std::sync::Arc::new(MockSpawner::default()));
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.depth = rua_engine::spawn::MAX_SPAWN_DEPTH;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    engine2.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+    let requests = server2.received_requests().await.unwrap();
+    let tools = serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap()["tools"]
+        .to_string();
+    assert!(!tools.contains("spawn_turn"), "got: {tools}");
+}

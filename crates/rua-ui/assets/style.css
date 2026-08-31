@@ -1,0 +1,965 @@
+/* rua-ui — dark hand-written styles, no component library. */
+
+:root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --bg-panel: #161a22;
+    --bg-bubble: #1c212c;
+    --bg-input: #232936;
+    --border: #2a3040;
+    --text: #d8dee9;
+    --text-dim: #8a93a5;
+    --accent: #5b9dff;
+    --ok: #4caf7d;
+    --warn: #d8a037;
+    --err: #e05c5c;
+    --cancel: #b07cc6;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family:
+        -apple-system, "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.mono,
+pre {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+}
+
+.app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+/* ---- top bar ---- */
+
+.topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    flex: none;
+}
+
+.topbar-title {
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--accent);
+    margin-right: 8px;
+}
+
+.view-switch {
+    display: flex;
+    gap: 4px;
+}
+
+.view-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 6px;
+    padding: 4px 14px;
+    cursor: pointer;
+}
+
+.view-btn.active {
+    background: var(--bg-input);
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+.cursor-select {
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+
+/* ---- 图管理 ---- */
+
+.graph-switch {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.graph-select {
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    max-width: 140px;
+}
+
+.graph-op-btn {
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1.4;
+}
+
+.graph-op-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+.graph-op-btn.danger:hover {
+    color: var(--warn);
+    border-color: var(--warn);
+}
+
+.tip-label {
+    color: var(--text-dim);
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 12px;
+}
+
+.conn {
+    margin-left: auto;
+    font-size: 12px;
+    padding: 2px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+}
+
+.conn::before {
+    content: "●";
+    margin-right: 6px;
+}
+
+.conn-up {
+    color: var(--ok);
+}
+
+.conn-mid {
+    color: var(--warn);
+}
+
+.conn-down {
+    color: var(--err);
+}
+
+/* ---- error banner ---- */
+
+.error-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 16px;
+    background: #3a1d1d;
+    border-bottom: 1px solid var(--err);
+    color: #f0b5b5;
+    flex: none;
+}
+
+.error-text {
+    flex: 1;
+    white-space: pre-wrap;
+}
+
+.error-close,
+.detail-close {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+.loading {
+    padding: 40px;
+    text-align: center;
+    color: var(--text-dim);
+}
+
+/* ---- chat view ---- */
+
+.chat-view {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+.chat-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px clamp(16px, 8vw, 120px);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.chat-empty {
+    color: var(--text-dim);
+    text-align: center;
+    margin-top: 48px;
+}
+
+.bubble {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    max-width: 78%;
+    position: relative;
+}
+
+.bubble-input {
+    align-self: flex-end;
+    background: #1e2a3d;
+    border-color: #31445f;
+}
+
+.bubble-turn {
+    align-self: flex-start;
+    background: var(--bg-bubble);
+    min-width: 40%;
+}
+
+.bubble-turn.outcome-failed {
+    border-color: var(--err);
+}
+
+.bubble-turn.outcome-cancelled {
+    border-color: var(--cancel);
+}
+
+.bubble-turn.outcome-interrupted {
+    border-color: var(--warn);
+}
+
+.bubble-inflight {
+    border-style: dashed;
+    border-color: var(--accent);
+}
+
+.bubble-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 4px;
+    font-size: 12px;
+}
+
+.bubble-actor {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.bubble-id {
+    color: var(--text-dim);
+    font-family: ui-monospace, Menlo, monospace;
+}
+
+.inflight-hint {
+    color: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    50% {
+        opacity: 0.35;
+    }
+}
+
+.fork-btn {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 5px;
+    padding: 1px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s;
+}
+
+.bubble:hover .fork-btn {
+    opacity: 1;
+}
+
+.fork-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.bubble-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.bubble-footer {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+}
+
+.badge {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0 8px;
+}
+
+.badge.outcome-completed {
+    color: var(--ok);
+}
+
+.badge.outcome-failed {
+    color: var(--err);
+}
+
+.badge.outcome-cancelled {
+    color: var(--cancel);
+}
+
+.badge.outcome-interrupted {
+    color: var(--warn);
+}
+
+/* reasoning + tool exec */
+
+details.reasoning {
+    border-left: 2px solid var(--border);
+    margin: 6px 0;
+    padding-left: 10px;
+}
+
+details.reasoning summary {
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 12px;
+}
+
+details.reasoning pre {
+    white-space: pre-wrap;
+    color: var(--text-dim);
+    margin: 6px 0;
+}
+
+.tool-exec {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    margin: 6px 0;
+    font-size: 12.5px;
+}
+
+.tool-exec summary {
+    cursor: pointer;
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+}
+
+.tool-exec pre,
+.tool-preview {
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text-dim);
+    margin: 6px 0 2px;
+}
+
+.tool-name {
+    color: var(--warn);
+    font-family: ui-monospace, Menlo, monospace;
+    font-weight: 600;
+}
+
+.tool-args {
+    color: var(--text-dim);
+    font-family: ui-monospace, Menlo, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 50%;
+}
+
+.tool-duration {
+    margin-left: auto;
+    color: var(--text-dim);
+    font-size: 11.5px;
+}
+
+.tool-running {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: baseline;
+    border-style: dashed;
+}
+
+/* ---- input area ---- */
+
+.input-area {
+    flex: none;
+    display: flex;
+    gap: 10px;
+    padding: 12px clamp(16px, 8vw, 120px);
+    border-top: 1px solid var(--border);
+    background: var(--bg-panel);
+}
+
+.input-box {
+    flex: 1;
+    resize: none;
+    min-height: 44px;
+    max-height: 180px;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: inherit;
+}
+
+.input-box:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.send-btn,
+.cancel-btn {
+    border-radius: 8px;
+    padding: 0 20px;
+    cursor: pointer;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #0b0e13;
+    font-weight: 600;
+}
+
+.send-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.cancel-btn {
+    background: transparent;
+    color: var(--err);
+    border-color: var(--err);
+}
+
+/* ---- graph view ---- */
+
+.graph-view {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+
+.graph-canvas-wrap {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+}
+
+.graph-canvas {
+    background: var(--bg);
+}
+
+/* 工具条：覆盖在画布右上角 */
+.graph-toolbar {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+}
+
+.graph-tool-btn {
+    background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    backdrop-filter: blur(4px);
+}
+
+.graph-tool-btn:hover:not(:disabled) {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+.graph-tool-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* 编程式视口跳转的平滑过渡（dioxus-flow 的 animate class） */
+.flow-frame--animate {
+    transition: transform 0.3s ease;
+}
+
+.flow-frame--animate .flow-zoom {
+    transition: zoom 0.3s ease;
+}
+
+/* 边 */
+.flow-edge--dashed path {
+    stroke-dasharray: 6 5;
+}
+
+.flow-edge--highlight path {
+    stroke-opacity: 1;
+    stroke-width: 2.5px;
+    stroke: var(--accent);
+}
+
+.flow-edge--dim path {
+    stroke-opacity: 0.1;
+}
+
+/* 节点卡片（flow-node wrapper 由 dioxus-flow 定位并定尺寸） */
+.fcard {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 7px 10px;
+    background: var(--bg-bubble);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    font-size: 11.5px;
+    line-height: 1.45;
+    overflow: hidden;
+}
+
+.fcard:hover {
+    border-color: var(--text-dim);
+}
+
+.fcard-top {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex: none;
+}
+
+.fcard-kind {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 5px;
+    font-size: 10px;
+    line-height: 1.5;
+    flex: none;
+}
+
+.kind-input {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.kind-turn {
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+}
+
+.kind-context {
+    color: var(--cancel);
+    border-color: color-mix(in srgb, var(--cancel) 45%, transparent);
+}
+
+.fcard-context {
+    border-style: dashed;
+}
+
+.fcard-id {
+    color: var(--text-dim);
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 10.5px;
+}
+
+.fcard-running {
+    margin-left: auto;
+    color: var(--accent);
+    font-size: 10px;
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+.fcard-preview {
+    flex: 1;
+    min-height: 0;
+    color: var(--text-dim);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+}
+
+.fcard-bottom {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    color: var(--text-dim);
+    font-size: 10.5px;
+}
+
+.fcard-outcome {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.fcard-usage {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+}
+
+.fcard-ctx {
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+}
+
+.outcome-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.outcome-dot.outcome-completed {
+    background: var(--ok);
+}
+
+.outcome-dot.outcome-failed {
+    background: var(--err);
+}
+
+.outcome-dot.outcome-cancelled {
+    background: var(--warn);
+}
+
+.outcome-dot.outcome-interrupted {
+    background: var(--text-dim);
+}
+
+/* 当前 cursor tip：高亮光环 */
+.flow-node.tip .fcard {
+    border-color: var(--accent);
+    box-shadow:
+        0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent),
+        0 0 18px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* 选中：描边 */
+.flow-node.selected .fcard {
+    border-color: var(--accent);
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* 在飞 turn：虚线边框脉冲 */
+.flow-node.inflight .fcard {
+    border-style: dashed;
+    animation: inflight-border 1.4s ease-in-out infinite;
+}
+
+/* 草稿态的待定落点：虚线描边（发送后或换 cursor 时消失） */
+.flow-node.pending .fcard {
+    outline: 2px dashed var(--warn);
+    outline-offset: 2px;
+}
+
+/* 用户自己的输入节点（非 spawn 产物）：accent 左侧条强调 */
+.flow-node.user-authored .fcard {
+    border-left: 3px solid var(--accent);
+}
+
+/* spawn 组折叠徽章（turn 卡片顶行右侧） */
+.spawn-toggle {
+    margin-left: auto;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 9.5px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+
+.spawn-toggle:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+/* 详情面板里的节点跳转链接 */
+.detail-link {
+    padding: 0 4px;
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: inherit;
+    cursor: pointer;
+    text-align: left;
+}
+
+.detail-link:hover {
+    text-decoration: underline;
+}
+
+@keyframes inflight-border {
+    0%,
+    100% {
+        border-color: var(--accent);
+    }
+    50% {
+        border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    }
+}
+
+/* ---- detail panel ---- */
+
+.detail-panel {
+    flex: none;
+    width: 380px;
+    border-left: 1px solid var(--border);
+    background: var(--bg-panel);
+    padding: 14px 16px 12px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* 中间内容区滚动；头部与底部输入框固定 */
+.detail-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.detail-header {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.detail-title {
+    font-weight: 700;
+    flex: 1;
+}
+
+.detail-meta {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 14px;
+    margin: 0 0 10px;
+    font-size: 12.5px;
+}
+
+.detail-meta dt {
+    color: var(--text-dim);
+}
+
+.detail-meta dd {
+    margin: 0;
+    word-break: break-all;
+}
+
+.detail-preview {
+    border-left: 2px solid var(--border);
+    padding-left: 10px;
+    color: var(--text-dim);
+    font-size: 12.5px;
+    margin-bottom: 10px;
+    white-space: pre-wrap;
+}
+
+.detail-loading {
+    color: var(--text-dim);
+}
+
+.detail-body {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 10px;
+}
+
+.step-usage {
+    color: var(--text-dim);
+    font-size: 11.5px;
+    margin: 2px 0 6px;
+}
+
+.tool-section-label {
+    color: var(--text-dim);
+    font-size: 11px;
+    margin: 8px 0 2px;
+}
+
+.detail-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.detail-actions button {
+    padding: 6px 16px;
+}
+
+.detail-actions button:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* 详情面板底部的「从这里继续」输入框（固定不滚动） */
+.detail-compose {
+    margin-top: 12px;
+    flex: none;
+}
+
+.detail-compose .input-box {
+    width: 100%;
+    min-height: 38px;
+    max-height: 120px;
+    resize: vertical;
+}
+
+.detail-compose-hint {
+    color: var(--text-dim);
+    font-size: 12px;
+    margin: 0;
+}
+
+/* ---- markdown (assistant bubbles) ---- */
+
+.markdown {
+    white-space: normal;
+}
+
+.markdown > :first-child {
+    margin-top: 0;
+}
+
+.markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+    margin: 0.9em 0 0.4em;
+    line-height: 1.3;
+}
+
+.markdown h1 {
+    font-size: 1.3em;
+}
+
+.markdown h2 {
+    font-size: 1.2em;
+}
+
+.markdown h3 {
+    font-size: 1.1em;
+}
+
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+    font-size: 1em;
+}
+
+.markdown p {
+    margin: 0.5em 0;
+}
+
+.markdown ul,
+.markdown ol {
+    margin: 0.4em 0;
+    padding-left: 1.5em;
+}
+
+.markdown li {
+    margin: 0.15em 0;
+}
+
+.markdown code {
+    background: var(--bg-input);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+}
+
+.markdown pre {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    overflow-x: auto;
+    margin: 0.5em 0;
+    white-space: pre;
+}
+
+.markdown pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+}
+
+.markdown blockquote {
+    border-left: 3px solid var(--border);
+    margin: 0.5em 0;
+    padding-left: 12px;
+    color: var(--text-dim);
+}
+
+.markdown a {
+    color: var(--accent);
+}
+
+.markdown hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 0.8em 0;
+}
+
+.markdown table {
+    border-collapse: collapse;
+    margin: 0.5em 0;
+}
+
+.markdown th,
+.markdown td {
+    border: 1px solid var(--border);
+    padding: 3px 10px;
+}
+
+.markdown th {
+    background: var(--bg-input);
+}
