@@ -87,7 +87,11 @@ fn default_port() -> u16 {
 /// Resolve a config value using pi-style rules:
 /// - starts with "!": execute the rest as a shell command, stdout is the
 ///   value (cached for the process lifetime)
-/// - otherwise: try as an environment variable name, then treat as literal
+/// - starts with "$": explicit environment variable reference (error if
+///   unset — an explicit reference that resolves to nothing is a config
+///   mistake, not a literal)
+/// - otherwise (pi semantics): try as an environment variable name, then
+///   treat as literal
 pub fn resolve_value(value: &str) -> Result<String> {
     if let Some(command) = value.strip_prefix('!') {
         {
@@ -112,6 +116,10 @@ pub fn resolve_value(value: &str) -> Result<String> {
             .unwrap()
             .insert(command.to_string(), stdout.clone());
         Ok(stdout)
+    } else if let Some(var) = value.strip_prefix('$') {
+        std::env::var(var).map_err(|_| {
+            Error::Config(format!("environment variable {var:?} referenced by {value:?} is not set"))
+        })
     } else {
         Ok(std::env::var(value).unwrap_or_else(|_| value.to_string()))
     }
@@ -171,9 +179,11 @@ fn ensure_default_config(path: &std::path::Path) -> Result<()> {
 # Provider kind: "openai" = any OpenAI-compatible endpoint (default: LM
 # Studio local server); "deepseek" = DeepSeek API.
 kind = "openai"
-# API key supports three formats (LM Studio accepts any non-empty string):
+# API key supports these formats (LM Studio accepts any non-empty string):
 # 1. Literal: api_key = "lm-studio"
 # 2. Env var name: api_key = "DEEPSEEK_API_KEY"
+#    (explicit $ form also works: api_key = "$DEEPSEEK_API_KEY",
+#     which errors if the variable is unset)
 # 3. Shell command (pi-style ! prefix):
 #    api_key = "!echo $DEEPSEEK_API_KEY"
 #    api_key = "!security find-generic-password -s deepseek-api-key -w"
@@ -212,6 +222,18 @@ mod tests {
     fn resolves_env_var() {
         unsafe { std::env::set_var("RUA_TEST_KEY", "from-env") };
         assert_eq!(resolve_value("RUA_TEST_KEY").unwrap(), "from-env");
+    }
+
+    #[test]
+    fn resolves_dollar_env_var() {
+        unsafe { std::env::set_var("RUA_TEST_DOLLAR", "from-dollar") };
+        assert_eq!(resolve_value("$RUA_TEST_DOLLAR").unwrap(), "from-dollar");
+    }
+
+    #[test]
+    fn dollar_env_var_unset_is_an_error() {
+        unsafe { std::env::remove_var("RUA_TEST_MISSING") };
+        assert!(resolve_value("$RUA_TEST_MISSING").is_err());
     }
 
     #[test]

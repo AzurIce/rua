@@ -36,9 +36,12 @@ following order:
 
 2. **Environment variable name** — if the value does not start with `!`, rua
    first attempts to read it as an environment variable. If the variable is
-   unset, the value is treated as a literal string.
+   unset, the value is treated as a literal string. An explicit `$VAR` form
+   is also accepted and errors instead of falling back when the variable is
+   unset.
    ```toml
    api_key = "DEEPSEEK_API_KEY"
+   api_key = "$DEEPSEEK_API_KEY"
    ```
 
 3. **Literal string** — directly use the key text (not recommended for
