@@ -7,7 +7,7 @@ use futures::StreamExt;
 use gloo_net::websocket::{Message, futures::WebSocket};
 use gloo_timers::future::sleep;
 
-use crate::api::WS_URL;
+use crate::api::ws_url;
 use crate::state::{AppState, ConnState, handle_event, resync};
 use crate::types::WsEvent;
 
@@ -21,7 +21,7 @@ pub fn spawn_ws_loop(mut state: AppState) {
         let mut backoff = BACKOFF_START_MS;
         loop {
             state.conn.set(ConnState::Connecting);
-            match WebSocket::open(WS_URL) {
+            match WebSocket::open(&ws_url()) {
                 Ok(ws) => {
                     state.conn.set(ConnState::Connected);
                     backoff = BACKOFF_START_MS;

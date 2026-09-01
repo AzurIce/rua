@@ -90,7 +90,7 @@ impl TurnSpawner for ServerSpawner {
                     parent: Some(input_id),
                     context_refs: vec![],
                     actor,
-                    model: state.model.clone(),
+                    model: state.default_model.clone(),
                     history,
                     system_prompt: Some(state.system_prompt.clone()),
                     depth,

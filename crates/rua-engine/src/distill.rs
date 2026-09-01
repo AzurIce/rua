@@ -12,11 +12,13 @@ const DISTILL_INSTRUCTION: &str = "Distill the following material into a concise
     redundancy. Reply with the summary text only.";
 
 impl Engine {
-    /// One-shot summarize: material in, summary body text out.
-    pub async fn summarize(&self, material: &str) -> Result<String> {
+    /// One-shot summarize: material in, summary body text out. `model_ref`
+    /// 与 turn 同一套规则（`"provider/model"` 或裸名 = 默认 provider）。
+    pub async fn summarize(&self, model_ref: &str, material: &str) -> Result<String> {
+        let (model, additional_params) = self.model_for(model_ref)?;
         let prompt = format!("{DISTILL_INSTRUCTION}\n\n<material>\n{material}\n</material>");
-        let mut builder = self.model.completion_request(Message::user(prompt));
-        if let Some(additional_params) = &self.additional_params {
+        let mut builder = model.completion_request(Message::user(prompt));
+        if let Some(additional_params) = &additional_params {
             builder = builder.additional_params(additional_params.clone());
         }
         let response = builder.send().await?;

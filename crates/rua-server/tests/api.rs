@@ -77,6 +77,7 @@ impl AgentEngine for MockEngine {
 
     fn summarize<'a>(
         &'a self,
+        _model_ref: &'a str,
         _material: &'a str,
     ) -> Pin<Box<dyn Future<Output = rua_engine::Result<String>> + Send + 'a>> {
         Box::pin(async { Ok("distilled summary".to_string()) })
@@ -106,7 +107,10 @@ async fn spawn_server() -> TestServer {
         "mock-model".into(),
         graphs_root,
         "default".into(),
-        rua_core::config::ProviderConfig::default(),
+        vec![(
+            rua_core::config::DEFAULT_PROVIDER.to_string(),
+            rua_core::config::ProviderConfig::default(),
+        )],
     ));
     let app = rua_server::build_router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -530,7 +534,10 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
         "mock-model".into(),
         graphs_root,
         "default".into(),
-        rua_core::config::ProviderConfig::default(),
+        vec![(
+            rua_core::config::DEFAULT_PROVIDER.to_string(),
+            rua_core::config::ProviderConfig::default(),
+        )],
     ));
     let spawner = ServerSpawner::new(state.clone());
 
@@ -862,4 +869,75 @@ async fn clone_subgraph_across_graphs() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// GET /api/models：聚合多个 provider 的模型列表，id 为 model ref（默认
+/// provider 裸名、具名 provider "name/model"）；不可达的 provider 回退到
+/// 它配置的默认模型。
+#[tokio::test]
+async fn models_aggregates_providers_with_model_refs() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // 可达的默认 provider：/models 返回两个模型。
+    let provider = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "m-a"}, {"id": "m-b"}]
+        })))
+        .mount(&provider)
+        .await;
+
+    let mk = |base_url: String, model: &str| rua_core::config::ProviderConfig {
+        kind: "openai".into(),
+        api_key: "k".into(),
+        base_url,
+        model: model.into(),
+        additional_params: Default::default(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let graphs_root = dir.path().join("graphs");
+    let graph = Graph::open(graphs_root.join("default")).unwrap();
+    let engine = Arc::new(MockEngine {
+        release: Arc::new(Notify::new()),
+        park: false,
+    });
+    let state = Arc::new(AppState::new(
+        graph,
+        engine,
+        "m-a".into(),
+        graphs_root,
+        "default".into(),
+        vec![
+            (
+                rua_core::config::DEFAULT_PROVIDER.to_string(),
+                mk(provider.uri(), "m-a"),
+            ),
+            // 不可达 provider（连接拒绝，快速失败）：回退到配置模型。
+            ("dead".to_string(), mk("http://127.0.0.1:1".into(), "fallback-model")),
+        ],
+    ));
+    let app = rua_server::build_router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let resp: Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = resp["models"].as_array().unwrap();
+    // 默认 provider：裸 id。
+    assert!(models.iter().any(|e| e["id"] == "m-a" && e["provider"] == "default" && e["model"] == "m-a"));
+    assert!(models.iter().any(|e| e["id"] == "m-b" && e["provider"] == "default"));
+    // 不可达 provider：回退模型，id 带 provider 前缀。
+    assert!(models.iter().any(
+        |e| e["id"] == "dead/fallback-model" && e["provider"] == "dead" && e["model"] == "fallback-model"
+    ));
+    assert_eq!(resp["default"], "m-a");
 }

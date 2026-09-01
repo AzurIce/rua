@@ -23,6 +23,7 @@ pub trait AgentEngine: Send + Sync {
 
     fn summarize<'a>(
         &'a self,
+        model_ref: &'a str,
         material: &'a str,
     ) -> Pin<Box<dyn Future<Output = rua_engine::Result<String>> + Send + 'a>>;
 }
@@ -39,8 +40,9 @@ impl AgentEngine for Engine {
 
     fn summarize<'a>(
         &'a self,
+        model_ref: &'a str,
         material: &'a str,
     ) -> Pin<Box<dyn Future<Output = rua_engine::Result<String>> + Send + 'a>> {
-        Box::pin(Engine::summarize(self, material))
+        Box::pin(Engine::summarize(self, model_ref, material))
     }
 }

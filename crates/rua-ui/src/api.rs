@@ -1,12 +1,24 @@
-//! REST client for the rua-server contract (base `http://127.0.0.1:3080`).
+//! REST client for the rua-server contract. API/WS 都走页面同源（daemon
+//! 同时 serve UI 与 API），不再硬编码端口——任何端口起 daemon 都能用。
 
 use gloo_net::http::{Request, Response};
 use serde::Serialize;
 
 use crate::types::*;
 
-pub const API_BASE: &str = "http://127.0.0.1:3080";
-pub const WS_URL: &str = "ws://127.0.0.1:3080/api/ws";
+fn origin() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_else(|| "http://127.0.0.1:3080".to_string())
+}
+
+pub fn api_base() -> String {
+    origin()
+}
+
+pub fn ws_url() -> String {
+    format!("{}/api/ws", origin().replacen("http", "ws", 1))
+}
 
 async fn unwrap<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T, String> {
     if resp.ok() {
@@ -30,7 +42,7 @@ async fn status_error(resp: Response) -> String {
 }
 
 pub async fn get_graph() -> Result<GraphResponse, String> {
-    let resp = Request::get(&format!("{API_BASE}/api/graph"))
+    let resp = Request::get(&format!("{}/api/graph", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -38,7 +50,7 @@ pub async fn get_graph() -> Result<GraphResponse, String> {
 }
 
 pub async fn get_cursors() -> Result<Vec<Cursor>, String> {
-    let resp = Request::get(&format!("{API_BASE}/api/cursors"))
+    let resp = Request::get(&format!("{}/api/cursors", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -46,7 +58,7 @@ pub async fn get_cursors() -> Result<Vec<Cursor>, String> {
 }
 
 pub async fn get_chain(cursor_id: &str) -> Result<Vec<Node>, String> {
-    let resp = Request::get(&format!("{API_BASE}/api/cursors/{cursor_id}/chain"))
+    let resp = Request::get(&format!("{}/api/cursors/{cursor_id}/chain", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -54,7 +66,7 @@ pub async fn get_chain(cursor_id: &str) -> Result<Vec<Node>, String> {
 }
 
 pub async fn get_node(id: &str) -> Result<Node, String> {
-    let resp = Request::get(&format!("{API_BASE}/api/nodes/{id}"))
+    let resp = Request::get(&format!("{}/api/nodes/{id}", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -75,7 +87,7 @@ pub async fn send_input(
         #[serde(skip_serializing_if = "Option::is_none")]
         tools: Option<&'a [String]>,
     }
-    let resp = Request::post(&format!("{API_BASE}/api/cursors/{cursor_id}/input"))
+    let resp = Request::post(&format!("{}/api/cursors/{cursor_id}/input", api_base()))
         .json(&InputBody { text, model, tools })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
@@ -112,7 +124,7 @@ pub async fn post_root_input(
         model,
         tools,
     };
-    let resp = Request::post(&format!("{API_BASE}/api/inputs"))
+    let resp = Request::post(&format!("{}/api/inputs", api_base()))
         .json(&body)
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
@@ -122,7 +134,7 @@ pub async fn post_root_input(
 }
 
 pub async fn get_models() -> Result<ModelsResponse, String> {
-    let resp = Request::get(&format!("{API_BASE}/api/models"))
+    let resp = Request::get(&format!("{}/api/models", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -134,7 +146,7 @@ pub async fn move_cursor(cursor_id: &str, node_id: &str) -> Result<Cursor, Strin
     struct MoveBody<'a> {
         node_id: &'a str,
     }
-    let resp = Request::post(&format!("{API_BASE}/api/cursors/{cursor_id}/move"))
+    let resp = Request::post(&format!("{}/api/cursors/{cursor_id}/move", api_base()))
         .json(&MoveBody { node_id })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
@@ -150,7 +162,7 @@ pub async fn move_cursor(cursor_id: &str, node_id: &str) -> Result<Cursor, Strin
 }
 
 pub async fn detach_cursor(cursor_id: &str) -> Result<Cursor, String> {
-    let resp = Request::post(&format!("{API_BASE}/api/cursors/{cursor_id}/detach"))
+    let resp = Request::post(&format!("{}/api/cursors/{cursor_id}/detach", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -161,7 +173,7 @@ pub async fn detach_cursor(cursor_id: &str) -> Result<Cursor, String> {
 }
 
 pub async fn cancel_turn(cursor_id: &str) -> Result<(), String> {
-    let resp = Request::post(&format!("{API_BASE}/api/cursors/{cursor_id}/cancel"))
+    let resp = Request::post(&format!("{}/api/cursors/{cursor_id}/cancel", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -177,7 +189,7 @@ pub async fn cancel_turn(cursor_id: &str) -> Result<(), String> {
 // ---- graph management (user-side) ----
 
 pub async fn get_graphs() -> Result<GraphsResponse, String> {
-    let resp = Request::get(&format!("{API_BASE}/api/graphs"))
+    let resp = Request::get(&format!("{}/api/graphs", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -198,7 +210,7 @@ pub async fn create_graph(name: &str) -> Result<(), String> {
     struct Body<'a> {
         name: &'a str,
     }
-    let resp = Request::post(&format!("{API_BASE}/api/graphs"))
+    let resp = Request::post(&format!("{}/api/graphs", api_base()))
         .json(&Body { name })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
@@ -208,7 +220,7 @@ pub async fn create_graph(name: &str) -> Result<(), String> {
 }
 
 pub async fn activate_graph(name: &str) -> Result<(), String> {
-    let resp = Request::post(&format!("{API_BASE}/api/graphs/{name}/activate"))
+    let resp = Request::post(&format!("{}/api/graphs/{name}/activate", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -220,7 +232,7 @@ pub async fn rename_graph(from: &str, to: &str) -> Result<(), String> {
     struct Body<'a> {
         name: &'a str,
     }
-    let resp = Request::post(&format!("{API_BASE}/api/graphs/{from}/rename"))
+    let resp = Request::post(&format!("{}/api/graphs/{from}/rename", api_base()))
         .json(&Body { name: to })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
@@ -231,7 +243,7 @@ pub async fn rename_graph(from: &str, to: &str) -> Result<(), String> {
 
 /// 删除 = 服务端移入回收站（.rua/graphs/.trash/），可手工恢复。
 pub async fn delete_graph(name: &str) -> Result<(), String> {
-    let resp = Request::delete(&format!("{API_BASE}/api/graphs/{name}"))
+    let resp = Request::delete(&format!("{}/api/graphs/{name}", api_base()))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -244,7 +256,7 @@ pub async fn duplicate_graph(from: &str, to: &str) -> Result<(), String> {
     struct Body<'a> {
         name: &'a str,
     }
-    let resp = Request::post(&format!("{API_BASE}/api/graphs/{from}/duplicate"))
+    let resp = Request::post(&format!("{}/api/graphs/{from}/duplicate", api_base()))
         .json(&Body { name: to })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
@@ -261,7 +273,7 @@ pub async fn clone_subgraph(from_graph: &str, nodes: &[String]) -> Result<usize,
         from_graph: &'a str,
         nodes: &'a [String],
     }
-    let resp = Request::post(&format!("{API_BASE}/api/clone"))
+    let resp = Request::post(&format!("{}/api/clone", api_base()))
         .json(&Body { from_graph, nodes })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()

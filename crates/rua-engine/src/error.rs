@@ -5,6 +5,9 @@ pub enum Error {
     #[error("unsupported provider kind: {0}")]
     UnsupportedProvider(String),
 
+    #[error("unknown provider in model ref: {0}")]
+    UnknownProvider(String),
+
     #[error("http client error: {0}")]
     HttpClient(#[from] rig_core::http_client::Error),
 

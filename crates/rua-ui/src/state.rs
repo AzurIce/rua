@@ -122,8 +122,8 @@ pub struct AppState {
     /// from it. Cleared on send or when switching to another cursor.
     pub pending_attach: Signal<Option<String>>,
     /// 可用模型列表（GET /api/models）与本次发送的模型覆盖
-    ///（None = daemon 默认模型）。
-    pub models: Signal<Vec<String>>,
+    ///（None = daemon 默认模型；覆盖值是 model ref）。
+    pub models: Signal<Vec<crate::types::ModelEntry>>,
     pub default_model: Signal<String>,
     pub selected_model: Signal<Option<String>>,
     /// 被关掉的工具（默认全开 = 发 None）。关任意一个会改变请求前缀 →
@@ -229,7 +229,7 @@ pub async fn bootstrap(mut state: AppState) {
             state.current_graph.set(g.current);
         }
         Err(e) => {
-            state.set_error(format!("无法连接 rua-server ({}): {e}", api::API_BASE));
+            state.set_error(format!("无法连接 rua-server ({}): {e}", api::api_base()));
             return;
         }
     }
@@ -250,7 +250,7 @@ pub async fn bootstrap(mut state: AppState) {
             state.cursors.set(cursors);
         }
         Err(e) => {
-            state.set_error(format!("无法连接 rua-server ({}): {e}", api::API_BASE));
+            state.set_error(format!("无法连接 rua-server ({}): {e}", api::api_base()));
             return;
         }
     }

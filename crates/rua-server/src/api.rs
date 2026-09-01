@@ -223,7 +223,7 @@ async fn post_input(
     });
     let handle = graph.begin_turn(cursor_id)?;
     let history = graph.assemble_chain(input_id)?;
-    let model = body.model.clone().unwrap_or_else(|| state.model.clone());
+    let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
 
     let cancel = CancellationToken::new();
@@ -322,7 +322,7 @@ async fn post_root_input(
     let handle = graph.begin_turn(cursor.id)?;
     let history = graph.assemble_chain(input_id)?;
     let cursor_id = cursor.id;
-    let model = body.model.clone().unwrap_or_else(|| state.model.clone());
+    let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
 
     let cancel = CancellationToken::new();
@@ -484,7 +484,7 @@ async fn post_summarize(
 
     let summary = state
         .engine
-        .summarize(&material)
+        .summarize(&state.default_model, &material)
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("summarize failed: {e}")))?;
 
@@ -497,7 +497,7 @@ async fn post_summarize(
         kind: NodeKind::Context {
             body: summary,
             created_by: body.sources[0],
-            model: state.model.clone(),
+            model: state.default_model.clone(),
         },
     };
     let node_id = node.id;
@@ -511,33 +511,65 @@ async fn post_summarize(
 
 // ---- models ----
 
-/// Proxy the provider's model list (OpenAI-compatible `GET {base_url}/models`).
-/// Falls back to just the configured default model when the endpoint is
-/// unreachable or answers in a foreign shape.
+/// Aggregate every registered provider's model list (OpenAI-compatible
+/// `GET {base_url}/models` per provider, fetched in parallel). Each provider
+/// falls back to its configured default model when unreachable.
 ///
-/// 带 2s 超时 + 60s 缓存：provider 不在时（比如 LM Studio 没开）代理请求
-/// 会挂到连接超时，UI 每次刷新都调这个端点，不能每次都卡几秒。
+/// 每个 provider 独立 2s 超时 + 60s 缓存：provider 不在时（比如 oMLX 没开）
+/// 代理请求会挂到连接超时，UI 每次刷新都调这个端点，不能每次都卡几秒。
+/// 返回的条目带 model ref（默认 provider 用裸模型名，具名 provider 用
+/// `"provider/model"`），UI 直接把它作为发送时的模型覆盖值。
 async fn list_models(State(state): State<SharedState>) -> Json<Value> {
-    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
     const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-    let cached = state.models_cache.lock().await.clone();
-    if let Some((at, models)) = &cached
-        && at.elapsed() < CACHE_TTL
-    {
-        return Json(json!({ "models": models, "default": state.model }));
-    }
-
-    let url = format!("{}/models", state.provider.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .build()
         .unwrap_or_default();
-    let resp = client
-        .get(&url)
-        .bearer_auth(&state.provider.api_key)
-        .send()
-        .await;
+    let fetches: Vec<_> = state
+        .providers
+        .iter()
+        .map(|(name, cfg)| {
+            let client = client.clone();
+            let state = state.clone();
+            let name = name.clone();
+            let cfg = cfg.clone();
+            async move { (name.clone(), fetch_provider_models(&state, &client, &name, &cfg).await) }
+        })
+        .collect();
+    let mut models = Vec::new();
+    for (name, list) in futures::future::join_all(fetches).await {
+        for m in list {
+            let id = if name == rua_core::config::DEFAULT_PROVIDER {
+                m.clone()
+            } else {
+                format!("{name}/{m}")
+            };
+            models.push(json!({ "id": id, "provider": name, "model": m }));
+        }
+    }
+    Json(json!({ "models": models, "default": state.default_model }))
+}
+
+/// 单个 provider 的模型列表：60s 缓存 → 2s 超时拉取 → 失败回退陈旧缓存
+/// → 兜底为配置的默认模型。`cfg.model` 保证在列表里。
+async fn fetch_provider_models(
+    state: &SharedState,
+    client: &reqwest::Client,
+    name: &str,
+    cfg: &rua_core::config::ProviderConfig,
+) -> Vec<String> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let cached = state.models_cache.lock().await.get(name).cloned();
+    if let Some((at, models)) = &cached
+        && at.elapsed() < CACHE_TTL
+    {
+        return models.clone();
+    }
+
+    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let resp = client.get(&url).bearer_auth(&cfg.api_key).send().await;
     let fetched: Option<Vec<String>> = match resp {
         Ok(r) => r.json::<Value>().await.ok().and_then(|v| {
             v["data"].as_array().map(|arr| {
@@ -548,15 +580,18 @@ async fn list_models(State(state): State<SharedState>) -> Json<Value> {
         }),
         Err(_) => None,
     };
-    // 失败时回退：陈旧缓存 > 仅默认模型。
     let mut models = fetched
         .or_else(|| cached.map(|(_, m)| m))
         .unwrap_or_default();
-    if !models.contains(&state.model) {
-        models.insert(0, state.model.clone());
+    if !models.contains(&cfg.model) {
+        models.insert(0, cfg.model.clone());
     }
-    *state.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
-    Json(json!({ "models": models, "default": state.model }))
+    state
+        .models_cache
+        .lock()
+        .await
+        .insert(name.to_string(), (std::time::Instant::now(), models.clone()));
+    models
 }
 
 // ---- graphs (user-side management) ----

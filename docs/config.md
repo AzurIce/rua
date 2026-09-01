@@ -60,6 +60,28 @@ completion request. Example (DeepSeek thinking toggle):
 thinking = { type = "enabled" }
 ```
 
+## `[[providers]]` — multiple providers
+
+Additional named providers can be registered on top of the default
+`[provider]` section (which stays the default, internally named
+`"default"`):
+
+```toml
+[[providers]]
+name = "deepseek"            # unique; must not be "default" or contain "/"
+kind = "deepseek"
+api_key = "$DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"    # this provider's own default model
+```
+
+**Model refs.** Everywhere a model is selected (UI picker, per-send
+override), the value is a *model ref*: `"provider/model"` for named
+providers, or a bare model name for the default provider. The daemon's
+`GET /api/models` aggregates every provider's `GET {base_url}/models`
+(fetched in parallel, 2s timeout + 60s cache per provider, falling back to
+the provider's configured `model` when unreachable).
+
 ## `server` section
 
 | Key    | Default | Description                              |

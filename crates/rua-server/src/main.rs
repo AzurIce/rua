@@ -97,7 +97,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let graphs_root = rua_dir.join("graphs");
     let default_dir = graphs_root.join(rua_server::graphs::DEFAULT_GRAPH);
     let graph = Graph::open(&default_dir)?;
-    let engine = Engine::new(&config.provider, &opts.project_root)?;
+    let engine = Engine::new(&config.all_providers(), &opts.project_root)?;
     let engine = Arc::new(engine);
     let state = Arc::new(AppState::new(
         graph,
@@ -105,7 +105,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         config.provider.model.clone(),
         graphs_root,
         rua_server::graphs::DEFAULT_GRAPH.to_string(),
-        config.provider.clone(),
+        config.all_providers(),
     ));
     // 注入图生长工具的运行时后端（循环依赖：spawner 持有 state，
     // state 持有 engine——所以 late-bind）。

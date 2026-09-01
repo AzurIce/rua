@@ -92,6 +92,7 @@ impl Engine {
             let snapshot = request_snapshot(&history, system_prompt.as_deref());
             let call = self
                 .stream_call(
+                    &model,
                     &history,
                     system_prompt.as_deref(),
                     cursor_id,
@@ -195,9 +196,13 @@ impl Engine {
         })
     }
 
-    /// One streaming LLM call over the current history.
+    /// One streaming LLM call over the current history. `model_ref` is the
+    /// per-turn model override (`"provider/model"` or bare = default
+    /// provider); it is resolved per call so per-send overrides actually
+    /// take effect (and failures surface as a Failed turn, not a panic).
     async fn stream_call(
         &self,
+        model_ref: &str,
         history: &[CoreMessage],
         system_prompt: Option<&str>,
         cursor_id: CursorId,
@@ -207,6 +212,19 @@ impl Engine {
         send: &dyn Fn(TurnEvent),
         cancel: &CancellationToken,
     ) -> CallOutcome {
+        let (model, additional_params) = match self.model_for(model_ref) {
+            Ok(x) => x,
+            Err(e) => {
+                return CallOutcome {
+                    text: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    cancelled: false,
+                    error: Some(e.to_string()),
+                };
+            }
+        };
         let mut rig_history = history_to_rig(history);
         // The builder's `prompt` is appended as the last message; feed it the
         // tail and put everything before it into `.messages()`.
@@ -230,15 +248,14 @@ impl Engine {
                 tool_defs.push(crate::spawn::inspect_definition());
             }
         }
-        let mut builder = self
-            .model
+        let mut builder = model
             .completion_request(prompt)
             .messages(rig_history)
             .tools(tool_defs);
         if let Some(system_prompt) = system_prompt {
             builder = builder.preamble(system_prompt.to_string());
         }
-        if let Some(additional_params) = &self.additional_params {
+        if let Some(additional_params) = &additional_params {
             builder = builder.additional_params(additional_params.clone());
         }
 

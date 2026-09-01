@@ -245,7 +245,9 @@ fn InflightBubble(turn: Inflight) -> Element {
     }
 }
 
-/// 模型选择下拉（发送时覆盖；「默认」= daemon 配置模型）。
+/// 模型选择下拉（发送时覆盖；「默认」= daemon 配置模型）。多 provider：
+/// 条目按 provider 分组（optgroup），值是 model ref（默认 provider 组用
+/// 裸模型名，具名 provider 用 "provider/model"）。
 /// 注意：换模型/改工具列表都会改变请求前缀，前缀缓存会失效。
 #[component]
 pub(crate) fn ModelPicker() -> Element {
@@ -253,6 +255,15 @@ pub(crate) fn ModelPicker() -> Element {
     let models = state.models.read().clone();
     let selected = state.selected_model.read().clone();
     let default_model = state.default_model.read().clone();
+    // 按 provider 分组，保持返回顺序（server 保证默认 provider 在前）。
+    let mut groups: Vec<(String, Vec<ModelEntry>)> = Vec::new();
+    for e in &models {
+        if let Some(g) = groups.iter_mut().find(|(p, _)| p == &e.provider) {
+            g.1.push(e.clone());
+        } else {
+            groups.push((e.provider.clone(), vec![e.clone()]));
+        }
+    }
     rsx! {
         select {
             class: "model-select",
@@ -263,12 +274,17 @@ pub(crate) fn ModelPicker() -> Element {
                 state.selected_model.set(if v.is_empty() { None } else { Some(v) });
             },
             option { value: "", "模型: 默认 ({short_model(&default_model)})" }
-            for m in &models {
-                option {
-                    key: "{m}",
-                    value: "{m}",
-                    selected: selected.as_deref() == Some(m.as_str()),
-                    "{short_model(m)}"
+            for (provider, entries) in groups {
+                // rua-core 的 DEFAULT_PROVIDER = "default"（UI 不依赖 rua-core）。
+                optgroup { label: if provider == "default" { "默认 provider".to_string() } else { provider.clone() },
+                    for e in entries {
+                        option {
+                            key: "{e.id}",
+                            value: "{e.id}",
+                            selected: selected.as_deref() == Some(e.id.as_str()),
+                            "{e.model}"
+                        }
+                    }
                 }
             }
         }

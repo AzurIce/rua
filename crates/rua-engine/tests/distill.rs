@@ -13,7 +13,11 @@ fn engine_for(server: &MockServer) -> Engine {
         model: "deepseek-v4-pro".to_string(),
         additional_params: serde_json::Map::new(),
     };
-    Engine::new(&config, std::env::current_dir().unwrap()).unwrap()
+    Engine::new(
+        &[(rua_core::config::DEFAULT_PROVIDER.to_string(), config)],
+        std::env::current_dir().unwrap(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -50,6 +54,9 @@ async fn summarize_returns_body_text() {
         .await;
 
     let engine = engine_for(&server);
-    let body = engine.summarize("raw material here").await.unwrap();
+    let body = engine
+        .summarize("deepseek-v4-pro", "raw material here")
+        .await
+        .unwrap();
     assert_eq!(body, "- fact one\n- decision two");
 }

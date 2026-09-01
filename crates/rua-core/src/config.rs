@@ -20,8 +20,32 @@ fn cache() -> &'static Mutex<HashMap<String, String>> {
 pub struct Config {
     #[serde(default)]
     pub provider: ProviderConfig,
+    /// 额外注册的具名 provider（`[[providers]]`）。默认 provider 即上面的
+    /// `[provider]` 节，名为 `"default"`。
+    #[serde(default)]
+    pub providers: Vec<NamedProviderConfig>,
     #[serde(default)]
     pub server: ServerConfig,
+}
+
+/// `[[providers]]` 里的一项：名字 + 扁平展开的 provider 字段。
+#[derive(Debug, Deserialize, Clone)]
+pub struct NamedProviderConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub provider: ProviderConfig,
+}
+
+/// 默认 provider 的名字（model ref 中裸模型名解析到它）。
+pub const DEFAULT_PROVIDER: &str = "default";
+
+/// 模型引用：`"provider名/模型名"`；裸名（无 `/`）指默认 provider。
+/// 返回 (provider 名, 模型名)。
+pub fn parse_model_ref(model_ref: &str) -> (&str, &str) {
+    match model_ref.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => (p, m),
+        _ => (DEFAULT_PROVIDER, model_ref),
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -143,6 +167,7 @@ impl Config {
         struct RawConfig {
             provider: Option<ProviderConfig>,
             deepseek: Option<ProviderConfig>,
+            providers: Option<Vec<NamedProviderConfig>>,
             server: Option<ServerConfig>,
         }
         let raw: RawConfig = toml::from_str(&contents)
@@ -158,11 +183,44 @@ impl Config {
         };
         let mut config = Config {
             provider,
+            providers: raw.providers.unwrap_or_default(),
             server: raw.server.unwrap_or_default(),
         };
+        // 具名 provider 校验：名字非空、不得占用 "default"、不得重复。
+        let mut seen = std::collections::HashSet::new();
+        for p in &config.providers {
+            if p.name.is_empty() || p.name == DEFAULT_PROVIDER || p.name.contains('/') {
+                return Err(Error::Config(format!(
+                    "invalid provider name {:?} (empty, \"{DEFAULT_PROVIDER}\" and \"/\" are not allowed)",
+                    p.name
+                )));
+            }
+            if !seen.insert(p.name.clone()) {
+                return Err(Error::Config(format!(
+                    "duplicate provider name {:?}",
+                    p.name
+                )));
+            }
+        }
         config.provider.api_key = resolve_value(&config.provider.api_key)
             .map_err(|e| Error::Config(format!("failed to resolve provider.api_key: {e}")))?;
+        for p in &mut config.providers {
+            p.provider.api_key = resolve_value(&p.provider.api_key).map_err(|e| {
+                Error::Config(format!("failed to resolve api_key of provider {:?}: {e}", p.name))
+            })?;
+        }
         Ok(config)
+    }
+
+    /// 全部 provider：默认 provider 在前（名 `"default"`），后跟具名列表。
+    pub fn all_providers(&self) -> Vec<(String, ProviderConfig)> {
+        let mut out = vec![(DEFAULT_PROVIDER.to_string(), self.provider.clone())];
+        out.extend(
+            self.providers
+                .iter()
+                .map(|p| (p.name.clone(), p.provider.clone())),
+        );
+        out
     }
 
     pub fn resolved_api_key(&self) -> Result<String> {
@@ -193,6 +251,15 @@ model = "qwen3.8-27b-uncensored-mlx"
 # Provider-specific params passed through verbatim, e.g.:
 # [provider.additional_params]
 # thinking = { type = "enabled" }
+
+# Extra named providers (a model ref is then "name/model"; bare model names
+# resolve to the default [provider] above):
+# [[providers]]
+# name = "deepseek"
+# kind = "deepseek"
+# api_key = "$DEEPSEEK_API_KEY"
+# base_url = "https://api.deepseek.com"
+# model = "deepseek-v4-pro"
 
 [server]
 port = 3080
@@ -242,6 +309,75 @@ mod tests {
         assert_eq!(v, "hello-cache");
         // second call hits the cache (same value, no re-execution)
         assert_eq!(resolve_value("!echo hello-cache").unwrap(), "hello-cache");
+    }
+
+    #[test]
+    fn named_providers_are_parsed_and_resolved() {
+        unsafe { std::env::set_var("RUA_TEST_DS_KEY", "sk-ds-env") };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+kind = "openai"
+api_key = "lm-studio"
+base_url = "http://127.0.0.1:8000/v1"
+model = "local-model"
+
+[[providers]]
+name = "deepseek"
+kind = "deepseek"
+api_key = "$RUA_TEST_DS_KEY"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+
+[[providers]]
+name = "backup"
+kind = "openai"
+api_key = "sk-literal"
+base_url = "http://127.0.0.1:9999/v1"
+model = "small-model"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(path).unwrap();
+        let all = cfg.all_providers();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].0, DEFAULT_PROVIDER);
+        assert_eq!(all[0].1.model, "local-model");
+        assert_eq!(all[1].0, "deepseek");
+        assert_eq!(all[1].1.api_key, "sk-ds-env");
+        assert_eq!(all[1].1.kind, "deepseek");
+        assert_eq!(all[2].0, "backup");
+        assert_eq!(all[2].1.api_key, "sk-literal");
+    }
+
+    #[test]
+    fn duplicate_provider_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[[providers]]\nname = \"a\"\n[[providers]]\nname = \"a\"\n").unwrap();
+        assert!(Config::load_from(path).is_err());
+    }
+
+    #[test]
+    fn reserved_provider_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[[providers]]\nname = \"default\"\n").unwrap();
+        assert!(Config::load_from(path).is_err());
+    }
+
+    #[test]
+    fn model_ref_parsing() {
+        assert_eq!(
+            parse_model_ref("deepseek/deepseek-v4-pro"),
+            ("deepseek", "deepseek-v4-pro")
+        );
+        assert_eq!(parse_model_ref("local-model"), (DEFAULT_PROVIDER, "local-model"));
+        // 模型名本身含 / 时按第一个 / 切（provider/model/sub）
+        assert_eq!(parse_model_ref("p/a/b"), ("p", "a/b"));
     }
 
     #[test]

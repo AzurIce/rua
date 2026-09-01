@@ -3,7 +3,7 @@
 会话图模型的 agent（daemon + Dioxus Web UI）。Workspace 四 crate：
 
 - `crates/rua-core` — 图引擎（纯库，不依赖 rig/axum/tokio）：不可变节点（Input/Turn/Context）、cursor 注册表、journal 事件溯源、装配纯函数
-- `crates/rua-engine` — agent loop：rig-core 0.42（OpenAI-compatible / DeepSeek）、工具（bash，行为对齐 pi：尾部截断 2000 行/50KB + 全文落盘、`exec 2>&1` 交错、无默认超时、进程组击杀；spawn_turn/inspect 图生长工具经 `TurnSpawner` trait 注入）、`run_turn(...) -> Node`
+- `crates/rua-engine` — agent loop：rig-core 0.42（OpenAI-compatible / DeepSeek；多 provider 经 `[[providers]]` 具名注册，model ref = `"provider/model"`，裸名走默认 provider）、工具（bash，行为对齐 pi：尾部截断 2000 行/50KB + 全文落盘、`exec 2>&1` 交错、无默认超时、进程组击杀；spawn_turn/inspect 图生长工具经 `TurnSpawner` trait 注入）、`run_turn(...) -> Node`
 - `crates/rua-server` — daemon（二进制 `rua`）：独占图 + 运行时，REST/WS API，只绑 127.0.0.1；`ServerSpawner` 实现 spawn_turn/inspect（spawn 复用 `/api/inputs` 原子路径，递归上限 4）
 - `crates/rua-ui` — Dioxus 0.7 web UI：聊天视图（markdown 渲染）+ 图视图（基于 `../dioxus-flow` 画布库）
 

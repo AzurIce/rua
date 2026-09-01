@@ -173,11 +173,20 @@ pub struct GraphsResponse {
     pub current: String,
 }
 
-/// Response of `GET /api/models`: provider model list + daemon default.
+/// Response of `GET /api/models`: per-provider model list + daemon default.
+/// `id` 是 model ref（默认 provider 为裸模型名，具名 provider 为
+/// `"provider/model"`），直接作为发送时的模型覆盖值。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelsResponse {
-    pub models: Vec<String>,
+    pub models: Vec<ModelEntry>,
     pub default: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelEntry {
+    pub id: String,
+    pub provider: String,
+    pub model: String,
 }
 
 /// Flat WS event stream: every message carries an `event` tag.

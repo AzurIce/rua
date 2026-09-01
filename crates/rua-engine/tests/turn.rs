@@ -91,7 +91,11 @@ fn engine_for(server: &MockServer) -> Engine {
         model: "deepseek-v4-pro".to_string(),
         additional_params: serde_json::Map::new(),
     };
-    Engine::new(&config, std::env::current_dir().unwrap()).unwrap()
+    Engine::new(
+        &[(rua_core::config::DEFAULT_PROVIDER.to_string(), config)],
+        std::env::current_dir().unwrap(),
+    )
+    .unwrap()
 }
 
 fn params(history: Vec<CoreMessage>) -> TurnParams {
@@ -107,6 +111,35 @@ fn params(history: Vec<CoreMessage>) -> TurnParams {
         depth: 0,
         tools: None,
     }
+}
+
+#[tokio::test]
+async fn model_override_reaches_the_request() {
+    // 覆盖的模型名必须真的出现在请求体里（曾经只记录进节点、请求仍走
+    // 默认模型的 bug 的回归测试）。
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"model\":\"other-model\""))
+        .respond_with(sse_response(sse(&[
+            text_chunk("ok"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.model = "other-model".to_string();
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+    let NodeKind::Turn { outcome, model, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Completed);
+    assert_eq!(model, "other-model");
 }
 
 #[tokio::test]

@@ -42,12 +42,15 @@ pub struct AppState {
     pub events: broadcast::Sender<String>,
     /// Cancellation token per in-flight turn, keyed by cursor.
     pub cancels: Mutex<HashMap<CursorId, CancellationToken>>,
-    pub model: String,
-    /// 完整 provider 配置（/api/models 代理要用 base_url/api_key）。
-    pub provider: rua_core::config::ProviderConfig,
-    /// /api/models 的缓存：provider 不可达时代理请求会挂到超时（数秒），
-    /// UI 每次刷新都调这个端点，不能每次都等。
-    pub models_cache: Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// 默认模型（默认 provider 的裸模型名；model ref 规则见
+    /// `rua_core::config::parse_model_ref`）。
+    pub default_model: String,
+    /// 全部 provider（默认在前，名为 "default"）：/api/models 聚合代理和
+    /// Engine 的 model ref 解析都要用。
+    pub providers: Vec<(String, rua_core::config::ProviderConfig)>,
+    /// /api/models 按 provider 的缓存：provider 不可达时代理请求会挂到
+    /// 超时（数秒），UI 每次刷新都调这个端点，不能每次都等。
+    pub models_cache: Mutex<HashMap<String, (std::time::Instant, Vec<String>)>>,
     pub system_prompt: String,
 }
 
@@ -57,10 +60,10 @@ impl AppState {
     pub fn new(
         graph: Graph,
         engine: Arc<dyn AgentEngine>,
-        model: String,
+        default_model: String,
         graphs_root: std::path::PathBuf,
         current_graph: String,
-        provider: rua_core::config::ProviderConfig,
+        providers: Vec<(String, rua_core::config::ProviderConfig)>,
     ) -> Self {
         Self {
             graph: Mutex::new(graph),
@@ -69,9 +72,9 @@ impl AppState {
             engine,
             events: broadcast::channel(EVENT_BUS_CAPACITY).0,
             cancels: Mutex::new(HashMap::new()),
-            model,
-            provider,
-            models_cache: Mutex::new(None),
+            default_model,
+            providers,
+            models_cache: Mutex::new(HashMap::new()),
             system_prompt: SYSTEM_PROMPT.to_string(),
         }
     }

@@ -4847,6 +4847,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tower-http",
+ "wiremock",
 ]
 
 [[package]]
