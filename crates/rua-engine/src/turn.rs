@@ -41,6 +41,9 @@ pub struct TurnParams {
     /// spawn_turn 递归深度（0 = 用户发起）。达到 MAX_SPAWN_DEPTH 后不再
     /// 注册 spawn_turn/inspect 工具。
     pub depth: usize,
+    /// 本次发送的工具列表覆盖（None = 全部可用工具）。改工具列表会改变
+    /// 请求前缀 → 前缀缓存失效（开发测试时这正是目的）。
+    pub tools: Option<Vec<String>>,
 }
 
 /// What one streamed LLM call produced.
@@ -70,6 +73,7 @@ impl Engine {
             mut history,
             system_prompt,
             depth,
+            tools,
         } = params;
         if history.is_empty() {
             return Err(Error::EmptyHistory);
@@ -87,7 +91,16 @@ impl Engine {
         let outcome = loop {
             let snapshot = request_snapshot(&history, system_prompt.as_deref());
             let call = self
-                .stream_call(&history, system_prompt.as_deref(), cursor_id, node_id, depth, &send, &cancel)
+                .stream_call(
+                    &history,
+                    system_prompt.as_deref(),
+                    cursor_id,
+                    node_id,
+                    depth,
+                    tools.as_deref(),
+                    &send,
+                    &cancel,
+                )
                 .await;
 
             usage.add_assign(&call.usage);
@@ -190,6 +203,7 @@ impl Engine {
         cursor_id: CursorId,
         node_id: NodeId,
         depth: usize,
+        tools_override: Option<&[String]>,
         send: &dyn Fn(TurnEvent),
         cancel: &CancellationToken,
     ) -> CallOutcome {
@@ -198,11 +212,23 @@ impl Engine {
         // tail and put everything before it into `.messages()`.
         let prompt = rig_history.pop().expect("history checked non-empty");
 
-        let mut tool_defs = vec![BashTool::definition()];
-        // 图生长工具：有 spawner 且未达递归上限才注册。
+        // 可用工具全集 → 应用本次发送的工具覆盖（Some = 只保留列表里的）。
+        let allowed = |name: &str| match tools_override {
+            None => true,
+            Some(list) => list.iter().any(|t| t == name),
+        };
+        let mut tool_defs = Vec::new();
+        if allowed("bash") {
+            tool_defs.push(BashTool::definition());
+        }
+        // 图生长工具：有 spawner、未达递归上限、且未被工具覆盖关掉才注册。
         if self.spawner.get().is_some() && depth < crate::spawn::MAX_SPAWN_DEPTH {
-            tool_defs.push(crate::spawn::spawn_turn_definition(depth));
-            tool_defs.push(crate::spawn::inspect_definition());
+            if allowed("spawn_turn") {
+                tool_defs.push(crate::spawn::spawn_turn_definition(depth));
+            }
+            if allowed("inspect") {
+                tool_defs.push(crate::spawn::inspect_definition());
+            }
         }
         let mut builder = self
             .model

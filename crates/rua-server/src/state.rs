@@ -43,6 +43,11 @@ pub struct AppState {
     /// Cancellation token per in-flight turn, keyed by cursor.
     pub cancels: Mutex<HashMap<CursorId, CancellationToken>>,
     pub model: String,
+    /// 完整 provider 配置（/api/models 代理要用 base_url/api_key）。
+    pub provider: rua_core::config::ProviderConfig,
+    /// /api/models 的缓存：provider 不可达时代理请求会挂到超时（数秒），
+    /// UI 每次刷新都调这个端点，不能每次都等。
+    pub models_cache: Mutex<Option<(std::time::Instant, Vec<String>)>>,
     pub system_prompt: String,
 }
 
@@ -55,6 +60,7 @@ impl AppState {
         model: String,
         graphs_root: std::path::PathBuf,
         current_graph: String,
+        provider: rua_core::config::ProviderConfig,
     ) -> Self {
         Self {
             graph: Mutex::new(graph),
@@ -64,6 +70,8 @@ impl AppState {
             events: broadcast::channel(EVENT_BUS_CAPACITY).0,
             cancels: Mutex::new(HashMap::new()),
             model,
+            provider,
+            models_cache: Mutex::new(None),
             system_prompt: SYSTEM_PROMPT.to_string(),
         }
     }

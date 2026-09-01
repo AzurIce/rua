@@ -61,13 +61,22 @@ pub async fn get_node(id: &str) -> Result<Node, String> {
     unwrap(resp).await
 }
 
-pub async fn send_input(cursor_id: &str, text: &str) -> Result<InputResponse, String> {
+pub async fn send_input(
+    cursor_id: &str,
+    text: &str,
+    model: Option<&str>,
+    tools: Option<&[String]>,
+) -> Result<InputResponse, String> {
     #[derive(Serialize)]
     struct InputBody<'a> {
         text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<&'a [String]>,
     }
     let resp = Request::post(&format!("{API_BASE}/api/cursors/{cursor_id}/input"))
-        .json(&InputBody { text })
+        .json(&InputBody { text, model, tools })
         .map_err(|e| format!("序列化失败: {e}"))?
         .send()
         .await
@@ -84,20 +93,36 @@ pub async fn send_input(cursor_id: &str, text: &str) -> Result<InputResponse, St
 pub async fn post_root_input(
     text: &str,
     parent: Option<String>,
+    model: Option<&str>,
+    tools: Option<&[String]>,
 ) -> Result<RootInputResponse, String> {
     #[derive(Serialize)]
     struct RootInputBody<'a> {
         text: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<&'a [String]>,
     }
     let body = RootInputBody {
         text,
         parent: parent.as_deref(),
+        model,
+        tools,
     };
     let resp = Request::post(&format!("{API_BASE}/api/inputs"))
         .json(&body)
         .map_err(|e| format!("序列化失败: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
+    unwrap(resp).await
+}
+
+pub async fn get_models() -> Result<ModelsResponse, String> {
+    let resp = Request::get(&format!("{API_BASE}/api/models"))
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
@@ -211,4 +236,37 @@ pub async fn delete_graph(name: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("网络错误: {e}"))?;
     unit_ok(resp, "删除图").await
+}
+
+/// 复制当前图为一个新图（深拷贝，不切换）。
+pub async fn duplicate_graph(from: &str, to: &str) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        name: &'a str,
+    }
+    let resp = Request::post(&format!("{API_BASE}/api/graphs/{from}/duplicate"))
+        .json(&Body { name: to })
+        .map_err(|e| format!("序列化失败: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
+    unit_ok(resp, "复制图").await
+}
+
+/// `POST /api/clone`：把 from_graph 里选中的节点（含后继子树与引用的
+/// 材料）以新 id 克隆进当前活跃图。返回克隆的节点数。
+pub async fn clone_subgraph(from_graph: &str, nodes: &[String]) -> Result<usize, String> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        from_graph: &'a str,
+        nodes: &'a [String],
+    }
+    let resp = Request::post(&format!("{API_BASE}/api/clone"))
+        .json(&Body { from_graph, nodes })
+        .map_err(|e| format!("序列化失败: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
+    let v: serde_json::Value = unwrap(resp).await?;
+    Ok(v["cloned"].as_u64().unwrap_or(0) as usize)
 }

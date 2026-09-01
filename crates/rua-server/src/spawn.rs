@@ -94,6 +94,8 @@ impl TurnSpawner for ServerSpawner {
                     history,
                     system_prompt: Some(state.system_prompt.clone()),
                     depth,
+                    // 子会话默认全工具（由深度门控）；不带用户侧覆盖。
+                    tools: None,
                 },
                 cancel,
             );

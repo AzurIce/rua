@@ -172,6 +172,37 @@ pub async fn rename_graph(state: &SharedState, from: &str, to: &str) -> Result<(
     Ok(())
 }
 
+/// Duplicate a graph: recursive directory copy (nodes are immutable files,
+/// so a plain copy is a perfect clone). Does not switch the active graph.
+pub fn duplicate_graph(state: &SharedState, from: &str, to: &str) -> Result<()> {
+    let from = validate_name(from)?;
+    let to = validate_name(to)?;
+    let src = graph_dir(&state.graphs_root, from);
+    let dst = graph_dir(&state.graphs_root, to);
+    if !src.is_dir() {
+        return Err(GraphOpError::NotFound(from.to_string()));
+    }
+    if dst.exists() {
+        return Err(GraphOpError::AlreadyExists(to.to_string()));
+    }
+    copy_dir(&src, &dst)?;
+    Ok(())
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(GraphOpError::Io)?;
+    for entry in std::fs::read_dir(src).map_err(GraphOpError::Io)? {
+        let entry = entry.map_err(GraphOpError::Io)?;
+        let target = dst.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target).map_err(GraphOpError::Io)?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn delete_graph(state: &SharedState, name: &str) -> Result<()> {
     let name = validate_name(name)?;
     let dir = graph_dir(&state.graphs_root, name);
@@ -201,4 +232,86 @@ pub async fn delete_graph(state: &SharedState, name: &str) -> Result<()> {
         swap_active(state, &next, graph).await;
     }
     Ok(())
+}
+
+/// 跨图克隆子树：把 `from_graph` 里选中的节点（含其后继子树、以及它们
+/// 引用的 context 材料节点）以新 id 复制进**当前活跃图**。
+///
+/// 语义：
+/// - 克隆集 = 选中节点 + 结构后继（parent 链向下）+ 一层被引用的 context 节点；
+/// - parent / context_refs / created_by 只保留指向克隆集内部的边（重映射到
+///   新 id），指向集外的引用一律丢弃（溯源断链是可接受的：跨图复制本来
+///   就是「脱离上下文另起炉灶」）；
+/// - cursor 不克隆；节点本体不可变所以 kind 原样复制，id/时间戳/归属边换新；
+/// - 返回克隆的节点数。
+pub async fn clone_subgraph(
+    state: &SharedState,
+    from_graph: &str,
+    selected: Vec<rua_core::id::NodeId>,
+) -> Result<usize> {
+    let from_graph = validate_name(from_graph)?;
+    let src_dir = graph_dir(&state.graphs_root, from_graph);
+    if !src_dir.is_dir() {
+        return Err(GraphOpError::NotFound(from_graph.to_string()));
+    }
+    if selected.is_empty() {
+        return Ok(0);
+    }
+    let mut src = Graph::open(&src_dir).map_err(GraphOpError::Core)?;
+
+    // 1. 扩张克隆集：选中节点 + 全部结构后继 + 一层 context 引用。
+    let mut set: std::collections::HashSet<rua_core::id::NodeId> = selected.into_iter().collect();
+    let mut stack: Vec<rua_core::id::NodeId> = set.iter().cloned().collect();
+    while let Some(id) = stack.pop() {
+        for &child in src.children(id) {
+            if set.insert(child) {
+                stack.push(child);
+            }
+        }
+    }
+    let structural: Vec<rua_core::id::NodeId> = set.iter().cloned().collect();
+    for id in structural {
+        if let Ok(node) = src.node(id) {
+            let refs: Vec<rua_core::id::NodeId> = node.context_refs.clone();
+            for r in refs {
+                if src.meta(r).is_some() {
+                    set.insert(r);
+                }
+            }
+        }
+    }
+
+    // 2. 按 created_at 升序（父必先于子 commit）依次重建节点。
+    let mut ordered: Vec<rua_core::node::Node> = set
+        .iter()
+        .filter_map(|id| src.node(*id).ok().cloned())
+        .collect();
+    ordered.sort_by_key(|n| n.created_at);
+
+    let remap: std::collections::HashMap<rua_core::id::NodeId, rua_core::id::NodeId> = ordered
+        .iter()
+        .map(|n| (n.id, rua_core::id::NodeId::new()))
+        .collect();
+
+    let mut graph = state.graph.lock().await;
+    let mut count = 0usize;
+    for old in ordered {
+        let node = rua_core::node::Node {
+            id: remap[&old.id],
+            parent: old.parent.and_then(|p| remap.get(&p).copied()),
+            context_refs: old
+                .context_refs
+                .iter()
+                .filter_map(|r| remap.get(r).copied())
+                .collect(),
+            created_by: old.created_by.and_then(|c| remap.get(&c).copied()),
+            created_at: rua_core::node::Node::now_millis(),
+            kind: old.kind.clone(),
+        };
+        graph.commit_node(node).map_err(GraphOpError::Core)?;
+        let meta = graph.meta(remap[&old.id]).expect("just committed").clone();
+        state.broadcast(ServerEvent::NodeCommitted { meta });
+        count += 1;
+    }
+    Ok(count)
 }

@@ -245,6 +245,112 @@ fn InflightBubble(turn: Inflight) -> Element {
     }
 }
 
+/// 模型选择下拉（发送时覆盖；「默认」= daemon 配置模型）。
+/// 注意：换模型/改工具列表都会改变请求前缀，前缀缓存会失效。
+#[component]
+pub(crate) fn ModelPicker() -> Element {
+    let mut state = use_context::<AppState>();
+    let models = state.models.read().clone();
+    let selected = state.selected_model.read().clone();
+    let default_model = state.default_model.read().clone();
+    rsx! {
+        select {
+            class: "model-select",
+            title: "本次发送使用的模型（默认 = daemon 配置）",
+            value: selected.clone().unwrap_or_default(),
+            onchange: move |e| {
+                let v = e.value();
+                state.selected_model.set(if v.is_empty() { None } else { Some(v) });
+            },
+            option { value: "", "模型: 默认 ({short_model(&default_model)})" }
+            for m in &models {
+                option {
+                    key: "{m}",
+                    value: "{m}",
+                    selected: selected.as_deref() == Some(m.as_str()),
+                    "{short_model(m)}"
+                }
+            }
+        }
+    }
+}
+
+/// 模型名缩短：取最后一段路径/冒号前缀，最多 20 字符。
+pub(crate) fn short_model(model: &str) -> String {
+    let tail = model.rsplit('/').next().unwrap_or(model);
+    if tail.chars().count() > 20 {
+        format!("{}…", tail.chars().take(19).collect::<String>())
+    } else {
+        tail.to_string()
+    }
+}
+
+/// 工具覆盖：上拉勾选列表 + 重置按钮（发送时覆盖；全开 = 不覆盖）。
+/// 关工具会改请求前缀，前缀缓存失效——开发测试用。
+#[component]
+pub(crate) fn ToolToggles() -> Element {
+    let mut state = use_context::<AppState>();
+    let mut open = use_signal(|| false);
+    let off = state.tools_off.read().clone();
+    let total = AppState::ALL_TOOLS.len();
+    let summary = if off.is_empty() {
+        "工具: 全部".to_string()
+    } else {
+        format!("工具: {}/{}", total - off.len(), total)
+    };
+    rsx! {
+        span { class: "tool-menu-wrap",
+            // 打开时铺一个透明 backdrop，点外面即关闭。
+            if *open.read() {
+                div {
+                    class: "tool-menu-backdrop",
+                    onclick: move |_| open.set(false),
+                }
+                div { class: "tool-menu",
+                    for tool in AppState::ALL_TOOLS {
+                        {
+                            let tool_static: &'static str = tool;
+                            let enabled = !off.contains(tool_static);
+                            rsx! {
+                                label { key: "{tool_static}",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: enabled,
+                                        onchange: move |_| {
+                                            let mut set = state.tools_off.write();
+                                            if !set.remove(tool_static) {
+                                                set.insert(tool_static.to_string());
+                                            }
+                                        },
+                                    }
+                                    "{tool_static}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            button {
+                class: "tool-menu-btn",
+                title: "本次发送可用的工具（默认全开；关掉会使命中前缀缓存失效）",
+                onclick: move |_| {
+                    let cur = *open.read();
+                    open.set(!cur);
+                },
+                "{summary} ▴"
+            }
+            if !off.is_empty() {
+                button {
+                    class: "tool-reset-btn",
+                    title: "重置为全部工具（不覆盖）",
+                    onclick: move |_| state.tools_off.write().clear(),
+                    "重置"
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn InputArea(busy: bool) -> Element {
     let mut state = use_context::<AppState>();
@@ -261,6 +367,10 @@ fn InputArea(busy: bool) -> Element {
 
     rsx! {
         div { class: "input-area",
+            div { class: "input-toolbar",
+                ModelPicker {}
+                ToolToggles {}
+            }
             textarea {
                 class: "input-box",
                 placeholder: if busy { "等待当前轮次结束…" } else { "输入消息，Enter 发送，Shift+Enter 换行" },

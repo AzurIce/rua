@@ -34,19 +34,25 @@ pub struct NodeMeta {
     /// 创建者（turn 的 spawn_turn 工具调用产生）；None = 用户/直接操作。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<NodeId>,
+    /// 该 turn 使用的模型（turn 节点才有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Short human-readable preview for graph UIs.
     pub preview: String,
 }
 
 impl NodeMeta {
     fn of(node: &Node) -> Self {
-        let (outcome, actor, usage, context_tokens, preview) = match &node.kind {
-            NodeKind::Input { text, actor } => (None, actor.clone(), None, None, truncate(text, 80)),
+        let (outcome, actor, usage, context_tokens, model, preview) = match &node.kind {
+            NodeKind::Input { text, actor } => {
+                (None, actor.clone(), None, None, None, truncate(text, 80))
+            }
             NodeKind::Turn {
                 steps,
                 outcome,
                 actor,
                 usage,
+                model,
                 ..
             } => {
                 let final_text = steps
@@ -74,10 +80,13 @@ impl NodeMeta {
                     actor.clone(),
                     Some(*usage),
                     ctx,
+                    Some(model.clone()),
                     truncate(&final_text, 80),
                 )
             }
-            NodeKind::Context { body, .. } => (None, String::new(), None, None, truncate(body, 80)),
+            NodeKind::Context { body, .. } => {
+                (None, String::new(), None, None, None, truncate(body, 80))
+            }
         };
         NodeMeta {
             id: node.id,
@@ -90,6 +99,7 @@ impl NodeMeta {
             usage,
             context_tokens,
             created_by: node.created_by,
+            model,
             preview,
         }
     }

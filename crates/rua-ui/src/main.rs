@@ -27,9 +27,17 @@ fn main() {
 #[component]
 fn App() -> Element {
     let mut state = AppState {
-        view: use_signal(|| View::Chat),
+        view: use_signal(|| {
+            // 支持 #graph 深链直接进图视图。
+            let hash = web_sys::window().and_then(|w| w.location().hash().ok());
+            if hash.as_deref() == Some("#graph") { View::Graph } else { View::Chat }
+        }),
         graphs: use_signal(Vec::new),
         current_graph: use_signal(String::new),
+        models: use_signal(Vec::new),
+        default_model: use_signal(String::new),
+        selected_model: use_signal(|| None),
+        tools_off: use_signal(Default::default),
         cursors: use_signal(Vec::new),
         current_cursor: use_signal(|| None),
         pending_attach: use_signal(|| None),
@@ -42,6 +50,8 @@ fn App() -> Element {
         selected_body: use_signal(|| None),
         graph_positions: use_signal(Default::default),
         collapsed_spawns: use_signal(Default::default),
+        selection: use_signal(Default::default),
+        clipboard: use_signal(|| None),
         draft: use_signal(String::new),
         booted: use_signal(|| false),
     };

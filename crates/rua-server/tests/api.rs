@@ -100,7 +100,14 @@ async fn spawn_server() -> TestServer {
         release: release.clone(),
         park: true,
     });
-    let state = Arc::new(AppState::new(graph, engine, "mock-model".into(), graphs_root, "default".into()));
+    let state = Arc::new(AppState::new(
+        graph,
+        engine,
+        "mock-model".into(),
+        graphs_root,
+        "default".into(),
+        rua_core::config::ProviderConfig::default(),
+    ));
     let app = rua_server::build_router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -517,7 +524,14 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
         release: Arc::new(Notify::new()),
         park: false,
     });
-    let state = Arc::new(AppState::new(graph, engine, "mock-model".into(), graphs_root, "default".into()));
+    let state = Arc::new(AppState::new(
+        graph,
+        engine,
+        "mock-model".into(),
+        graphs_root,
+        "default".into(),
+        rua_core::config::ProviderConfig::default(),
+    ));
     let spawner = ServerSpawner::new(state.clone());
 
     // 从零 spawn：立即返回，turn 在后台跑（mock engine 直接完成）。
@@ -676,6 +690,49 @@ async fn graph_management_lifecycle() {
     // 重命名后数据还在（图里有 2 个节点）。
     assert_eq!(server.graph().await["nodes"].as_array().unwrap().len(), 2);
 
+    // duplicate w2 → w2b（深拷贝，不切换）。
+    let resp = server
+        .client
+        .post(format!("{}/api/graphs/w2/duplicate", server.base))
+        .json(&json!({"name": "w2b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let g = list_graphs(&server).await;
+    assert_eq!(g["graphs"], json!(["default", "w2", "w2b"]));
+    assert_eq!(g["current"], "w2", "duplicate 不切换当前图");
+    // 副本是完整克隆：切过去看节点数一致。
+    server
+        .client
+        .post(format!("{}/api/graphs/w2b/activate", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(server.graph().await["nodes"].as_array().unwrap().len(), 2);
+    server
+        .client
+        .post(format!("{}/api/graphs/w2/activate", server.base))
+        .send()
+        .await
+        .unwrap();
+    // 重名冲突：409。
+    let resp = server
+        .client
+        .post(format!("{}/api/graphs/w2/duplicate", server.base))
+        .json(&json!({"name": "w2b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    // 清掉副本。
+    server
+        .client
+        .delete(format!("{}/api/graphs/w2b", server.base))
+        .send()
+        .await
+        .unwrap();
+
     // 切回 default（空图）。
     let resp = server
         .client
@@ -698,10 +755,14 @@ async fn graph_management_lifecycle() {
     assert_eq!(g["graphs"], json!(["default"]));
     let trash = server._dir.path().join("graphs/.trash");
     let trashed: Vec<_> = std::fs::read_dir(&trash).unwrap().map(|e| e.unwrap()).collect();
-    assert_eq!(trashed.len(), 1);
-    assert!(trashed[0].file_name().to_string_lossy().starts_with("w2-"));
+    // w2b（副本）和 w2 都在回收站里。
+    assert_eq!(trashed.len(), 2);
+    let w2_dir = trashed
+        .iter()
+        .find(|e| e.file_name().to_string_lossy().starts_with("w2-"))
+        .expect("w2 trashed");
     // 回收站里的数据完整可读。
-    assert!(trashed[0].path().join("journal.jsonl").exists());
+    assert!(w2_dir.path().join("journal.jsonl").exists());
 
     // 删除最后一个图（当前的 default）：自动重建空 default 并切过去。
     let resp = server
@@ -715,4 +776,90 @@ async fn graph_management_lifecycle() {
     assert_eq!(g["graphs"], json!(["default"]));
     assert_eq!(g["current"], "default");
     assert_eq!(server.graph().await["nodes"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn clone_subgraph_across_graphs() {
+    let server = spawn_server().await;
+
+    // default 图里造一条 input→turn 链。
+    let cursor_id = server.create_cursor().await;
+    server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/input", server.base))
+        .json(&json!({"text": "clone me"}))
+        .send()
+        .await
+        .unwrap();
+    server.release.notify_one();
+    let graph = server.wait_for_nodes(2).await;
+    let input_id = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "input")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let turn_id = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "turn")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 新建图 b（自动切换过去，是空的）。
+    let resp = server
+        .client
+        .post(format!("{}/api/graphs", server.base))
+        .json(&json!({"name": "b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(server.graph().await["nodes"].as_array().unwrap().len(), 0);
+
+    // 从 default 克隆选中的 input（连同它的 turn 后继）进当前图 b。
+    let resp = server
+        .client
+        .post(format!("{}/api/clone", server.base))
+        .json(&json!({"from_graph": "default", "nodes": [input_id]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["cloned"], 2);
+
+    let cloned = server.wait_for_nodes(2).await;
+    let nodes = cloned["nodes"].as_array().unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+    // 新 id，不是原来的节点。
+    assert!(!ids.contains(&input_id.as_str()));
+    assert!(!ids.contains(&turn_id.as_str()));
+    // parent 重映射：克隆的 turn 的 parent 是克隆的 input。
+    let cloned_turn = nodes.iter().find(|n| n["kind"] == "turn").unwrap();
+    let cloned_input = nodes.iter().find(|n| n["kind"] == "input").unwrap();
+    assert_eq!(cloned_turn["parent"], cloned_input["id"]);
+    // 源图不受影响。
+    server
+        .client
+        .post(format!("{}/api/graphs/default/activate", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(server.graph().await["nodes"].as_array().unwrap().len(), 2);
+
+    // 源图不存在 → 404。
+    let resp = server
+        .client
+        .post(format!("{}/api/clone", server.base))
+        .json(&json!({"from_graph": "nope", "nodes": [input_id]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }

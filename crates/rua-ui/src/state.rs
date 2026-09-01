@@ -121,6 +121,14 @@ pub struct AppState {
     /// Draft state's pending attach node (a Turn id): the first send forks
     /// from it. Cleared on send or when switching to another cursor.
     pub pending_attach: Signal<Option<String>>,
+    /// 可用模型列表（GET /api/models）与本次发送的模型覆盖
+    ///（None = daemon 默认模型）。
+    pub models: Signal<Vec<String>>,
+    pub default_model: Signal<String>,
+    pub selected_model: Signal<Option<String>>,
+    /// 被关掉的工具（默认全开 = 发 None）。关任意一个会改变请求前缀 →
+    /// 前缀缓存失效，开发测试时这正是目的。
+    pub tools_off: Signal<std::collections::HashSet<String>>,
     pub metas: Signal<HashMap<String, NodeMeta>>,
     pub chain: Signal<Vec<Node>>,
     /// In-flight turns keyed by turn node id (one per running cursor).
@@ -136,6 +144,10 @@ pub struct AppState {
     /// Graph view: collapsed spawn groups, keyed by creator turn id
     /// (its spawned subtree is hidden while collapsed).
     pub collapsed_spawns: Signal<std::collections::HashSet<String>>,
+    /// Graph view: box-selected node ids and the clipboard for cross-graph
+    /// clone ((source graph name, selected ids)).
+    pub selection: Signal<std::collections::HashSet<String>>,
+    pub clipboard: Signal<Option<(String, Vec<String>)>>,
     pub draft: Signal<String>,
     pub booted: Signal<bool>,
 }
@@ -176,12 +188,41 @@ impl AppState {
     pub fn set_error(&mut self, msg: String) {
         self.error.set(Some(msg));
     }
+
+    /// 全部可用工具。spawn 工具的实际可用性还受 spawner/深度门控。
+    pub const ALL_TOOLS: &'static [&'static str] = &["bash", "spawn_turn", "inspect"];
+
+    /// 本次发送的工具覆盖：全开 → None；有关掉的 → Some(剩余列表)。
+    pub fn tools_override(&self) -> Option<Vec<String>> {
+        let off = self.tools_off.read();
+        if off.is_empty() {
+            return None;
+        }
+        Some(
+            Self::ALL_TOOLS
+                .iter()
+                .filter(|t| !off.contains(**t))
+                .map(|t| t.to_string())
+                .collect(),
+        )
+    }
 }
 
 /// Startup: load the cursor list and pick the current one. No cursor is
 /// auto-created — an empty list means draft state (the first message creates
 /// the cursor lazily). Then load graph + chain.
 pub async fn bootstrap(mut state: AppState) {
+    // 模型列表并行拉，不占启动关键路径：/api/models 要代理 provider，
+    // provider 不可达时会阻塞到超时（数秒），不该卡住「正在连接」。
+    spawn(async move {
+        match api::get_models().await {
+            Ok(m) => {
+                state.models.set(m.models);
+                state.default_model.set(m.default);
+            }
+            Err(e) => state.set_error(format!("获取模型列表失败: {e}")),
+        }
+    });
     match api::get_graphs().await {
         Ok(g) => {
             state.graphs.set(g.graphs);
@@ -365,6 +406,8 @@ pub async fn handle_event(mut state: AppState, ev: WsEvent) {
             state.selected_body.set(None);
             state.graph_positions.set(Default::default());
             state.collapsed_spawns.set(Default::default());
+            // 换图后选中集失效；剪贴板保留（跨图粘贴正是它的用途）。
+            state.selection.set(Default::default());
             state.pending_attach.set(None);
             state.current_cursor.set(None);
             bootstrap(state).await;
@@ -438,11 +481,13 @@ pub async fn detach_current_cursor(mut state: AppState) {
 
 pub async fn send_current_input(mut state: AppState, text: String) {
     let current = state.current_cursor.read().clone();
+    let model = state.selected_model.read().clone();
+    let tools = state.tools_override();
     let input_node = match current {
         // Draft state: atomically create cursor + root input + started turn.
         None => {
             let parent = state.pending_attach.read().clone();
-            match api::post_root_input(&text, parent).await {
+            match api::post_root_input(&text, parent, model.as_deref(), tools.as_deref()).await {
                 Ok(resp) => {
                     state.pending_attach.set(None);
                     if !state.cursors.read().iter().any(|c| c.id == resp.cursor.id) {
@@ -457,7 +502,7 @@ pub async fn send_current_input(mut state: AppState, text: String) {
                 }
             }
         }
-        Some(cid) => match api::send_input(&cid, &text).await {
+        Some(cid) => match api::send_input(&cid, &text, model.as_deref(), tools.as_deref()).await {
             Ok(resp) => resp.input_node,
             Err(e) => {
                 state.set_error(format!("发送失败: {e}"));

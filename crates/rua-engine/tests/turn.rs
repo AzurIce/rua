@@ -105,6 +105,7 @@ fn params(history: Vec<CoreMessage>) -> TurnParams {
         history,
         system_prompt: Some("You are helpful.".to_string()),
         depth: 0,
+        tools: None,
     }
 }
 
@@ -566,4 +567,29 @@ async fn spawn_tools_gated_by_spawner_and_depth() {
     let tools = serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap()["tools"]
         .to_string();
     assert!(!tools.contains("spawn_turn"), "got: {tools}");
+}
+
+/// 发送时工具覆盖：只留 bash（即使 spawner 在位、深度未用尽）。
+#[tokio::test]
+async fn tools_override_filters_advertised_tools() {
+    let server3 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[text_chunk("ok"), final_chunk("stop")])))
+        .mount(&server3)
+        .await;
+    let engine3 = engine_for(&server3);
+    engine3.set_spawner(std::sync::Arc::new(MockSpawner::default()));
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.tools = Some(vec!["bash".to_string()]);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    engine3.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+    let requests = server3.received_requests().await.unwrap();
+    let tools = serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap()["tools"]
+        .to_string();
+    assert!(tools.contains("bash"), "got: {tools}");
+    assert!(!tools.contains("spawn_turn"), "got: {tools}");
+    assert!(!tools.contains("\"inspect\""), "got: {tools}");
 }

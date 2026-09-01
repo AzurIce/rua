@@ -52,6 +52,9 @@ pub struct NodeMeta {
     /// 创建者（哪个 turn 的 spawn_turn 产生）；None = 用户/直接操作。
     #[serde(default)]
     pub created_by: Option<String>,
+    /// 该 turn 使用的模型（turn 节点才有）。
+    #[serde(default)]
+    pub model: Option<String>,
     pub preview: String,
 }
 
@@ -168,6 +171,13 @@ pub struct RootInputResponse {
 pub struct GraphsResponse {
     pub graphs: Vec<String>,
     pub current: String,
+}
+
+/// Response of `GET /api/models`: provider model list + daemon default.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelsResponse {
+    pub models: Vec<String>,
+    pub default: String,
 }
 
 /// Flat WS event stream: every message carries an `event` tag.

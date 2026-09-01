@@ -105,6 +105,22 @@ pub fn TopBar() -> Element {
                     "✎"
                 }
                 button {
+                    class: "graph-op-btn",
+                    title: "复制当前图为一个新图（深拷贝，不切换）",
+                    onclick: move |_| {
+                        let from = state.current_graph.read().clone();
+                        if from.is_empty() {
+                            return;
+                        }
+                        if let Some(to) = prompt("复制为：", &format!("{from}-副本")) {
+                            spawn(async move {
+                                run_graph_op(state, crate::api::duplicate_graph(&from, &to)).await;
+                            });
+                        }
+                    },
+                    "⧉"
+                }
+                button {
                     class: "graph-op-btn danger",
                     title: "删除当前图（移入 .rua/graphs/.trash/，可手工恢复）",
                     onclick: move |_| {

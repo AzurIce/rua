@@ -14,6 +14,7 @@
     --warn: #d8a037;
     --err: #e05c5c;
     --cancel: #b07cc6;
+    --agent: #a78bfa;
 }
 
 * {
@@ -418,10 +419,16 @@ details.reasoning pre {
 .input-area {
     flex: none;
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     padding: 12px clamp(16px, 8vw, 120px);
     border-top: 1px solid var(--border);
     background: var(--bg-panel);
+}
+
+.input-area .input-toolbar {
+    width: 100%;
+    margin-bottom: 0;
 }
 
 .input-box {
@@ -626,19 +633,33 @@ details.reasoning pre {
 }
 
 .fcard-outcome {
+    margin-left: auto;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    flex: none;
 }
 
 .fcard-usage {
     margin-left: auto;
+    flex: none;
     font-variant-numeric: tabular-nums;
 }
 
 .fcard-ctx {
+    flex: none;
     font-variant-numeric: tabular-nums;
     color: var(--text);
+}
+
+/* actor 可能很长（agent:<父turn短id>）：底行不折行，actor 超长时省略 */
+.fcard-bottom {
+    white-space: nowrap;
+}
+
+.fcard-actor {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .outcome-dot {
@@ -691,27 +712,89 @@ details.reasoning pre {
     outline-offset: 2px;
 }
 
-/* 用户自己的输入节点（非 spawn 产物）：accent 左侧条强调 */
+/* 人发起的节点（用户输入 / 人发起的回合）：accent 左侧条强调 */
 .flow-node.user-authored .fcard {
     border-left: 3px solid var(--accent);
 }
 
-/* spawn 组折叠徽章（turn 卡片顶行右侧） */
-.spawn-toggle {
-    margin-left: auto;
-    padding: 1px 6px;
+/* agent 发起的回合（spawn 产物）：紫色左侧条，actor 文字同步着色 */
+.flow-node.agent-authored .fcard {
+    border-left: 3px solid var(--agent);
+}
+
+.flow-node.agent-authored .fcard-actor {
+    color: var(--agent);
+}
+
+/* 卡片下方的 model 标签（turn 节点）：辅助判断前缀缓存覆盖 */
+.fcard-model-tag {
+    position: absolute;
+    top: 100%;
+    left: 2px;
+    margin-top: 3px;
+    font-size: 9.5px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+/* 输入区上方的小工具栏（模型选择等） */
+.input-toolbar {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.model-select {
+    background: var(--bg-input);
+    color: var(--text-dim);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    background: transparent;
+    border-radius: 6px;
+    padding: 2px 6px;
+    font-size: 11px;
+    max-width: 240px;
+}
+
+/* spawn 折叠条：卡片内部的通长底栏（不再是外挂的绝对定位条）。左右负边距
+   顶到卡片内边距外，顶部分隔线；底部圆角靠卡片 overflow:hidden 裁出。 */
+.fcard.fcard-strip {
+    padding-bottom: 0;
+}
+
+.spawn-strip {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    height: 17px;
+    margin: 0 -10px;
+    padding: 0 8px;
+    border: none;
+    border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-bubble), black 18%);
     color: var(--text-dim);
     font-size: 9.5px;
-    line-height: 1.4;
+    line-height: 1;
     cursor: pointer;
 }
 
-.spawn-toggle:hover {
+.spawn-strip:hover {
     color: var(--text);
-    border-color: var(--accent);
+    border-top-color: var(--accent);
+}
+
+/* 折叠态：accent 描边 + 文字变色，提示下面压着隐藏内容 */
+.spawn-strip.collapsed {
+    color: var(--accent);
+    border-top-color: var(--accent);
+}
+
+.spawn-strip-model {
+    margin-left: auto;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* 详情面板里的节点跳转链接 */
@@ -962,4 +1045,85 @@ details.reasoning pre {
 
 .markdown th {
     background: var(--bg-input);
+}
+
+/* 工具覆盖：上拉勾选列表 + 重置按钮 */
+.tool-menu-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.tool-menu-btn {
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-input);
+    color: var(--text-dim);
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.tool-menu-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+.tool-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+}
+
+.tool-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    z-index: 41;
+    min-width: 150px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgb(0 0 0 / 0.4);
+}
+
+.tool-menu label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 6px;
+    border-radius: 5px;
+    font-size: 11.5px;
+    color: var(--text);
+    cursor: pointer;
+}
+
+.tool-menu label:hover {
+    background: var(--bg-input);
+}
+
+.tool-reset-btn {
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.tool-reset-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+/* 框选选中（复制/粘贴选择集） */
+.flow-node.box-selected .fcard {
+    outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+    outline-offset: 1px;
 }

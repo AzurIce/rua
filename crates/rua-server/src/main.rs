@@ -105,6 +105,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         config.provider.model.clone(),
         graphs_root,
         rua_server::graphs::DEFAULT_GRAPH.to_string(),
+        config.provider.clone(),
     ));
     // 注入图生长工具的运行时后端（循环依赖：spawner 持有 state，
     // state 持有 engine——所以 late-bind）。

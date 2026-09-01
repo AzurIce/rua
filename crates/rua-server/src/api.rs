@@ -34,12 +34,15 @@ pub fn api_router(state: SharedState) -> Router {
         .route("/cursors/{id}/detach", post(post_detach))
         .route("/cursors/{id}/cancel", post(post_cancel))
         .route("/summarize", post(post_summarize))
+        .route("/models", get(list_models))
         .route(
             "/graphs",
             get(list_graphs_handler).post(create_graph_handler),
         )
         .route("/graphs/{name}/activate", post(activate_graph_handler))
         .route("/graphs/{name}/rename", post(rename_graph_handler))
+        .route("/graphs/{name}/duplicate", post(duplicate_graph_handler))
+        .route("/clone", post(clone_subgraph_handler))
         .route("/graphs/{name}", axum::routing::delete(delete_graph_handler))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -174,6 +177,12 @@ async fn get_chain(
 #[derive(Deserialize)]
 struct InputBody {
     text: String,
+    /// 本次发送的模型覆盖（None = daemon 默认模型）。
+    #[serde(default)]
+    model: Option<String>,
+    /// 本次发送的工具列表覆盖（None = 全部工具）。
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 async fn post_input(
@@ -214,6 +223,7 @@ async fn post_input(
     });
     let handle = graph.begin_turn(cursor_id)?;
     let history = graph.assemble_chain(input_id)?;
+    let model = body.model.clone().unwrap_or_else(|| state.model.clone());
     drop(graph);
 
     let cancel = CancellationToken::new();
@@ -226,10 +236,11 @@ async fn post_input(
             parent: Some(input_id),
             context_refs: vec![],
             actor: cursor.actor,
-            model: state.model.clone(),
+            model,
             history,
             system_prompt: Some(state.system_prompt.clone()),
             depth: 0,
+            tools: body.tools.clone(),
         },
         cancel,
     );
@@ -249,6 +260,12 @@ struct RootInputBody {
     parent: Option<NodeId>,
     #[serde(default = "default_actor")]
     actor: String,
+    /// 本次发送的模型覆盖（None = daemon 默认模型）。
+    #[serde(default)]
+    model: Option<String>,
+    /// 本次发送的工具列表覆盖（None = 全部工具）。
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 fn default_actor() -> String {
@@ -305,6 +322,7 @@ async fn post_root_input(
     let handle = graph.begin_turn(cursor.id)?;
     let history = graph.assemble_chain(input_id)?;
     let cursor_id = cursor.id;
+    let model = body.model.clone().unwrap_or_else(|| state.model.clone());
     drop(graph);
 
     let cancel = CancellationToken::new();
@@ -317,10 +335,11 @@ async fn post_root_input(
             parent: Some(input_id),
             context_refs: vec![],
             actor,
-            model: state.model.clone(),
+            model,
             history,
             system_prompt: Some(state.system_prompt.clone()),
             depth: 0,
+            tools: body.tools.clone(),
         },
         cancel,
     );
@@ -490,6 +509,56 @@ async fn post_summarize(
     Ok(Json(meta))
 }
 
+// ---- models ----
+
+/// Proxy the provider's model list (OpenAI-compatible `GET {base_url}/models`).
+/// Falls back to just the configured default model when the endpoint is
+/// unreachable or answers in a foreign shape.
+///
+/// 带 2s 超时 + 60s 缓存：provider 不在时（比如 LM Studio 没开）代理请求
+/// 会挂到连接超时，UI 每次刷新都调这个端点，不能每次都卡几秒。
+async fn list_models(State(state): State<SharedState>) -> Json<Value> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let cached = state.models_cache.lock().await.clone();
+    if let Some((at, models)) = &cached
+        && at.elapsed() < CACHE_TTL
+    {
+        return Json(json!({ "models": models, "default": state.model }));
+    }
+
+    let url = format!("{}/models", state.provider.base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .unwrap_or_default();
+    let resp = client
+        .get(&url)
+        .bearer_auth(&state.provider.api_key)
+        .send()
+        .await;
+    let fetched: Option<Vec<String>> = match resp {
+        Ok(r) => r.json::<Value>().await.ok().and_then(|v| {
+            v["data"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            })
+        }),
+        Err(_) => None,
+    };
+    // 失败时回退：陈旧缓存 > 仅默认模型。
+    let mut models = fetched
+        .or_else(|| cached.map(|(_, m)| m))
+        .unwrap_or_default();
+    if !models.contains(&state.model) {
+        models.insert(0, state.model.clone());
+    }
+    *state.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
+    Json(json!({ "models": models, "default": state.model }))
+}
+
 // ---- graphs (user-side management) ----
 
 impl From<crate::graphs::GraphOpError> for ApiError {
@@ -543,6 +612,16 @@ async fn rename_graph_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Duplicate a graph (deep copy); does not switch the active graph.
+async fn duplicate_graph_handler(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(body): Json<GraphNameBody>,
+) -> Result<StatusCode, ApiError> {
+    crate::graphs::duplicate_graph(&state, &name, &body.name)?;
+    Ok(StatusCode::CREATED)
+}
+
 /// Delete = move into `.rua/graphs/.trash/` (recoverable by hand).
 async fn delete_graph_handler(
     State(state): State<SharedState>,
@@ -550,6 +629,24 @@ async fn delete_graph_handler(
 ) -> Result<StatusCode, ApiError> {
     crate::graphs::delete_graph(&state, &name).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CloneBody {
+    /// 源图名（从哪张图复制）。
+    from_graph: String,
+    /// 框选选中的节点 id。
+    nodes: Vec<NodeId>,
+}
+
+/// 跨图克隆子树：把 from_graph 里选中的节点（含后继子树与引用的材料）
+/// 以新 id 复制进当前活跃图。返回克隆的节点数。
+async fn clone_subgraph_handler(
+    State(state): State<SharedState>,
+    Json(body): Json<CloneBody>,
+) -> Result<Json<Value>, ApiError> {
+    let n = crate::graphs::clone_subgraph(&state, &body.from_graph, body.nodes).await?;
+    Ok(Json(json!({ "cloned": n })))
 }
 
 // ---- websocket ----
