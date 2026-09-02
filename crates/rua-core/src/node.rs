@@ -70,7 +70,14 @@ pub enum Step {
 pub enum NodeKind {
     /// Input on an edge, modelled as a node. Roots a conversation when
     /// `parent` is `None`.
-    Input { text: String, actor: String },
+    Input {
+        text: String,
+        actor: String,
+        /// 本轮的工具覆盖（展开后的显式列表，wire 层的 None 在 commit 前
+        /// 就地展开）。空数组 = 未记录（旧数据）或该轮无工具。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+    },
     /// A complete turn: LLM calls + tool executions + outcome.
     Turn {
         steps: Vec<Step>,
@@ -79,6 +86,9 @@ pub enum NodeKind {
         model: String,
         #[serde(default)]
         usage: Usage,
+        /// 该轮实际生效的工具集（规范序记录，非配置）。空 = 旧数据未记录。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
     },
     /// Distilled material. Never a cursor/attach/fork landing point; its
     /// `context_refs` are provenance edges to the nodes it was distilled

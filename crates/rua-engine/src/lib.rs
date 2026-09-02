@@ -9,6 +9,7 @@ pub mod client;
 pub mod distill;
 pub mod error;
 pub mod message;
+pub mod prompt;
 pub mod spawn;
 pub mod tools;
 pub mod turn;

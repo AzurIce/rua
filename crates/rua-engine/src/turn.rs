@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::Engine;
 use crate::error::{Error, Result};
 use crate::message::history_to_rig;
+use crate::prompt::{EffectiveTools, build_system_prompt};
 use crate::tools::BashTool;
 
 /// Maximum number of tool-call rounds inside one turn.
@@ -37,6 +38,8 @@ pub struct TurnParams {
     pub model: String,
     /// Assembled history (`rua_core::assemble` output); must be non-empty.
     pub history: Vec<CoreMessage>,
+    /// 调用方附加段：拼在 engine 按有效工具集组装出的系统提示词之后
+    /// （空行分隔）。不再是完整提示词。
     pub system_prompt: Option<String>,
     /// spawn_turn 递归深度（0 = 用户发起）。达到 MAX_SPAWN_DEPTH 后不再
     /// 注册 spawn_turn/inspect 工具。
@@ -79,6 +82,15 @@ impl Engine {
             return Err(Error::EmptyHistory);
         }
 
+        // 有效工具集只算一次：schema 注册、提示词组装、执行分发三处共用。
+        let effective = EffectiveTools::compute(tools.as_deref(), self.spawner.get().is_some(), depth);
+        // 最终提示词 = engine 按工具集组装 + 调用方附加段（空行拼接在后）。
+        let mut prompt = build_system_prompt(&effective);
+        if let Some(extra) = system_prompt.as_deref() {
+            prompt.push_str("\n\n");
+            prompt.push_str(extra);
+        }
+
         let send = |event: TurnEvent| {
             let _ = events.send(event);
         };
@@ -89,16 +101,16 @@ impl Engine {
         let mut tool_rounds = 0usize;
 
         let outcome = loop {
-            let snapshot = request_snapshot(&history, system_prompt.as_deref());
+            let snapshot = request_snapshot(&history, &prompt);
             let call = self
                 .stream_call(
                     &model,
                     &history,
-                    system_prompt.as_deref(),
+                    &prompt,
                     cursor_id,
                     node_id,
                     depth,
-                    tools.as_deref(),
+                    &effective,
                     &send,
                     &cancel,
                 )
@@ -140,22 +152,35 @@ impl Engine {
                     args: call_tool.args.clone(),
                 });
                 let start = std::time::Instant::now();
-                let output = match call_tool.name.as_str() {
-                    "bash" => self.bash.execute(&call_tool.args, &cancel).await,
-                    "spawn_turn" => match self.spawner.get() {
-                        Some(spawner) => {
-                            crate::spawn::execute_spawn(spawner, &call_tool.args, node_id, depth)
+                // 软拒绝：模型发出未启用工具的调用 → ToolResult 返回错误，
+                // 事件/Step 照记，turn 继续。
+                let output = if !effective.allowed(&call_tool.name) {
+                    format!("error: tool not enabled: {}", call_tool.name)
+                } else {
+                    match call_tool.name.as_str() {
+                        "bash" => self.bash.execute(&call_tool.args, &cancel).await,
+                        "spawn_turn" => match self.spawner.get() {
+                            Some(spawner) => {
+                                crate::spawn::execute_spawn(
+                                    spawner,
+                                    &call_tool.args,
+                                    node_id,
+                                    depth,
+                                    &effective,
+                                )
                                 .await
-                        }
-                        None => "error: spawn_turn is not available".to_string(),
-                    },
-                    "inspect" => match self.spawner.get() {
-                        Some(spawner) => {
-                            crate::spawn::execute_inspect(spawner, &call_tool.args, &cancel).await
-                        }
-                        None => "error: inspect is not available".to_string(),
-                    },
-                    other => format!("error: unknown tool: {other}"),
+                            }
+                            None => "error: spawn_turn is not available".to_string(),
+                        },
+                        "inspect" => match self.spawner.get() {
+                            Some(spawner) => {
+                                crate::spawn::execute_inspect(spawner, &call_tool.args, &cancel)
+                                    .await
+                            }
+                            None => "error: inspect is not available".to_string(),
+                        },
+                        other => format!("error: unknown tool: {other}"),
+                    }
                 };
                 let duration_ms = start.elapsed().as_millis() as u64;
                 send(TurnEvent::ToolExecFinished {
@@ -192,6 +217,7 @@ impl Engine {
                 actor,
                 model,
                 usage,
+                tools: effective.names(),
             },
         })
     }
@@ -200,15 +226,17 @@ impl Engine {
     /// per-turn model override (`"provider/model"` or bare = default
     /// provider); it is resolved per call so per-send overrides actually
     /// take effect (and failures surface as a Failed turn, not a panic).
+    /// `prompt` is the final system prompt; `tools` is the effective tool
+    /// set (registered schemas come straight off its booleans).
     async fn stream_call(
         &self,
         model_ref: &str,
         history: &[CoreMessage],
-        system_prompt: Option<&str>,
+        prompt: &str,
         cursor_id: CursorId,
         node_id: NodeId,
         depth: usize,
-        tools_override: Option<&[String]>,
+        tools: &EffectiveTools,
         send: &dyn Fn(TurnEvent),
         cancel: &CancellationToken,
     ) -> CallOutcome {
@@ -228,33 +256,24 @@ impl Engine {
         let mut rig_history = history_to_rig(history);
         // The builder's `prompt` is appended as the last message; feed it the
         // tail and put everything before it into `.messages()`.
-        let prompt = rig_history.pop().expect("history checked non-empty");
+        let prompt_msg = rig_history.pop().expect("history checked non-empty");
 
-        // 可用工具全集 → 应用本次发送的工具覆盖（Some = 只保留列表里的）。
-        let allowed = |name: &str| match tools_override {
-            None => true,
-            Some(list) => list.iter().any(|t| t == name),
-        };
+        // 工具 schema 直接读有效工具集的三个布尔。
         let mut tool_defs = Vec::new();
-        if allowed("bash") {
+        if tools.bash {
             tool_defs.push(BashTool::definition());
         }
-        // 图生长工具：有 spawner、未达递归上限、且未被工具覆盖关掉才注册。
-        if self.spawner.get().is_some() && depth < crate::spawn::MAX_SPAWN_DEPTH {
-            if allowed("spawn_turn") {
-                tool_defs.push(crate::spawn::spawn_turn_definition(depth));
-            }
-            if allowed("inspect") {
-                tool_defs.push(crate::spawn::inspect_definition());
-            }
+        if tools.spawn_turn {
+            tool_defs.push(crate::spawn::spawn_turn_definition(depth));
+        }
+        if tools.inspect {
+            tool_defs.push(crate::spawn::inspect_definition());
         }
         let mut builder = model
-            .completion_request(prompt)
+            .completion_request(prompt_msg)
             .messages(rig_history)
             .tools(tool_defs);
-        if let Some(system_prompt) = system_prompt {
-            builder = builder.preamble(system_prompt.to_string());
-        }
+        builder = builder.preamble(prompt.to_string());
         if let Some(additional_params) = &additional_params {
             builder = builder.additional_params(additional_params.clone());
         }
@@ -358,14 +377,12 @@ impl Engine {
 }
 
 /// The `CoreMessage` snapshot recorded on a `Step::LlmCall`: the history as
-/// sent, with the system prompt (if any) rendered as a leading System message.
-fn request_snapshot(history: &[CoreMessage], system_prompt: Option<&str>) -> Vec<CoreMessage> {
+/// sent, with the final system prompt rendered as a leading System message.
+fn request_snapshot(history: &[CoreMessage], prompt: &str) -> Vec<CoreMessage> {
     let mut snapshot = Vec::with_capacity(history.len() + 1);
-    if let Some(system_prompt) = system_prompt {
-        snapshot.push(CoreMessage::System {
-            content: system_prompt.to_string(),
-        });
-    }
+    snapshot.push(CoreMessage::System {
+        content: prompt.to_string(),
+    });
     snapshot.extend(history.iter().cloned());
     snapshot
 }

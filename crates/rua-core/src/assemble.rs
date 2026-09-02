@@ -114,6 +114,7 @@ mod tests {
             kind: NodeKind::Input {
                 text: text.into(),
                 actor: "human".into(),
+                tools: vec![],
             },
         }
     }
@@ -157,6 +158,7 @@ mod tests {
                 actor: "agent".into(),
                 model: "m".into(),
                 usage: Usage::default(),
+                tools: vec![],
             },
         }
     }

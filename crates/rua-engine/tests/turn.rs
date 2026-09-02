@@ -175,6 +175,7 @@ async fn plain_text_turn_completes() {
         actor,
         model,
         usage,
+        tools,
     } = &node.kind
     else {
         panic!("expected turn node");
@@ -182,6 +183,8 @@ async fn plain_text_turn_completes() {
     assert_eq!(*outcome, Outcome::Completed);
     assert_eq!(actor, "human");
     assert_eq!(model, "deepseek-v4-pro");
+    // 无 spawner：有效工具集只有 bash，记录在 Turn 节点上。
+    assert_eq!(tools, &vec!["bash".to_string()]);
     assert_eq!(steps.len(), 1);
     let Step::LlmCall {
         request,
@@ -416,7 +419,7 @@ async fn empty_history_is_a_parameter_error() {
 
 #[derive(Default)]
 struct MockSpawner {
-    spawned: std::sync::Mutex<Vec<(Option<NodeId>, String, usize)>>,
+    spawned: std::sync::Mutex<Vec<(Option<NodeId>, String, usize, Vec<String>)>>,
     inspected: std::sync::Mutex<Vec<NodeId>>,
 }
 
@@ -428,13 +431,14 @@ impl rua_engine::TurnSpawner for MockSpawner {
         _actor: String,
         _created_by: NodeId,
         depth: usize,
+        tools: Vec<String>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<rua_engine::SpawnedTurn, String>> + Send>,
     > {
         self.spawned
             .lock()
             .unwrap()
-            .push((parent, text.clone(), depth));
+            .push((parent, text.clone(), depth, tools));
         Box::pin(async move {
             Ok(rua_engine::SpawnedTurn {
                 cursor_id: "cur-child".to_string(),
@@ -517,18 +521,37 @@ async fn spawn_turn_then_inspect_roundtrip() {
         .await
         .unwrap();
 
-    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
+    let NodeKind::Turn { steps, outcome, tools, .. } = &node.kind else {
         panic!("expected turn node");
     };
     assert_eq!(*outcome, Outcome::Completed);
     assert_eq!(steps.len(), 5, "llm + spawn + llm + inspect + llm");
+    // Turn 节点记录该轮有效工具集（spawner 在位、depth 0 → 全量）。
+    assert_eq!(
+        tools,
+        &vec![
+            "bash".to_string(),
+            "spawn_turn".to_string(),
+            "inspect".to_string()
+        ]
+    );
 
-    // spawn_turn reached the runtime with parent=None, content, depth+1.
+    // spawn_turn reached the runtime with parent=None, content, depth+1,
+    // and the inherited effective tool set (no `tools` arg passed).
     let spawned = spawner.spawned.lock().unwrap();
     assert_eq!(spawned.len(), 1);
     assert_eq!(spawned[0].0, None);
     assert_eq!(spawned[0].1, "subtask");
     assert_eq!(spawned[0].2, 1, "child runs at depth 1");
+    assert_eq!(
+        spawned[0].3,
+        vec![
+            "bash".to_string(),
+            "spawn_turn".to_string(),
+            "inspect".to_string()
+        ],
+        "child inherits the parent's full effective set by default"
+    );
 
     // inspect reached the runtime with the pointer from the tool args.
     let inspected = spawner.inspected.lock().unwrap();
@@ -625,4 +648,205 @@ async fn tools_override_filters_advertised_tools() {
     assert!(tools.contains("bash"), "got: {tools}");
     assert!(!tools.contains("spawn_turn"), "got: {tools}");
     assert!(!tools.contains("\"inspect\""), "got: {tools}");
+}
+
+/// 分发拦截：override 只留 bash，模型仍调 spawn_turn → ToolResult 软拒绝
+/// （Step/事件照记），spawner 未被调用。
+#[tokio::test]
+async fn disabled_tool_call_is_soft_rejected() {
+    let server = MockServer::start().await;
+    // Request 2（带软拒绝的 tool result）：最终文本。
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("tool not enabled"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("sorry, no spawn"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+    // Request 1：模型硬发 spawn_turn。
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk(
+                "call_spawn",
+                "spawn_turn",
+                r#"{"pointer":null,"content":"subtask"}"#,
+            ),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let spawner = std::sync::Arc::new(MockSpawner::default());
+    engine.set_spawner(spawner.clone());
+    let mut p = params(vec![CoreMessage::User {
+        content: "delegate".to_string(),
+    }]);
+    p.tools = Some(vec!["bash".to_string()]);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+
+    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Completed);
+    assert_eq!(steps.len(), 3, "llm + rejected tool exec + llm");
+    let Step::ToolExec { name, output, .. } = &steps[1] else {
+        panic!("expected tool exec");
+    };
+    assert_eq!(name, "spawn_turn");
+    assert!(
+        output.contains("error: tool not enabled: spawn_turn"),
+        "got: {output}"
+    );
+    // 软拒绝：从未到达 runtime。
+    assert!(spawner.spawned.lock().unwrap().is_empty());
+}
+
+/// spawn 显式子集：父轮全量，spawn_turn 传 tools=["bash"] → 子代收到
+/// ["bash"]（校验通过的子集）。
+#[tokio::test]
+async fn spawn_explicit_tools_subset_passes_validation() {
+    let server = MockServer::start().await;
+    // Request 2（带 spawn 结果）：最终文本。
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("turn_node_id"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("spawned"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk(
+                "call_spawn",
+                "spawn_turn",
+                r#"{"pointer":null,"content":"subtask","tools":["bash"]}"#,
+            ),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let spawner = std::sync::Arc::new(MockSpawner::default());
+    engine.set_spawner(spawner.clone());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "delegate".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let NodeKind::Turn { outcome, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    assert_eq!(*outcome, Outcome::Completed);
+    let spawned = spawner.spawned.lock().unwrap();
+    assert_eq!(spawned.len(), 1);
+    assert_eq!(spawned[0].3, vec!["bash".to_string()]);
+}
+
+/// spawn 显式 tools 的严格校验：未知名或超出父有效集 → error: invalid
+/// tools，spawner 未被调用。
+#[tokio::test]
+async fn spawn_invalid_tools_subset_is_rejected() {
+    // (a) 未知名：父轮全量，传 ["nonexistent"]。
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("invalid tools"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("fixed"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk(
+                "call_spawn",
+                "spawn_turn",
+                r#"{"pointer":null,"content":"subtask","tools":["nonexistent"]}"#,
+            ),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+    let engine = engine_for(&server);
+    let spawner = std::sync::Arc::new(MockSpawner::default());
+    engine.set_spawner(spawner.clone());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine
+        .run_turn(
+            params(vec![CoreMessage::User {
+                content: "delegate".to_string(),
+            }]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let NodeKind::Turn { steps, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    let Step::ToolExec { output, .. } = &steps[1] else {
+        panic!("expected tool exec");
+    };
+    assert!(output.contains("error: invalid tools"), "got: {output}");
+    assert!(output.contains("nonexistent"), "got: {output}");
+    assert!(spawner.spawned.lock().unwrap().is_empty());
+
+    // (b) 父有效集之外的项：父轮 override 不含 inspect，传 ["inspect"]。
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("invalid tools"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("fixed"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            tool_call_chunk(
+                "call_spawn",
+                "spawn_turn",
+                r#"{"pointer":null,"content":"subtask","tools":["inspect"]}"#,
+            ),
+            final_chunk("tool_calls"),
+        ])))
+        .mount(&server)
+        .await;
+    let engine = engine_for(&server);
+    let spawner = std::sync::Arc::new(MockSpawner::default());
+    engine.set_spawner(spawner.clone());
+    let mut p = params(vec![CoreMessage::User {
+        content: "delegate".to_string(),
+    }]);
+    p.tools = Some(vec!["bash".to_string(), "spawn_turn".to_string()]);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+    let NodeKind::Turn { steps, .. } = &node.kind else {
+        panic!("expected turn node");
+    };
+    let Step::ToolExec { output, .. } = &steps[1] else {
+        panic!("expected tool exec");
+    };
+    assert!(output.contains("error: invalid tools"), "got: {output}");
+    assert!(spawner.spawned.lock().unwrap().is_empty());
 }

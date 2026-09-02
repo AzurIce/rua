@@ -51,6 +51,9 @@ pub trait TurnSpawner: Send + Sync {
     /// `created_by`: the calling turn's node id, stamped on the spawned root
     /// input as its provenance. Returns immediately (async fan-out); the
     /// turn's node id is pre-allocated so the caller can `inspect` it later.
+    /// `tools`: 子代的工具覆盖（engine 已解析好的显式列表）：默认 = 父
+    /// turn 的有效集（沿 spawn 边继承），显式指定 = 校验后的子集（能力沿
+    /// spawn 边单调衰减，永不放大）。
     fn spawn_turn(
         &self,
         parent: Option<NodeId>,
@@ -58,6 +61,7 @@ pub trait TurnSpawner: Send + Sync {
         actor: String,
         created_by: NodeId,
         depth: usize,
+        tools: Vec<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SpawnedTurn, String>> + Send>>;
 
     /// Wait (up to `wait`; None = indefinitely) for the node to be
@@ -92,6 +96,11 @@ pub fn spawn_turn_definition(depth: usize) -> ToolDefinition {
                 "content": {
                     "type": "string",
                     "description": "The first message of the spawned session (its task)"
+                },
+                "tools": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Subset of your current tools for the spawned session; omit = inherit your full current set"
                 }
             },
             "required": ["content"]
@@ -125,16 +134,20 @@ pub fn inspect_definition() -> ToolDefinition {
 }
 
 /// Execute `spawn_turn`. Output is a JSON [`SpawnedTurn`] or an error string.
+/// `parent_tools` 是父 turn 的有效工具集：子代默认继承它；`args.tools`
+/// 显式指定时必须是它的子集（含空集），否则报错让模型修正重试。
 pub async fn execute_spawn(
     spawner: &Arc<dyn TurnSpawner>,
     args: &serde_json::Value,
     parent_turn: NodeId,
     depth: usize,
+    parent_tools: &crate::prompt::EffectiveTools,
 ) -> String {
     #[derive(serde::Deserialize)]
     struct Args {
         pointer: Option<String>,
         content: String,
+        tools: Option<Vec<String>>,
     }
     let args: Args = match serde_json::from_value(args.clone()) {
         Ok(a) => a,
@@ -143,6 +156,24 @@ pub async fn execute_spawn(
     if args.content.trim().is_empty() {
         return "error: content must be non-empty".to_string();
     }
+    // 工具集解析：省略 = 继承父有效集；显式 = 严格校验后的子集（空数组合法）。
+    let tools = match args.tools {
+        None => parent_tools.names(),
+        Some(list) => {
+            let bad: Vec<&String> = list.iter().filter(|t| !parent_tools.allowed(t)).collect();
+            if !bad.is_empty() {
+                return format!(
+                    "error: invalid tools: {} (your current tools: {})",
+                    bad.iter()
+                        .map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    parent_tools.names().join(", ")
+                );
+            }
+            list
+        }
+    };
     let parent = match args.pointer.as_deref().map(str::parse::<NodeId>).transpose() {
         Ok(p) => p,
         Err(_) => return format!("error: invalid node id: {:?}", args.pointer),
@@ -151,7 +182,7 @@ pub async fn execute_spawn(
     let parent_id = parent_turn.to_string();
     let actor = format!("agent:{}", &parent_id[..8.min(parent_id.len())]);
     match spawner
-        .spawn_turn(parent, args.content, actor, parent_turn, depth + 1)
+        .spawn_turn(parent, args.content, actor, parent_turn, depth + 1, tools)
         .await
     {
         Ok(spawned) => serde_json::to_string_pretty(&spawned).unwrap_or_default(),

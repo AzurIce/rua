@@ -37,15 +37,19 @@ pub struct NodeMeta {
     /// 该 turn 使用的模型（turn 节点才有）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// 工具集：Input 节点 = 展开后的请求列表；Turn 节点 = 该轮有效集。
+    /// 空 = 未记录（旧数据）或无工具。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     /// Short human-readable preview for graph UIs.
     pub preview: String,
 }
 
 impl NodeMeta {
     fn of(node: &Node) -> Self {
-        let (outcome, actor, usage, context_tokens, model, preview) = match &node.kind {
-            NodeKind::Input { text, actor } => {
-                (None, actor.clone(), None, None, None, truncate(text, 80))
+        let (outcome, actor, usage, context_tokens, model, tools, preview) = match &node.kind {
+            NodeKind::Input { text, actor, tools } => {
+                (None, actor.clone(), None, None, None, tools.clone(), truncate(text, 80))
             }
             NodeKind::Turn {
                 steps,
@@ -53,6 +57,7 @@ impl NodeMeta {
                 actor,
                 usage,
                 model,
+                tools,
                 ..
             } => {
                 let final_text = steps
@@ -81,11 +86,12 @@ impl NodeMeta {
                     Some(*usage),
                     ctx,
                     Some(model.clone()),
+                    tools.clone(),
                     truncate(&final_text, 80),
                 )
             }
             NodeKind::Context { body, .. } => {
-                (None, String::new(), None, None, None, truncate(body, 80))
+                (None, String::new(), None, None, None, vec![], truncate(body, 80))
             }
         };
         NodeMeta {
@@ -100,6 +106,7 @@ impl NodeMeta {
             context_tokens,
             created_by: node.created_by,
             model,
+            tools,
             preview,
         }
     }
@@ -372,6 +379,7 @@ mod tests {
             kind: NodeKind::Input {
                 text: text.into(),
                 actor: "human".into(),
+                tools: vec![],
             },
         }
     }
@@ -395,6 +403,7 @@ mod tests {
                 actor: "agent".into(),
                 model: "deepseek-v4-pro".into(),
                 usage: Usage::default(),
+                tools: vec![],
             },
         }
     }
@@ -591,5 +600,67 @@ mod tests {
         // The interrupted cursor is usable again.
         let mut g2 = g2;
         assert!(g2.begin_turn(cur_id).is_ok());
+    }
+
+    /// 旧格式节点（无 tools 字段）反序列化兼容：缺字段读成空数组。
+    #[test]
+    fn legacy_node_without_tools_deserializes() {
+        let input_json = serde_json::json!({
+            "id": NodeId::new().to_string(),
+            "created_at": 0,
+            "kind": { "type": "input", "text": "hi", "actor": "human" },
+        });
+        let node: Node = serde_json::from_value(input_json).unwrap();
+        let NodeKind::Input { tools, .. } = &node.kind else {
+            panic!("expected input");
+        };
+        assert!(tools.is_empty());
+
+        let turn_json = serde_json::json!({
+            "id": NodeId::new().to_string(),
+            "created_at": 0,
+            "kind": {
+                "type": "turn",
+                "steps": [],
+                "outcome": "completed",
+                "actor": "agent",
+                "model": "m",
+            },
+        });
+        let node: Node = serde_json::from_value(turn_json).unwrap();
+        let NodeKind::Turn { tools, .. } = &node.kind else {
+            panic!("expected turn");
+        };
+        assert!(tools.is_empty());
+    }
+
+    /// NodeMeta::of：Input 带请求列表、Turn 带有效集；空数组不序列化。
+    #[test]
+    fn meta_maps_tools_from_node_kind() {
+        let mut input = input_node("hi", None);
+        if let NodeKind::Input { tools, .. } = &mut input.kind {
+            *tools = vec!["bash".into()];
+        }
+        let meta = NodeMeta::of(&input);
+        assert_eq!(meta.tools, vec!["bash".to_string()]);
+
+        let mut turn = turn_node(input.id, Outcome::Completed);
+        if let NodeKind::Turn { tools, .. } = &mut turn.kind {
+            *tools = vec!["bash".into(), "spawn_turn".into(), "inspect".into()];
+        }
+        let meta = NodeMeta::of(&turn);
+        assert_eq!(
+            meta.tools,
+            vec!["bash".to_string(), "spawn_turn".to_string(), "inspect".to_string()]
+        );
+        // 空数组不进 JSON（skip_serializing_if）。
+        let empty_meta = NodeMeta::of(&input_node("bare", None));
+        assert!(serde_json::to_value(&empty_meta).unwrap()["tools"].is_null());
+
+        // 旧格式 meta（无 tools 字段）同样兼容。
+        let mut legacy = serde_json::to_value(&meta).unwrap();
+        legacy.as_object_mut().unwrap().remove("tools");
+        let meta: NodeMeta = serde_json::from_value(legacy).unwrap();
+        assert!(meta.tools.is_empty());
     }
 }
