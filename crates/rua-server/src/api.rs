@@ -29,6 +29,7 @@ pub fn api_router(state: SharedState) -> Router {
         .route("/cursors", get(list_cursors).post(create_cursor))
         .route("/inputs", post(post_root_input))
         .route("/cursors/{id}/chain", get(get_chain))
+        .route("/cursors/{id}/context_preview", get(get_context_preview))
         .route("/cursors/{id}/input", post(post_input))
         .route("/cursors/{id}/move", post(post_move))
         .route("/cursors/{id}/detach", post(post_detach))
@@ -172,6 +173,44 @@ async fn get_chain(
     Ok(Json(nodes))
 }
 
+#[derive(Deserialize)]
+struct ContextPreviewQuery {
+    /// 工具覆盖（逗号分隔的显式列表）；缺省 = 全量。
+    tools: Option<String>,
+}
+
+/// 下一轮请求的实时装配预览：当前 tip 的链消息 + 按工具覆盖动态组装的
+/// 系统提示词与有效工具集。token 数只有真实发送后 provider 才返回，这里
+/// 不给估计——UI 用字符数 + 上一轮的 context_tokens 做参照。
+async fn get_context_preview(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ContextPreviewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cursor_id = parse_cursor_id(&id)?;
+    let tools_override: Option<Vec<String>> = query.tools.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let mut graph = state.graph.lock().await;
+    // 无 tip（detached 指针）= 空链；draft 会话 UI 侧不调用本端点。
+    let messages = match graph.cursors.get(cursor_id)?.node {
+        Some(tip) => graph.assemble_chain(tip)?,
+        None => Vec::new(),
+    };
+    // 预览恒按用户发送的语义计算：depth=0 且 spawner 在位（同 post_input）。
+    let effective =
+        rua_engine::prompt::EffectiveTools::compute(tools_override.as_deref(), true, 0);
+    Ok(Json(json!({
+        "system_prompt": rua_engine::prompt::build_system_prompt(&effective),
+        "tools": effective.names(),
+        "messages": messages,
+    })))
+}
+
 // ---- turns ----
 
 #[derive(Deserialize)]
@@ -199,6 +238,9 @@ async fn post_input(
         return Err(CoreError::CursorBusy(cursor_id).into());
     }
 
+    // wire 层的 None（UI 全勾）就地展开为显式列表再落图：图数据里 tools
+    // 就是 Vec，没有 None。用户发送恒 depth=0 且 spawner 在位。
+    let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
     let input = Node {
         id: NodeId::new(),
         parent: cursor.node,
@@ -208,6 +250,7 @@ async fn post_input(
         kind: NodeKind::Input {
             text: body.text,
             actor: cursor.actor.clone(),
+            tools: tools.clone(),
         },
     };
     let input_id = input.id;
@@ -238,9 +281,9 @@ async fn post_input(
             actor: cursor.actor,
             model,
             history,
-            system_prompt: Some(state.system_prompt.clone()),
+            system_prompt: None,
             depth: 0,
-            tools: body.tools.clone(),
+            tools: Some(tools),
         },
         cancel,
     );
@@ -297,6 +340,8 @@ async fn post_root_input(
     state.broadcast(ServerEvent::CursorCreated {
         cursor: cursor.clone(),
     });
+    // wire 层的 None（UI 全勾）就地展开为显式列表再落图（同 post_input）。
+    let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
     let input = Node {
         id: NodeId::new(),
         parent: body.parent,
@@ -306,6 +351,7 @@ async fn post_root_input(
         kind: NodeKind::Input {
             text: body.text,
             actor: actor.clone(),
+            tools: tools.clone(),
         },
     };
     let input_id = input.id;
@@ -337,9 +383,9 @@ async fn post_root_input(
             actor,
             model,
             history,
-            system_prompt: Some(state.system_prompt.clone()),
+            system_prompt: None,
             depth: 0,
-            tools: body.tools.clone(),
+            tools: Some(tools),
         },
         cancel,
     );
@@ -438,7 +484,7 @@ struct SummarizeBody {
 /// Project a node to plain text as distillation material.
 fn project_node(node: &Node) -> String {
     match &node.kind {
-        NodeKind::Input { text, actor } => format!("[input by {actor}]\n{text}"),
+        NodeKind::Input { text, actor, .. } => format!("[input by {actor}]\n{text}"),
         NodeKind::Context { body, .. } => body.clone(),
         NodeKind::Turn { steps, actor, .. } => {
             let mut out = format!("[turn by {actor}]");

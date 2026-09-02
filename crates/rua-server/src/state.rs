@@ -15,21 +15,6 @@ use crate::events::ServerEvent;
 /// Capacity of the broadcast bus. Lagging WS clients skip missed events.
 pub const EVENT_BUS_CAPACITY: usize = 1024;
 
-pub const SYSTEM_PROMPT: &str = "\
-You are rua, a coding agent living on a conversation graph. You have three tools:
-- `bash`: run a shell command with the project root as its working directory.
-- `spawn_turn`: fork a new session from a committed turn node (`pointer`) or a fresh root, \
-with `content` as its task. Returns the new turn's node id immediately — the turn runs in \
-the background.
-- `inspect`: wait for a node (usually a spawned turn) to commit and read its result.
-
-Delegation policy: when a task decomposes into INDEPENDENT subtasks (e.g. investigating \
-several packages, auditing several files, trying several approaches), do NOT do them all \
-yourself — `spawn_turn` one branch per subtask first, then `inspect` each to collect \
-results and synthesize. Each spawned session has the same tools as you, including bash. \
-Do it yourself with `bash` only when the subtasks are trivially small or strictly \
-sequential. Keep answers concise, and prefer inspecting before changing.";
-
 pub struct AppState {
     /// Single writer: every graph mutation takes this lock.
     pub graph: Mutex<Graph>,
@@ -51,7 +36,6 @@ pub struct AppState {
     /// /api/models 按 provider 的缓存：provider 不可达时代理请求会挂到
     /// 超时（数秒），UI 每次刷新都调这个端点，不能每次都等。
     pub models_cache: Mutex<HashMap<String, (std::time::Instant, Vec<String>)>>,
-    pub system_prompt: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -75,7 +59,6 @@ impl AppState {
             default_model,
             providers,
             models_cache: Mutex::new(HashMap::new()),
-            system_prompt: SYSTEM_PROMPT.to_string(),
         }
     }
 

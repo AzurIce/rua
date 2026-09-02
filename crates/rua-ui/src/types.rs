@@ -55,6 +55,10 @@ pub struct NodeMeta {
     /// 该 turn 使用的模型（turn 节点才有）。
     #[serde(default)]
     pub model: Option<String>,
+    /// 工具集：Input 节点 = 展开后的请求列表；Turn 节点 = 该轮有效集。
+    /// 空 = 未记录（旧数据）或无工具。
+    #[serde(default)]
+    pub tools: Vec<String>,
     pub preview: String,
 }
 
@@ -98,12 +102,42 @@ pub struct Usage {
     pub cached_input_tokens: u64,
 }
 
+/// Mirror of rua-core's `CoreMessage`（`#[serde(tag = "role")]`）：装配出的
+/// provider 无关消息 IR。上下文侧栏逐条展示的就是它（预览 = 即将发送的
+/// 装配结果；快照 = `Step::LlmCall.request` 的逐字记录）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum CoreMessageView {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+        /// 不透明透传（UI 只展示，不解释结构）。
+        #[serde(default)]
+        tool_calls: Vec<serde_json::Value>,
+    },
+    ToolResult {
+        call_id: String,
+        name: String,
+        output: String,
+    },
+    /// 经 context_refs 注入的蒸馏材料；sources 是溯源节点 id。
+    Context {
+        body: String,
+        sources: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Step {
     LlmCall {
-        /// Kept opaque: the UI never inspects the request messages.
-        request: serde_json::Value,
+        /// 该次调用的逐字请求快照（首条 System = 当时生效的系统提示词）。
+        request: Vec<CoreMessageView>,
         response_text: String,
         #[serde(default)]
         tool_calls: Vec<serde_json::Value>,
@@ -124,7 +158,13 @@ pub enum Step {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeKind {
-    Input { text: String, actor: String },
+    Input {
+        text: String,
+        actor: String,
+        /// 本轮的工具覆盖（展开后的显式列表）；空 = 未记录/无工具。
+        #[serde(default)]
+        tools: Vec<String>,
+    },
     Turn {
         steps: Vec<Step>,
         outcome: Outcome,
@@ -132,6 +172,9 @@ pub enum NodeKind {
         model: String,
         #[serde(default)]
         usage: Usage,
+        /// 该轮实际生效的工具集；空 = 未记录（旧数据）。
+        #[serde(default)]
+        tools: Vec<String>,
     },
     Context {
         body: String,
@@ -180,6 +223,16 @@ pub struct GraphsResponse {
 pub struct ModelsResponse {
     pub models: Vec<ModelEntry>,
     pub default: String,
+}
+
+/// Response of `GET /api/cursors/:id/context_preview`：下一轮请求的实时
+/// 装配预览（system prompt + 有效工具集 + 链消息；token 数只有真实发送后
+/// 才知道，这里不含）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ContextPreviewResponse {
+    pub system_prompt: String,
+    pub tools: Vec<String>,
+    pub messages: Vec<CoreMessageView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

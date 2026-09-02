@@ -53,6 +53,8 @@ fn App() -> Element {
         selection: use_signal(Default::default),
         clipboard: use_signal(|| None),
         draft: use_signal(String::new),
+        context_panel_open: use_signal(|| false),
+        snapshot_target: use_signal(|| None),
         booted: use_signal(|| false),
     };
     use_context_provider(|| state);

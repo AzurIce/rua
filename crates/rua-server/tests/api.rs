@@ -70,6 +70,7 @@ impl AgentEngine for MockEngine {
                     actor: params.actor,
                     model: params.model,
                     usage: Usage::default(),
+                    tools: params.tools.clone().unwrap_or_default(),
                 },
             })
         })
@@ -543,17 +544,25 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
 
     // 从零 spawn：立即返回，turn 在后台跑（mock engine 直接完成）。
     let creator = NodeId::new();
+    let all_tools = vec![
+        "bash".to_string(),
+        "spawn_turn".to_string(),
+        "inspect".to_string(),
+    ];
     let spawned = spawner
-        .spawn_turn(None, "child task".to_string(), "agent:test".to_string(), creator, 1)
+        .spawn_turn(None, "child task".to_string(), "agent:test".to_string(), creator, 1, all_tools.clone())
         .await
         .unwrap();
     let input_id: NodeId = spawned.input_node_id.parse().unwrap();
     let turn_id: NodeId = spawned.turn_node_id.parse().unwrap();
 
-    // 溯源盖章：spawn 出的根 input 的 created_by 指向发起它的 turn。
+    // 溯源盖章：spawn 出的根 input 的 created_by 指向发起它的 turn；
+    // 继承的工具集落在 input 节点上。
     {
         let graph = state.graph.lock().await;
-        assert_eq!(graph.meta(input_id).unwrap().created_by, Some(creator));
+        let meta = graph.meta(input_id).unwrap();
+        assert_eq!(meta.created_by, Some(creator));
+        assert_eq!(meta.tools, all_tools);
     }
 
     // Input 节点已同步 commit，inspect 立即可读。
@@ -588,14 +597,14 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
 
     // pointer 必须落在已 commit 的 turn 节点上：input 节点非法。
     let err = spawner
-        .spawn_turn(Some(input_id), "x".to_string(), "agent:test".to_string(), NodeId::new(), 1)
+        .spawn_turn(Some(input_id), "x".to_string(), "agent:test".to_string(), NodeId::new(), 1, all_tools.clone())
         .await
         .unwrap_err();
     assert!(err.contains("turn node"), "got: {err}");
 
     // 以刚完成的 turn 为 parent spawn（fork），能成。
     let forked = spawner
-        .spawn_turn(Some(turn_id), "grandchild".to_string(), "agent:test".to_string(), NodeId::new(), 2)
+        .spawn_turn(Some(turn_id), "grandchild".to_string(), "agent:test".to_string(), NodeId::new(), 2, vec!["bash".to_string()])
         .await
         .unwrap();
     let forked_turn: NodeId = forked.turn_node_id.parse().unwrap();
@@ -940,4 +949,137 @@ async fn models_aggregates_providers_with_model_refs() {
         |e| e["id"] == "dead/fallback-model" && e["provider"] == "dead" && e["model"] == "fallback-model"
     ));
     assert_eq!(resp["default"], "m-a");
+}
+
+/// POST input 的 tools：wire 层 None（不带字段）在 commit 前就地展开为
+/// 全量显式列表；显式列表原样落图。图数据里没有 None。
+#[tokio::test]
+async fn input_tools_none_expands_to_full_list() {
+    let server = spawn_server().await;
+    let cursor_id = server.create_cursor().await;
+
+    // 不带 tools 字段 → Input 节点 tools = 全量展开。
+    let resp = server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/input", server.base))
+        .json(&json!({"text": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["input_node"]["tools"],
+        json!(["bash", "spawn_turn", "inspect"])
+    );
+    server.release.notify_one();
+    server.wait_for_nodes(2).await;
+
+    // 显式列表 → 原样落图。
+    let resp = server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/input", server.base))
+        .json(&json!({"text": "bash only", "tools": ["bash"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["input_node"]["tools"], json!(["bash"]));
+    server.release.notify_one();
+    // 该轮的 Turn 节点记录同一有效集（mock engine 透传 params.tools）。
+    let graph = server.wait_for_nodes(4).await;
+    let turn = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|n| n["kind"] == "turn")
+        .unwrap();
+    assert_eq!(turn["tools"], json!(["bash"]));
+}
+
+/// GET /api/cursors/:id/context_preview：下一轮请求的实时装配预览——
+/// 不带 tools = 全量（system_prompt 含 delegation 段）；?tools=bash 时
+/// 无 spawn bullet / 无 delegation，tools 字段为 ["bash"]；messages 与
+/// 当前 tip 的链装配一致（detached 指针 = 空 messages）。
+#[tokio::test]
+async fn context_preview_endpoint() {
+    let server = spawn_server().await;
+    let cursor_id = server.create_cursor().await;
+
+    let preview = |suffix: &str| {
+        let server = &server;
+        let cursor_id = cursor_id.clone();
+        let suffix = suffix.to_string();
+        async move {
+            let resp = server
+                .client
+                .get(format!(
+                    "{}/api/cursors/{cursor_id}/context_preview{suffix}",
+                    server.base
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+
+    // 无 tip（新游标）：messages 为空；全量工具 → delegation 段在。
+    let p = preview("").await;
+    assert_eq!(p["messages"], json!([]));
+    assert_eq!(p["tools"], json!(["bash", "spawn_turn", "inspect"]));
+    let prompt = p["system_prompt"].as_str().unwrap();
+    assert!(prompt.contains("Delegation policy:"));
+    assert!(prompt.contains("`spawn_turn`"));
+
+    // 提交一轮后：tip = 回合节点，链装配出 input 的 user 消息。
+    server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/input", server.base))
+        .json(&json!({"text": "hello preview"}))
+        .send()
+        .await
+        .unwrap();
+    server.release.notify_one();
+    server.wait_for_nodes(2).await;
+
+    let p = preview("").await;
+    let messages = p["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "hello preview");
+
+    // ?tools=bash：tools 字段为 ["bash"]；无 spawn bullet、无 delegation。
+    let p = preview("?tools=bash").await;
+    assert_eq!(p["tools"], json!(["bash"]));
+    let prompt = p["system_prompt"].as_str().unwrap();
+    assert!(prompt.contains("`bash`"));
+    assert!(!prompt.contains("`spawn_turn`"));
+    assert!(!prompt.contains("Delegation policy:"));
+
+    // detach（指针置空）后：messages 回到空，提示词不受影响。
+    server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/detach", server.base))
+        .send()
+        .await
+        .unwrap();
+    let p = preview("").await;
+    assert_eq!(p["messages"], json!([]));
+
+    // 未知 cursor → 404。
+    let resp = server
+        .client
+        .get(format!(
+            "{}/api/cursors/{}/context_preview",
+            server.base,
+            CursorId::new()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }

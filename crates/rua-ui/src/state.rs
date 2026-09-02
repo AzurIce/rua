@@ -149,6 +149,11 @@ pub struct AppState {
     pub selection: Signal<std::collections::HashSet<String>>,
     pub clipboard: Signal<Option<(String, Vec<String>)>>,
     pub draft: Signal<String>,
+    /// 聊天视图的上下文侧栏开关（默认关）。
+    pub context_panel_open: Signal<bool>,
+    /// 快照 tab 的目标：(turn 节点 id, LlmCall 序号)。由 Turn 气泡的
+    /// 「上下文」按钮设置；None = 默认显示链上最新 Turn 的最后一次调用。
+    pub snapshot_target: Signal<Option<(String, usize)>>,
     pub booted: Signal<bool>,
 }
 
@@ -205,6 +210,22 @@ impl AppState {
                 .map(|t| t.to_string())
                 .collect(),
         )
+    }
+}
+
+/// 节点工具集的展示文本：全量 → "全部工具"（免噪音）；空 → "无工具"
+/// （旧数据未记录也落此分支，可接受）；否则列出名字。
+pub fn tools_label(tools: &[String]) -> String {
+    if tools.is_empty() {
+        "无工具".to_string()
+    } else if tools
+        .iter()
+        .map(String::as_str)
+        .eq(AppState::ALL_TOOLS.iter().copied())
+    {
+        "全部工具".to_string()
+    } else {
+        tools.join(", ")
     }
 }
 

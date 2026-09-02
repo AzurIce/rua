@@ -1,15 +1,28 @@
-//! REST client for the rua-server contract. API/WS 都走页面同源（daemon
-//! 同时 serve UI 与 API），不再硬编码端口——任何端口起 daemon 都能用。
+//! REST client for the rua-server contract. API/WS 默认走页面同源（daemon
+//! 同时 serve UI 与 API）；开发时 dx serve（默认 8080）没有 /api，把
+//! API/WS 指到本机 daemon 默认端口（daemon 已放开 CORS）。
 
 use gloo_net::http::{Request, Response};
 use serde::Serialize;
 
 use crate::types::*;
 
+/// dx serve 的默认开发端口。
+const DX_DEV_PORT: &str = "8080";
+/// 本机 daemon 的默认地址（dev 时 UI 在 dx serve 端口上，API 指向这里）。
+const DEV_DAEMON: &str = "http://127.0.0.1:3080";
+
 fn origin() -> String {
-    web_sys::window()
+    let origin = web_sys::window()
         .and_then(|w| w.location().origin().ok())
-        .unwrap_or_else(|| "http://127.0.0.1:3080".to_string())
+        .unwrap_or_default();
+    // dx serve 没有 /api（未知路径 SPA fallback 成 index.html），dev 访问
+    // 必须改用 daemon 端口；其余情况保持同源。
+    if origin.is_empty() || origin.ends_with(DX_DEV_PORT) {
+        DEV_DAEMON.to_string()
+    } else {
+        origin
+    }
 }
 
 pub fn api_base() -> String {
@@ -67,6 +80,23 @@ pub async fn get_chain(cursor_id: &str) -> Result<Vec<Node>, String> {
 
 pub async fn get_node(id: &str) -> Result<Node, String> {
     let resp = Request::get(&format!("{}/api/nodes/{id}", api_base()))
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
+    unwrap(resp).await
+}
+
+/// `GET /api/cursors/:id/context_preview`：下一轮请求的实时装配预览。
+/// `tools` = 工具覆盖（None = 全量，同发送语义）。
+pub async fn get_context_preview(
+    cursor_id: &str,
+    tools: Option<&[String]>,
+) -> Result<ContextPreviewResponse, String> {
+    let mut url = format!("{}/api/cursors/{cursor_id}/context_preview", api_base());
+    if let Some(tools) = tools {
+        url.push_str(&format!("?tools={}", tools.join(",")));
+    }
+    let resp = Request::get(&url)
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;

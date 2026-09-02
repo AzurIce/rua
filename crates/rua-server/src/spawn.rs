@@ -34,6 +34,7 @@ impl TurnSpawner for ServerSpawner {
         actor: String,
         created_by: NodeId,
         depth: usize,
+        tools: Vec<String>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SpawnedTurn, String>> + Send>,
     > {
@@ -64,6 +65,7 @@ impl TurnSpawner for ServerSpawner {
                 kind: NodeKind::Input {
                     text,
                     actor: actor.clone(),
+                    tools: tools.clone(),
                 },
             };
             let input_id = input.id;
@@ -92,10 +94,10 @@ impl TurnSpawner for ServerSpawner {
                     actor,
                     model: state.default_model.clone(),
                     history,
-                    system_prompt: Some(state.system_prompt.clone()),
+                    system_prompt: None,
                     depth,
-                    // 子会话默认全工具（由深度门控）；不带用户侧覆盖。
-                    tools: None,
+                    // 继承父 turn 的有效工具集（engine 已校验/展开的显式列表）。
+                    tools: Some(tools),
                 },
                 cancel,
             );

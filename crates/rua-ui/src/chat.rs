@@ -2,6 +2,7 @@
 
 use dioxus::prelude::*;
 
+use crate::api;
 use crate::state::{AppState, Inflight, InflightItem, cancel_current_turn, move_current_cursor, send_current_input};
 use crate::types::*;
 
@@ -24,35 +25,41 @@ pub fn ChatView() -> Element {
     let busy = state.busy();
     let draft_mode = state.current_cursor.read().is_none();
     let pending_attach = state.pending_attach.read().clone();
+    let panel_open = *state.context_panel_open.read();
 
     rsx! {
         div { class: "chat-view",
-            div { class: "chat-scroll",
-                if chain.is_empty() {
-                    div { class: "chat-empty",
-                        if draft_mode {
-                            p { "新会话草稿（尚未创建）。" }
-                            p { "发送第一条消息即创建新会话，它将成为图的一个根节点。" }
-                            if let Some(node_id) = &pending_attach {
-                                p { "将从节点 #{short_id(node_id)} 分叉。" }
+            div { class: "chat-main",
+                div { class: "chat-scroll",
+                    if chain.is_empty() {
+                        div { class: "chat-empty",
+                            if draft_mode {
+                                p { "新会话草稿（尚未创建）。" }
+                                p { "发送第一条消息即创建新会话，它将成为图的一个根节点。" }
+                                if let Some(node_id) = &pending_attach {
+                                    p { "将从节点 #{short_id(node_id)} 分叉。" }
+                                }
+                            } else {
+                                p { "空会话。" }
+                                p { "在下方输入第一条消息，它将成为图的一个根节点。" }
                             }
-                        } else {
-                            p { "空会话。" }
-                            p { "在下方输入第一条消息，它将成为图的一个根节点。" }
                         }
                     }
-                }
-                for node in chain.iter() {
-                    // Context 节点是材料，不出现在对话流里。
-                    if !matches!(node.kind, NodeKind::Context { .. }) {
-                        Bubble { key: "{node.id}", node: node.clone() }
+                    for node in chain.iter() {
+                        // Context 节点是材料，不出现在对话流里。
+                        if !matches!(node.kind, NodeKind::Context { .. }) {
+                            Bubble { key: "{node.id}", node: node.clone() }
+                        }
+                    }
+                    if let Some(turn) = state.current_inflight() {
+                        InflightBubble { turn }
                     }
                 }
-                if let Some(turn) = state.current_inflight() {
-                    InflightBubble { turn }
-                }
+                InputArea { busy }
             }
-            InputArea { busy }
+            if panel_open {
+                ContextPanel {}
+            }
         }
     }
 }
@@ -60,12 +67,13 @@ pub fn ChatView() -> Element {
 #[component]
 fn Bubble(node: Node) -> Element {
     match &node.kind {
-        NodeKind::Input { text, actor } => {
+        NodeKind::Input { text, actor, tools } => {
             rsx! {
                 div { class: "bubble bubble-input",
                     div { class: "bubble-header",
                         span { class: "bubble-actor", "{actor}" }
                         span { class: "bubble-id", "#{short_id(&node.id)}" }
+                        span { class: "badge", "{crate::state::tools_label(tools)}" }
                     }
                     div { class: "bubble-text", "{text}" }
                 }
@@ -77,13 +85,22 @@ fn Bubble(node: Node) -> Element {
             actor,
             model,
             usage,
+            ..
         } => {
             let outcome = *outcome;
+            // LlmCall 次数：有调用记录的回合才能看上下文快照。
+            let llm_calls = steps
+                .iter()
+                .filter(|s| matches!(s, Step::LlmCall { .. }))
+                .count();
             rsx! {
                 div { class: "bubble bubble-turn outcome-{outcome.label()}",
                     div { class: "bubble-header",
                         span { class: "bubble-actor", "{actor}" }
                         span { class: "bubble-id", "#{short_id(&node.id)}" }
+                        if llm_calls > 0 {
+                            SnapshotButton { node_id: node.id.clone(), last_call: llm_calls - 1 }
+                        }
                         ForkButton { node_id: node.id.clone() }
                     }
                     for step in steps {
@@ -158,20 +175,28 @@ pub(crate) fn compact_args(args: &serde_json::Value) -> String {
     }
 }
 
+/// 统一的 token 用量展示：`↑{in} ↓{out}[ · 缓存{cached}({pct}%)][ · 思考{r}]`，
+/// 零值部分省略；pct = cached*100/input（input>0 且有缓存时）。聊天气泡
+/// footer、图节点详情 turn 汇总行、LlmCall step 行三处共用。
+pub(crate) fn usage_label(usage: &Usage) -> String {
+    let mut s = format!("↑{} ↓{}", usage.input_tokens, usage.output_tokens);
+    if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
+        s.push_str(&format!(
+            " · 缓存{}({}%)",
+            usage.cached_input_tokens,
+            usage.cached_input_tokens * 100 / usage.input_tokens
+        ));
+    }
+    if usage.reasoning_tokens > 0 {
+        s.push_str(&format!(" · 思考{}", usage.reasoning_tokens));
+    }
+    s
+}
+
 #[component]
 fn UsageView(usage: Usage) -> Element {
-    let mut parts = vec![
-        format!("↑{}", usage.input_tokens),
-        format!("↓{}", usage.output_tokens),
-    ];
-    if usage.reasoning_tokens > 0 {
-        parts.push(format!("思考{}", usage.reasoning_tokens));
-    }
-    if usage.cached_input_tokens > 0 {
-        parts.push(format!("缓存{}", usage.cached_input_tokens));
-    }
     rsx! {
-        span { class: "bubble-usage", "{parts.join(\" · \")} tokens" }
+        span { class: "bubble-usage", "{usage_label(&usage)}" }
     }
 }
 
@@ -190,6 +215,24 @@ fn ForkButton(node_id: String) -> Element {
                 });
             },
             "fork 到这里"
+        }
+    }
+}
+
+/// Turn 气泡 header 的「上下文」按钮：打开侧栏并把快照 tab 指到本回合
+/// （默认落在最后一次 LlmCall，侧栏里可切换）。
+#[component]
+fn SnapshotButton(node_id: String, last_call: usize) -> Element {
+    let mut state = use_context::<AppState>();
+    rsx! {
+        button {
+            class: "ctx-jump-btn",
+            title: "在上下文侧栏查看本轮发送给模型的请求快照",
+            onclick: move |_| {
+                state.snapshot_target.set(Some((node_id.clone(), last_call)));
+                state.context_panel_open.set(true);
+            },
+            "上下文"
         }
     }
 }
@@ -386,6 +429,7 @@ fn InputArea(busy: bool) -> Element {
             div { class: "input-toolbar",
                 ModelPicker {}
                 ToolToggles {}
+                ContextPanelToggle {}
             }
             textarea {
                 class: "input-box",
@@ -418,5 +462,336 @@ fn InputArea(busy: bool) -> Element {
                 }
             }
         }
+    }
+}
+
+// ---- 上下文侧栏 ----
+
+/// InputArea 工具栏的「上下文」开关按钮（带开关态样式）。
+#[component]
+fn ContextPanelToggle() -> Element {
+    let mut state = use_context::<AppState>();
+    let open = *state.context_panel_open.read();
+    rsx! {
+        button {
+            class: if open { "ctx-toggle-btn active" } else { "ctx-toggle-btn" },
+            title: "打开/关闭上下文侧栏（预览下一轮请求 / 查看已发送快照）",
+            onclick: move |_| {
+                let cur = *state.context_panel_open.read();
+                state.context_panel_open.set(!cur);
+            },
+            "上下文"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextTab {
+    /// 下一轮请求的实时装配预览（默认）。
+    Preview,
+    /// 已提交回合的 LlmCall 请求快照（逐字记录）。
+    Snapshot,
+}
+
+/// 聊天视图右侧的上下文侧栏：预览 / 快照两个 tab 共享消息列表组件。
+#[component]
+fn ContextPanel() -> Element {
+    let mut state = use_context::<AppState>();
+    let mut tab = use_signal(|| ContextTab::Preview);
+    // Turn 气泡的「上下文」按钮写入 snapshot_target 时跳到快照 tab。
+    use_effect(move || {
+        if state.snapshot_target.read().is_some() {
+            tab.set(ContextTab::Snapshot);
+        }
+    });
+    let cur = *tab.read();
+    rsx! {
+        aside { class: "context-panel",
+            div { class: "ctx-tabs",
+                button {
+                    class: if cur == ContextTab::Preview { "ctx-tab active" } else { "ctx-tab" },
+                    onclick: move |_| tab.set(ContextTab::Preview),
+                    "预览"
+                }
+                button {
+                    class: if cur == ContextTab::Snapshot { "ctx-tab active" } else { "ctx-tab" },
+                    onclick: move |_| tab.set(ContextTab::Snapshot),
+                    "快照"
+                }
+                button {
+                    class: "detail-close",
+                    title: "关闭侧栏",
+                    onclick: move |_| state.context_panel_open.set(false),
+                    "×"
+                }
+            }
+            div { class: "ctx-scroll",
+                match cur {
+                    ContextTab::Preview => rsx! { PreviewTab {} },
+                    ContextTab::Snapshot => rsx! { SnapshotTab {} },
+                }
+            }
+        }
+    }
+}
+
+/// 预览 tab：当前 tip + 工具勾选实时装配出的下一轮请求。换游标、链增长
+/// （新 commit）、改工具勾选都会触发重新拉取。
+#[component]
+fn PreviewTab() -> Element {
+    let mut state = use_context::<AppState>();
+    let mut preview = use_signal(|| None::<ContextPreviewResponse>);
+    let mut failed = use_signal(|| false);
+    use_effect(move || {
+        let cursor = state.current_cursor.read().clone();
+        // 链长度（新节点 commit 后重拉）与工具勾选都是刷新触发源。
+        let _chain_len = state.chain.read().len();
+        let tools = state.tools_override();
+        preview.set(None);
+        failed.set(false);
+        if let Some(cid) = cursor {
+            spawn(async move {
+                match api::get_context_preview(&cid, tools.as_deref()).await {
+                    Ok(p) => preview.set(Some(p)),
+                    Err(e) => {
+                        state.set_error(format!("获取上下文预览失败: {e}"));
+                        failed.set(true);
+                    }
+                }
+            });
+        }
+    });
+
+    // draft 会话（无 cursor）没有服务端装配对象，显示空态。
+    if state.current_cursor.read().is_none() {
+        return rsx! {
+            div { class: "ctx-empty",
+                p { "新会话草稿尚无上下文。" }
+                p { "发送第一条消息后即可预览下一轮请求。" }
+            }
+        };
+    }
+    let data = preview.read().clone();
+    let failed = *failed.read();
+    match data {
+        Some(p) => {
+            let prompt_chars = p.system_prompt.chars().count();
+            rsx! {
+                div { class: "ctx-section",
+                    span { class: "ctx-label", "工具" }
+                    span { class: "badge", "{crate::state::tools_label(&p.tools)}" }
+                }
+                details { class: "ctx-msg ctx-system",
+                    summary {
+                        span { class: "ctx-role ctx-role-system", "system" }
+                        span { class: "ctx-msg-note", "动态组装的系统提示词" }
+                        span { class: "ctx-msg-chars", "{prompt_chars} 字符" }
+                    }
+                    pre { class: "mono", "{p.system_prompt}" }
+                }
+                ContextMessageList { messages: p.messages }
+            }
+        }
+        None if failed => rsx! {
+            div { class: "ctx-empty", p { "预览加载失败（详见顶部错误条）。" } }
+        },
+        None => rsx! {
+            div { class: "detail-loading", "装配预览加载中…" }
+        },
+    }
+}
+
+/// 快照 tab：某个已提交回合一次 LlmCall 的逐字请求记录（首条 System 即
+/// 当时实际生效的系统提示词）。默认显示链上最新 Turn 的最后一次调用；
+/// Turn 气泡的「上下文」按钮把目标切到对应回合。
+#[component]
+fn SnapshotTab() -> Element {
+    let mut state = use_context::<AppState>();
+    let chain = state.chain.read();
+    // 链上有 LlmCall 记录的 Turn（旧数据/纯工具回合可能没有）。
+    let turns: Vec<&Node> = chain
+        .iter()
+        .filter(|n| {
+            matches!(&n.kind, NodeKind::Turn { steps, .. }
+                if steps.iter().any(|s| matches!(s, Step::LlmCall { .. })))
+        })
+        .collect();
+    if turns.is_empty() {
+        return rsx! {
+            div { class: "ctx-empty",
+                p { "链上还没有带调用记录的回合。" }
+                p { "发送一条消息，回合提交后即可查看请求快照。" }
+            }
+        };
+    }
+
+    // 目标解析：snapshot_target 仍指向链上的回合时用它（调用序号夹取到
+    // 有效范围），否则回落到最新 Turn 的最后一次调用。
+    let target = state.snapshot_target.read().clone();
+    let latest = *turns.last().expect("non-empty");
+    let calls_of = |turn: &Node| -> Vec<(Usage, Vec<CoreMessageView>)> {
+        let NodeKind::Turn { steps, .. } = &turn.kind else {
+            unreachable!()
+        };
+        steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::LlmCall { usage, request, .. } => Some((*usage, request.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let (turn, sel) = match &target {
+        Some((id, idx)) if turns.iter().any(|t| &t.id == id) => {
+            let turn = turns.iter().find(|t| &t.id == id).expect("checked");
+            let n = calls_of(turn).len();
+            (*turn, (*idx).min(n - 1))
+        }
+        _ => {
+            let n = calls_of(latest).len();
+            (latest, n - 1)
+        }
+    };
+    let turn_id = turn.id.clone();
+    let calls = calls_of(turn);
+    let (_, request) = calls[sel].clone();
+
+    rsx! {
+        div { class: "ctx-section",
+            span { class: "ctx-label", "回合 #{short_id(&turn_id)}" }
+        }
+        div { class: "ctx-call-switch",
+            for (i, (usage, _)) in calls.iter().enumerate() {
+                {
+                    let tid = turn_id.clone();
+                    rsx! {
+                        div { class: "ctx-call-item", key: "{i}",
+                            button {
+                                class: if i == sel { "ctx-call-btn active" } else { "ctx-call-btn" },
+                                title: "查看本次调用的请求快照",
+                                onclick: move |_| {
+                                    state.snapshot_target.set(Some((tid.clone(), i)));
+                                },
+                                "调用 {i + 1}"
+                            }
+                            span { class: "ctx-call-usage", "{usage_label(usage)}" }
+                        }
+                    }
+                }
+            }
+        }
+        ContextMessageList { messages: request }
+    }
+}
+
+/// 预览 / 快照共用的消息列表：每条一个折叠条目（role 徽标 + 字符数，
+/// 展开看全文），底部汇总条数与总字符数。
+#[component]
+fn ContextMessageList(messages: Vec<CoreMessageView>) -> Element {
+    let total: usize = messages.iter().map(|m| message_text(m).chars().count()).sum();
+    let count = messages.len();
+    rsx! {
+        div { class: "ctx-msg-list",
+            for (i, m) in messages.iter().enumerate() {
+                {
+                    let text = message_text(m);
+                    let chars = text.chars().count();
+                    let role = role_label(m);
+                    rsx! {
+                        details { key: "{i}", class: "ctx-msg",
+                            summary {
+                                span { class: "ctx-role ctx-role-{role}", "{role}" }
+                                match m {
+                                    CoreMessageView::ToolResult { name, .. } => rsx! {
+                                        span { class: "ctx-msg-note mono", "{name}" }
+                                    },
+                                    CoreMessageView::Context { sources, .. } => rsx! {
+                                        span { class: "ctx-msg-note", "来源 {sources.len()} 节点" }
+                                    },
+                                    CoreMessageView::Assistant { tool_calls, .. } if !tool_calls.is_empty() => rsx! {
+                                        span { class: "ctx-msg-note", "{tool_calls.len()} 个工具调用" }
+                                    },
+                                    _ => rsx! {},
+                                }
+                                span { class: "ctx-msg-chars", "{chars} 字符" }
+                            }
+                            pre { class: "mono", "{text}" }
+                        }
+                    }
+                }
+            }
+            div { class: "ctx-summary", "{count} 条消息 · 共 {total} 字符" }
+        }
+    }
+}
+
+fn role_label(m: &CoreMessageView) -> &'static str {
+    match m {
+        CoreMessageView::System { .. } => "system",
+        CoreMessageView::User { .. } => "user",
+        CoreMessageView::Assistant { .. } => "assistant",
+        CoreMessageView::ToolResult { .. } => "tool",
+        CoreMessageView::Context { .. } => "context",
+    }
+}
+
+/// 条目展开后的全文：tool_calls 以 pretty JSON 附在 assistant 文本后。
+fn message_text(m: &CoreMessageView) -> String {
+    match m {
+        CoreMessageView::System { content } | CoreMessageView::User { content } => content.clone(),
+        CoreMessageView::Assistant { content, tool_calls } => {
+            if tool_calls.is_empty() {
+                content.clone()
+            } else {
+                format!(
+                    "{content}\n\n[tool_calls]\n{}",
+                    serde_json::to_string_pretty(tool_calls).unwrap_or_default()
+                )
+            }
+        }
+        CoreMessageView::ToolResult { output, .. } => output.clone(),
+        CoreMessageView::Context { body, .. } => body.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64, reasoning: u64, cached: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            reasoning_tokens: reasoning,
+            cached_input_tokens: cached,
+        }
+    }
+
+    #[test]
+    fn usage_label_omits_zero_parts() {
+        // 无缓存、无思考：只有 ↑in ↓out。
+        assert_eq!(usage_label(&usage(932, 120, 0, 0)), "↑932 ↓120");
+        // input 为 0 时不显示缓存（除零保护）。
+        assert_eq!(usage_label(&usage(0, 0, 0, 0)), "↑0 ↓0");
+    }
+
+    #[test]
+    fn usage_label_cache_percentage() {
+        assert_eq!(
+            usage_label(&usage(200, 50, 0, 100)),
+            "↑200 ↓50 · 缓存100(50%)"
+        );
+        // 有缓存但 input 为 0：省略缓存部分（pct 无意义）。
+        assert_eq!(usage_label(&usage(0, 5, 0, 3)), "↑0 ↓5");
+    }
+
+    #[test]
+    fn usage_label_reasoning_part() {
+        assert_eq!(usage_label(&usage(100, 20, 30, 0)), "↑100 ↓20 · 思考30");
+        // 缓存在前、思考在后。
+        assert_eq!(
+            usage_label(&usage(1000, 200, 40, 250)),
+            "↑1000 ↓200 · 缓存250(25%) · 思考40"
+        );
     }
 }

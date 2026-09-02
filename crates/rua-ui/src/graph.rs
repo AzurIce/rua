@@ -1,8 +1,9 @@
 //! Graph view: the whole DAG on a dioxus-flow canvas, with a detail side panel.
 //!
-//! Layout is a strict directory tree (pre-order rows, depth-indented columns);
-//! the caller (us) owns data and layout while `FlowCanvas` owns pan/zoom,
-//! node dragging, and edge rendering.
+//! Layout: conversation chains run horizontally (one node per column, same
+//! row); spawn subtrees and forks drop down from the parent's column as new
+//! chains. The caller (us) owns data and layout while `FlowCanvas` owns
+//! pan/zoom, node dragging, and edge rendering.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +15,7 @@ use dioxus_flow::{
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::chat::{compact_args, markdown_html};
+use crate::chat::{compact_args, markdown_html, usage_label};
 use crate::state::{AppState, Inflight, InflightItem, detach_current_cursor, move_current_cursor, send_current_input};
 use crate::types::*;
 
@@ -31,16 +32,15 @@ const FIT_MIN_ZOOM: f64 = 0.2;
 const FIT_MAX_ZOOM: f64 = 1.5;
 const FOCUS_ZOOM: f64 = 1.0;
 
-/// 目录树布局（纯函数）：先序展开、按深度缩进，但「输入 → 回合」是 1:1
-/// 的交换对，不配占用缩进——两者占同一行（输入在 col，回合在 col+1），
-/// 一条水平直线相连。
-/// - **树父**：parent（会话前后相继）优先，否则 created_by（spawn 溯源），
-///   都没有就是根——每个节点在树上只出现一次，两种关系共用一套结构
-///   （spawn 边仍画成虚线以区分溯源）；
-/// - **交换对**：输入唯一的回合孩子放在它右侧一格、同一行；回合的孩子们
-///   （会话后继 / spawn 子树）从下一行、**回合那一列**开始——每跳交换只
-///   向右漂移一列；
-/// - **Y = 先序行号 × ROW_H**：父必在子之上，兄弟按 created_at；绝不重叠；
+/// 水平链布局（纯函数）：会话主链横着走，spawn / fork 垂直成子树。
+/// - **链**：沿 parent（会话后继）的「第一个孩子」（created_at 最早）一路
+///   向右——输入、回合、下一个输入……一节点一列，全部同一行，继续输入
+///   就是主链向右延续；
+/// - **子树**：一个节点的其余孩子另起新行——spawn 子会话（created_by，
+///   虚线溯源边）和 fork（同一回合的多个后继输入）都从父节点那一列垂直
+///   向下，各自成为一条新的水平链；
+/// - **行分配**：链队列 BFS——父链整行放完后，它引出的子链依次占据下面
+///   的行。父必在子之上，一链独占一行，绝不重叠；
 /// - **Context 材料节点**：排在结构树最下方，每个独占一行，列基准取最深
 ///   「引入者」（context_refs 含它的结构节点）的列 + 1，没有引入者退回
 ///   最深 source。
@@ -51,68 +51,70 @@ fn is_context(m: &NodeMeta) -> bool {
 }
 
 fn layout(metas: &HashMap<String, NodeMeta>) -> HashMap<String, Point> {
-    // 树父 = parent ?? created_by（都必须存在于 metas，否则当根）。
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    // parent 孩子（会话后继）与 created_by 孩子（spawn 溯源）分开收集；
+    // 两者都没有（或父引用悬空）的是会话根。parent 优先：一个节点理论上
+    // 可以同时有两者，此时它参与主链，created_by 只画溯源边。
+    let mut cont_children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut spawn_children: HashMap<String, Vec<String>> = HashMap::new();
     let mut roots: Vec<&NodeMeta> = Vec::new();
     for meta in metas.values().filter(|m| !is_context(m)) {
-        let tree_parent = meta
-            .parent
-            .as_deref()
-            .filter(|p| metas.contains_key(*p))
-            .or_else(|| meta.created_by.as_deref().filter(|c| metas.contains_key(*c)));
-        match tree_parent {
-            Some(p) => children.entry(p.to_string()).or_default().push(meta.id.clone()),
-            None => roots.push(meta),
+        if let Some(p) = meta.parent.as_deref().filter(|p| metas.contains_key(*p)) {
+            cont_children
+                .entry(p.to_string())
+                .or_default()
+                .push(meta.id.clone());
+        } else if let Some(c) = meta.created_by.as_deref().filter(|c| metas.contains_key(*c)) {
+            spawn_children
+                .entry(c.to_string())
+                .or_default()
+                .push(meta.id.clone());
+        } else {
+            roots.push(meta);
         }
     }
     roots.sort_by_key(|m| m.created_at);
-    for ids in children.values_mut() {
-        ids.sort_by_key(|id| metas.get(id).map(|m| m.created_at).unwrap_or(0));
+    let by_created = |id: &String| metas.get(id).map(|m| m.created_at).unwrap_or(0);
+    for ids in cont_children.values_mut().chain(spawn_children.values_mut()) {
+        ids.sort_by_key(by_created);
     }
 
-    // 迭代先序（显式栈，长链不爆递归；子节点逆序压栈保持正序弹出）。
-    // 栈里是 (节点, 列)；每行放一个交换对（或一个落单节点）。
+    // 链队列：(链首节点, 起始列)。BFS——每链独占一行，行号按出队顺序
+    // 递增；父链引出的子链入队尾，保证父行必在子行之上。
     let mut pos: HashMap<String, Point> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut row = 0usize;
-    let mut stack: Vec<(&str, usize)> = roots
+    let mut next_row = 0usize;
+    let mut queue: std::collections::VecDeque<(String, usize)> = roots
         .iter()
-        .rev()
-        .map(|m| (m.id.as_str(), 0usize))
+        .map(|m| (m.id.clone(), 0usize))
         .collect();
-    while let Some((id, col)) = stack.pop() {
-        if !seen.insert(id.to_string()) {
-            continue;
-        }
-        pos.insert(
-            id.to_string(),
-            Point::new(col as f64 * COL_W, row as f64 * ROW_H),
-        );
-        row += 1;
-        let kids = children.get(id);
-        // 输入唯一的回合孩子：放到同一行右侧，它的孩子们从它那列继续。
-        let paired_turn = kids.and_then(|ks| {
-            (ks.len() == 1
-                && metas
-                    .get(ks[0].as_str())
-                    .is_some_and(|m| m.kind == NodeKindTag::Turn))
-            .then_some(ks[0].as_str())
-        });
-        if let Some(turn) = paired_turn {
-            seen.insert(turn.to_string());
+    while let Some((start, start_col)) = queue.pop_front() {
+        let row = next_row;
+        next_row += 1;
+        let mut col = start_col;
+        let mut cur = Some(start);
+        while let Some(id) = cur {
+            if !seen.insert(id.clone()) {
+                break;
+            }
             pos.insert(
-                turn.to_string(),
-                Point::new((col + 1) as f64 * COL_W, (row - 1) as f64 * ROW_H),
+                id.clone(),
+                Point::new(col as f64 * COL_W, row as f64 * ROW_H),
             );
-            if let Some(grandkids) = children.get(turn) {
-                for kid in grandkids.iter().rev() {
-                    stack.push((kid.as_str(), col + 1));
+            // spawn 子会话：从创建者那一列垂直向下，另起一条链。
+            if let Some(kids) = spawn_children.get(&id) {
+                for kid in kids {
+                    queue.push_back((kid.clone(), col));
                 }
             }
-        } else if let Some(kids) = kids {
-            for kid in kids.iter().rev() {
-                stack.push((kid.as_str(), col + 1));
+            // 会话后继：第一个孩子延续本行向右，其余 fork 从该列垂直向下
+            // 另起一条链。
+            cur = cont_children.get(&id).and_then(|ks| ks.first().cloned());
+            if let Some(kids) = cont_children.get(&id) {
+                for kid in kids.iter().skip(1) {
+                    queue.push_back((kid.clone(), col));
+                }
             }
+            col += 1;
         }
     }
 
@@ -263,6 +265,7 @@ pub fn GraphView() -> Element {
                     context_tokens: None,
                     created_by: None,
                     model: None,
+                    tools: vec![],
                     preview,
                 },
             );
@@ -346,11 +349,11 @@ pub fn GraphView() -> Element {
         })
         .collect();
 
-    // ---- edges: 「输入→回合」同行，走水平直线；「回合→下一个输入」同列
-    // 换行，走垂直直线（会话后继实线、spawn 虚线区分溯源）；引用边只画
-    // 「引入」：结构节点（input/turn）→ 它引入的 context 节点（纵向虚线，
-    // 材料带在结构树下方）。context 节点的溯源不画边，留在详情面板的
-    // 「源自」列表里。 ----
+    // ---- edges: 同一行的（输入→回合、回合→主链后继输入）走水平直线；
+    // 跨行的（fork 子链、spawn 溯源）走垂直直线——spawn 虚线区分溯源，
+    // fork 实线。引用边只画「引入」：结构节点（input/turn）→ 它引入的
+    // context 节点（纵向虚线，材料带在结构树下方）。context 节点的溯源不
+    // 画边，留在详情面板的「源自」列表里。 ----
     let hover_chain: Option<HashSet<String>> = hovered.read().as_ref().map(|id| {
         let mut set = HashSet::new();
         let mut cur = Some(id.clone());
@@ -365,9 +368,12 @@ pub fn GraphView() -> Element {
     let mut edges: Vec<FlowEdge> = Vec::new();
     for meta in metas.values() {
         if let Some(parent) = meta.parent.as_deref().filter(|p| metas.contains_key(*p)) {
-            // 交换对内（输入→回合）同一行，水平直线；回合的孩子在下一行
-            // 同一列，垂直直线。
-            let route = if meta.kind == NodeKindTag::Turn {
+            // 同行（主链延续）水平直线；跨行（fork 子链）垂直直线。
+            let same_row = auto
+                .get(parent)
+                .zip(auto.get(&meta.id))
+                .is_some_and(|(a, b)| a.y == b.y);
+            let route = if same_row {
                 EdgeRoute::Horizontal
             } else {
                 EdgeRoute::Vertical
@@ -639,17 +645,8 @@ fn node_card(
     spawn_collapsed: bool,
 ) -> Element {
     let kind = kind_label(meta.kind);
-    // 「发送过的 model」+ 缓存命中率（判断前缀缓存覆盖到哪个位置）。
-    let model_info = meta.model.as_ref().map(|model| {
-        let mut s = crate::chat::short_model(model).to_string();
-        if let Some(usage) = &meta.usage
-            && usage.input_tokens > 0
-            && usage.cached_input_tokens > 0
-        {
-            s = format!("{s} · 缓存 {}%", usage.cached_input_tokens * 100 / usage.input_tokens);
-        }
-        s
-    });
+    // 「发送过的 model」标签只显示模型名（缓存信息收归卡片底行，职责分离）。
+    let model_info = meta.model.as_ref().map(|model| crate::chat::short_model(model));
     let strip_class = if spawn_count > 0 { "fcard-strip" } else { "" };
     rsx! {
         div { class: "fcard fcard-{kind} {strip_class}",
@@ -674,7 +671,12 @@ fn node_card(
                     }
                 }
                 if let Some(usage) = &meta.usage {
-                    span { class: "fcard-usage", "↑{usage.input_tokens} ↓{usage.output_tokens}" }
+                    span { class: "fcard-usage",
+                        "↑{usage.input_tokens} ↓{usage.output_tokens}"
+                        if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
+                            " · 缓存{usage.cached_input_tokens * 100 / usage.input_tokens}%"
+                        }
+                    }
                 }
             }
             if spawn_count > 0 {
@@ -854,6 +856,12 @@ fn DetailPanel() -> Element {
                             dt { "model" }
                             dd { "{model}" }
                         }
+                        if matches!(meta.kind, NodeKindTag::Input | NodeKindTag::Turn) {
+                            // Input = 请求的工具列表；Turn = 该轮有效集
+                            // （depth 到顶等隐式变化在这可见）。
+                            dt { "工具" }
+                            dd { "{crate::state::tools_label(&meta.tools)}" }
+                        }
                     }
                     if !meta.preview.is_empty() {
                         div { class: "detail-preview", "{meta.preview}" }
@@ -962,9 +970,7 @@ fn NodeBody(node: Node) -> Element {
                 div { class: "bubble-footer",
                     span { class: "bubble-model", "{model}" }
                     span { class: "badge outcome-{outcome.label()}", "{outcome.label()}" }
-                    span { class: "bubble-usage",
-                        "↑{usage.input_tokens} ↓{usage.output_tokens} tokens"
-                    }
+                    span { class: "bubble-usage", "{usage_label(usage)}" }
                 }
                 for step in steps {
                     match step {
@@ -979,10 +985,7 @@ fn NodeBody(node: Node) -> Element {
                                 div { class: "bubble-text markdown", dangerous_inner_html: markdown_html(response_text) }
                             }
                             div { class: "step-usage",
-                                "本次调用 ↑{usage.input_tokens} ↓{usage.output_tokens}"
-                                if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
-                                    " · 缓存 {usage.cached_input_tokens * 100 / usage.input_tokens}%"
-                                }
+                                "本次调用 {usage_label(usage)}"
                             }
                         },
                         Step::ToolExec { name, args, output, duration_ms, .. } => rsx! {
@@ -1147,6 +1150,7 @@ mod layout_tests {
                 context_tokens: None,
                 created_by: created_by.map(str::to_string),
                 model: None,
+                tools: vec![],
                 preview: String::new(),
             }
         }
