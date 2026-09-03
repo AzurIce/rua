@@ -3,7 +3,10 @@
 //! UI = a view onto the graph + a set of cursors (each cursor is a session).
 //! The graph itself lives in the daemon; here we keep:
 //! - `metas`: every known node meta (drives the graph view),
-//! - `chain`: the current cursor's chain with full bodies (drives chat),
+//! - `chain`: the current cursor's chain as light metas (drives the chat
+//!   list; Input 正文内联在 meta.text，Turn 不含 steps),
+//! - `turn_details`: lazily fetched turn bodies (get_node), invalidated on
+//!   commit events,
 //! - `inflights`: in-flight turn accumulators keyed by node id — multiple
 //!   cursors may run turns in parallel on different branches.
 
@@ -106,6 +109,17 @@ impl Inflight {
             .collect();
         text.chars().take(max).collect()
     }
+
+    /// 流式内容总量（字节），滚动跟随的 effect 靠它感知 delta 增长。
+    pub fn content_len(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| match item {
+                InflightItem::Text(t) | InflightItem::Reasoning(t) => t.len(),
+                InflightItem::Tool(t) => t.output_preview.as_ref().map_or(0, |p| p.len()),
+            })
+            .sum()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -130,7 +144,19 @@ pub struct AppState {
     /// 前缀缓存失效，开发测试时这正是目的。
     pub tools_off: Signal<std::collections::HashSet<String>>,
     pub metas: Signal<HashMap<String, NodeMeta>>,
-    pub chain: Signal<Vec<Node>>,
+    /// 当前游标的链：轻量 meta 列表（chain 端点不含 steps；Input 正文在
+    /// meta.text 里）。Turn 的 steps 详情见 `turn_details`。
+    pub chain: Signal<Vec<NodeMeta>>,
+    /// Turn 详情缓存（get_node 懒加载填充，滚动近视口才拉）。TurnCommitted
+    /// 后对应条目失效。
+    pub turn_details: Signal<HashMap<String, Node>>,
+    /// 正在拉取的详情请求（防重复）。
+    pub detail_pending: Signal<std::collections::HashSet<String>>,
+    /// 聊天视图当前聚焦的 Turn（视口内最靠上的可见容器，滚动即更新；
+    /// 驱动右侧 inspect 侧栏与左侧导航条高亮）。
+    pub focused_turn: Signal<Option<String>>,
+    /// 聊天主区是否跟随流式输出贴底（用户上滚解除，回底恢复）。
+    pub follow_bottom: Signal<bool>,
     /// In-flight turns keyed by turn node id (one per running cursor).
     pub inflights: Signal<HashMap<String, Inflight>>,
     pub conn: Signal<ConnState>,
@@ -149,11 +175,8 @@ pub struct AppState {
     pub selection: Signal<std::collections::HashSet<String>>,
     pub clipboard: Signal<Option<(String, Vec<String>)>>,
     pub draft: Signal<String>,
-    /// 聊天视图的上下文侧栏开关（默认关）。
+    /// 聊天视图的 inspect 侧栏开关（默认关）。
     pub context_panel_open: Signal<bool>,
-    /// 快照 tab 的目标：(turn 节点 id, LlmCall 序号)。由 Turn 气泡的
-    /// 「上下文」按钮设置；None = 默认显示链上最新 Turn 的最后一次调用。
-    pub snapshot_target: Signal<Option<(String, usize)>>,
     pub booted: Signal<bool>,
 }
 
@@ -385,6 +408,8 @@ pub async fn handle_event(mut state: AppState, ev: WsEvent) {
             ..
         } => {
             state.inflights.write().remove(node_id);
+            // 提交的 turn 详情若曾被懒加载（不会：commit 前端点 404），防御性失效。
+            state.turn_details.write().remove(node_id);
             if current.as_ref() == Some(cursor_id) {
                 refresh_chain(state).await;
             }
@@ -422,6 +447,10 @@ pub async fn handle_event(mut state: AppState, ev: WsEvent) {
             // 活跃图被换（任何客户端发起）：丢弃所有图派生状态，从头来。
             state.metas.set(Default::default());
             state.chain.set(Vec::new());
+            state.turn_details.set(Default::default());
+            state.detail_pending.set(Default::default());
+            state.focused_turn.set(None);
+            state.follow_bottom.set(true);
             state.inflights.set(Default::default());
             state.selected.set(None);
             state.selected_body.set(None);
@@ -532,6 +561,8 @@ pub async fn send_current_input(mut state: AppState, text: String) {
         },
     };
     state.draft.set(String::new());
+    // 新轮提交后默认回到底部并恢复跟随。
+    state.follow_bottom.set(true);
     // The input node is committed synchronously; make it visible
     // immediately instead of waiting for the turn to finish.
     state
@@ -557,4 +588,26 @@ pub fn enter_draft(mut state: AppState, attach_to: Option<String>) {
     state.current_cursor.set(None);
     state.pending_attach.set(attach_to);
     state.chain.set(Vec::new());
+    state.focused_turn.set(None);
+    state.follow_bottom.set(true);
+}
+
+/// 懒加载 turn 详情：缓存未命中且无重复在飞请求时才拉取（chat 的
+/// IntersectionObserver 与 inspect 侧栏共用这一条路径）。
+pub fn load_turn_detail(mut state: AppState, node_id: String) {
+    if state.turn_details.read().contains_key(&node_id) {
+        return;
+    }
+    if !state.detail_pending.write().insert(node_id.clone()) {
+        return;
+    }
+    spawn(async move {
+        match api::get_node(&node_id).await {
+            Ok(node) => {
+                state.turn_details.write().insert(node_id.clone(), node);
+            }
+            Err(e) => state.set_error(format!("获取节点详情失败: {e}")),
+        }
+        state.detail_pending.write().remove(&node_id);
+    });
 }

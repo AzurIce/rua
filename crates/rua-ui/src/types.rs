@@ -59,6 +59,10 @@ pub struct NodeMeta {
     /// 空 = 未记录（旧数据）或无工具。
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Input 节点的完整正文（内联在 meta 里）；其它 kind 为 None。聊天视图
+    /// 的输入气泡直接用它渲染，不需要详情请求。
+    #[serde(default)]
+    pub text: Option<String>,
     pub preview: String,
 }
 
@@ -102,9 +106,9 @@ pub struct Usage {
     pub cached_input_tokens: u64,
 }
 
-/// Mirror of rua-core's `CoreMessage`（`#[serde(tag = "role")]`）：装配出的
+/// Mirror of rua-graph 的 `CoreMessage`（`#[serde(tag = "role")]`）：装配出的
 /// provider 无关消息 IR。上下文侧栏逐条展示的就是它（预览 = 即将发送的
-/// 装配结果；快照 = `Step::LlmCall.request` 的逐字记录）。
+/// 装配结果；快照 = server 按 init 锚点重放重建的 `Step::LlmCall.request`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum CoreMessageView {

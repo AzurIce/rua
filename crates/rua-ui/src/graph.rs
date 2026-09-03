@@ -266,6 +266,7 @@ pub fn GraphView() -> Element {
                     created_by: None,
                     model: None,
                     tools: vec![],
+                    text: None,
                     preview,
                 },
             );
@@ -782,6 +783,32 @@ fn DetailPanel() -> Element {
     let busy = state.busy();
     let mut panel_draft = use_signal(String::new);
 
+    // 滚动跟随：在底部（阈值 40px）则新内容贴底，用户上滚后不拽回。
+    // 切换节点时回顶并重置跟随；at_bottom 用 peek 读，避免效果自我触发。
+    let mut detail_scroll = use_signal(|| None::<web_sys::HtmlElement>);
+    let mut at_bottom = use_signal(|| true);
+    let mut last_selected = use_signal(|| None::<String>);
+    use_effect(move || {
+        let sel = state.selected.read().clone();
+        let _body = state.selected_body.read();
+        let _inflight_len: usize = state
+            .inflights
+            .read()
+            .values()
+            .map(|t| t.content_len())
+            .sum();
+        let Some(el) = detail_scroll.read().clone() else {
+            return;
+        };
+        if *last_selected.peek() != sel {
+            last_selected.set(sel);
+            at_bottom.set(true);
+            el.set_scroll_top(0);
+        } else if *at_bottom.peek() {
+            el.set_scroll_top(el.scroll_height());
+        }
+    });
+
     let mut send = move || {
         let text = panel_draft.read().trim().to_string();
         if text.is_empty() || state.busy() {
@@ -804,7 +831,22 @@ fn DetailPanel() -> Element {
                 }
             }
             // 中间内容区滚动；底部输入框固定。
-            div { class: "detail-scroll",
+            div {
+                class: "detail-scroll",
+                onmounted: move |event| {
+                    if let Some(el) = event.data().downcast::<web_sys::Element>() {
+                        detail_scroll.set(Some(el.clone().unchecked_into::<web_sys::HtmlElement>()));
+                    }
+                },
+                onscroll: move |_| {
+                    if let Some(el) = detail_scroll.read().as_ref() {
+                        let bottom =
+                            el.scroll_height() - el.scroll_top() - el.client_height() <= 40;
+                        if *at_bottom.peek() != bottom {
+                            at_bottom.set(bottom);
+                        }
+                    }
+                },
                 if let Some(meta) = &meta {
                     dl { class: "detail-meta",
                         dt { "类型" }
@@ -1151,6 +1193,7 @@ mod layout_tests {
                 created_by: created_by.map(str::to_string),
                 model: None,
                 tools: vec![],
+                text: None,
                 preview: String::new(),
             }
         }

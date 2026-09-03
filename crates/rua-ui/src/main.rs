@@ -43,6 +43,10 @@ fn App() -> Element {
         pending_attach: use_signal(|| None),
         metas: use_signal(Default::default),
         chain: use_signal(Vec::new),
+        turn_details: use_signal(Default::default),
+        detail_pending: use_signal(Default::default),
+        focused_turn: use_signal(|| None),
+        follow_bottom: use_signal(|| true),
         inflights: use_signal(Default::default),
         conn: use_signal(|| ConnState::Disconnected),
         error: use_signal(|| None),
@@ -54,7 +58,6 @@ fn App() -> Element {
         clipboard: use_signal(|| None),
         draft: use_signal(String::new),
         context_panel_open: use_signal(|| false),
-        snapshot_target: use_signal(|| None),
         booted: use_signal(|| false),
     };
     use_context_provider(|| state);

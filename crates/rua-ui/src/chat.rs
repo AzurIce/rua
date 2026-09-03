@@ -1,15 +1,31 @@
 //! Chat view: the current cursor's chain as a conversation.
+//!
+//! 链数据是轻量 meta（chain 端点不含 steps；Input 正文内联在 meta.text）。
+//! 每个 Turn（连同它的输入气泡）一个容器 `turn-<node_id>`，steps 详情经
+//! IntersectionObserver（±400px 预取）懒加载进 `state.turn_details`。
+//! 滚动跟随：用户在底部（阈值 40px）时新内容贴底，上滚解除并显示
+//! 「回到底部」浮钮。左侧 TurnNav 刻度导航，右侧 inspect 侧栏跟随
+//! `focused_turn`（视口内最靠上的可见 Turn）。
 
 use dioxus::prelude::*;
+use wasm_bindgen::JsCast;
 
-use crate::api;
-use crate::state::{AppState, Inflight, InflightItem, cancel_current_turn, move_current_cursor, send_current_input};
+use crate::state::{
+    AppState, Inflight, InflightItem, cancel_current_turn, load_turn_detail, move_current_cursor,
+    send_current_input,
+};
 use crate::types::*;
+
+/// 贴底判定阈值（px）。
+const BOTTOM_THRESHOLD: f64 = 40.0;
+/// Turn 详情懒加载的预取余量（rootMargin）。
+const PREFETCH_MARGIN: &str = "400px 0px";
 
 /// Assistant 文本按 markdown 渲染成 HTML，由调用方用 `dangerous_inner_html`
 /// 注入。内容来自本地自用的 LLM（rua-server 单用户、只绑 127.0.0.1），
 /// 不做 HTML 消毒。
-pub(crate) fn markdown_html(text: &str) -> String {    let options = pulldown_cmark::Options::ENABLE_TABLES
+pub(crate) fn markdown_html(text: &str) -> String {
+    let options = pulldown_cmark::Options::ENABLE_TABLES
         | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
         | pulldown_cmark::Options::ENABLE_TASKLISTS;
     let parser = pulldown_cmark::Parser::new_ext(text, options);
@@ -18,20 +34,155 @@ pub(crate) fn markdown_html(text: &str) -> String {    let options = pulldown_cm
     out
 }
 
+fn element_by_id(id: &str) -> Option<web_sys::Element> {
+    web_sys::window()?.document()?.get_element_by_id(id)
+}
+
+/// 定位到某个 Turn 容器（instant，避免平滑滚动途中聚焦闪烁）。
+fn scroll_to_turn(turn_id: &str) {
+    if let Some(el) = element_by_id(&format!("turn-{turn_id}")) {
+        let opts = web_sys::ScrollIntoViewOptions::new();
+        opts.set_block(web_sys::ScrollLogicalPosition::Start);
+        el.scroll_into_view_with_scroll_into_view_options(&opts);
+    }
+}
+
+/// 定位并聚焦某个 Turn（导航条点击/滚轮跳轮、气泡「上下文」按钮共用）。
+fn jump_to_turn(mut state: AppState, turn_id: &str) {
+    state.focused_turn.set(Some(turn_id.to_string()));
+    scroll_to_turn(turn_id);
+}
+
+/// 聚焦 Turn = 视口内最靠上的可见 Turn 容器（容器底边越过滚动口顶沿
+/// 即算可见）；一个都够不到时回退到链上最后一个。
+fn update_focus(mut state: AppState, turn_ids: &[String], scroller: &web_sys::HtmlElement) {
+    let top = scroller.get_bounding_client_rect().top();
+    let mut focused = None;
+    for id in turn_ids {
+        if let Some(el) = element_by_id(&format!("turn-{id}"))
+            && el.get_bounding_client_rect().bottom() > top + 8.0
+        {
+            focused = Some(id.clone());
+            break;
+        }
+    }
+    if focused.is_none() {
+        focused = turn_ids.last().cloned();
+    }
+    if state.focused_turn.peek().as_ref() != focused.as_ref() {
+        state.focused_turn.set(focused);
+    }
+}
+
+/// 链分组：Input + 紧随的 Turn 一对一个容器；Context 材料不进对话流；
+/// 没有配对 Turn 的 Input（连续两个、或末尾新提交而 turn 尚在飞）单列。
+struct TurnGroup {
+    input: Option<NodeMeta>,
+    turn: NodeMeta,
+}
+
+enum ChatItem {
+    Turn(TurnGroup),
+    StrayInput(NodeMeta),
+}
+
+fn group_chain(chain: &[NodeMeta]) -> Vec<ChatItem> {
+    let mut items = Vec::new();
+    let mut pending: Option<NodeMeta> = None;
+    for meta in chain {
+        match meta.kind {
+            NodeKindTag::Input => {
+                if let Some(prev) = pending.replace(meta.clone()) {
+                    items.push(ChatItem::StrayInput(prev));
+                }
+            }
+            NodeKindTag::Turn => {
+                items.push(ChatItem::Turn(TurnGroup {
+                    input: pending.take(),
+                    turn: meta.clone(),
+                }));
+            }
+            NodeKindTag::Context => {}
+        }
+    }
+    if let Some(rest) = pending {
+        items.push(ChatItem::StrayInput(rest));
+    }
+    items
+}
+
 #[component]
 pub fn ChatView() -> Element {
-    let state = use_context::<AppState>();
+    let mut state = use_context::<AppState>();
     let chain = state.chain.read();
     let busy = state.busy();
     let draft_mode = state.current_cursor.read().is_none();
     let pending_attach = state.pending_attach.read().clone();
     let panel_open = *state.context_panel_open.read();
+    let follow = *state.follow_bottom.read();
 
+    let mut scroll_el = use_signal(|| None::<web_sys::HtmlElement>);
+
+    let items = group_chain(&chain);
+    let empty = items.is_empty();
+    let turn_ids: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Turn(g) => Some(g.turn.id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // 切换会话 / 链增长 / 流式新内容：跟随模式下保持贴底（instant）；
+    // 无论是否跟随都重算聚焦（内容不滚动时 onscroll 不会触发）。
+    {
+        let focus_ids = turn_ids.clone();
+        use_effect(move || {
+            let _cursor = state.current_cursor.read();
+            let _chain_len = state.chain.read().len();
+            let _inflight_len = state.current_inflight().map(|t| t.content_len());
+            if let Some(el) = scroll_el.read().clone() {
+                if *state.follow_bottom.read() {
+                    el.set_scroll_top(el.scroll_height());
+                }
+                update_focus(state, &focus_ids, &el);
+            }
+        });
+    }
+
+    // 切换会话（含初次进入）：强制回到底部并恢复跟随。
+    use_effect(move || {
+        let _cursor = state.current_cursor.read();
+        state.follow_bottom.set(true);
+        if let Some(el) = scroll_el.read().clone() {
+            el.set_scroll_top(el.scroll_height());
+        }
+    });
+
+    let scroll_turn_ids = turn_ids.clone();
     rsx! {
         div { class: "chat-view",
+            TurnNav {}
             div { class: "chat-main",
-                div { class: "chat-scroll",
-                    if chain.is_empty() {
+                div {
+                    class: "chat-scroll",
+                    onmounted: move |event| {
+                        if let Some(el) = event.data().downcast::<web_sys::Element>() {
+                            scroll_el.set(Some(el.clone().unchecked_into::<web_sys::HtmlElement>()));
+                        }
+                    },
+                    onscroll: move |_| {
+                        let Some(el) = scroll_el.read().clone() else { return };
+                        let at_bottom = el.scroll_height()
+                            - el.scroll_top()
+                            - el.client_height()
+                            <= BOTTOM_THRESHOLD as i32;
+                        if *state.follow_bottom.peek() != at_bottom {
+                            state.follow_bottom.set(at_bottom);
+                        }
+                        update_focus(state, &scroll_turn_ids, &el);
+                    },
+                    if empty {
                         div { class: "chat-empty",
                             if draft_mode {
                                 p { "新会话草稿（尚未创建）。" }
@@ -45,76 +196,174 @@ pub fn ChatView() -> Element {
                             }
                         }
                     }
-                    for node in chain.iter() {
-                        // Context 节点是材料，不出现在对话流里。
-                        if !matches!(node.kind, NodeKind::Context { .. }) {
-                            Bubble { key: "{node.id}", node: node.clone() }
+                    for item in items {
+                        {
+                            match item {
+                                ChatItem::Turn(group) => rsx! {
+                                    TurnContainer {
+                                        key: "{group.turn.id}",
+                                        input: group.input,
+                                        turn: group.turn,
+                                    }
+                                },
+                                ChatItem::StrayInput(meta) => rsx! {
+                                    InputBubble { key: "{meta.id}", meta }
+                                },
+                            }
                         }
                     }
                     if let Some(turn) = state.current_inflight() {
                         InflightBubble { turn }
                     }
                 }
+                if !follow {
+                    button {
+                        class: "jump-bottom-btn",
+                        title: "回到底部并恢复跟随流式输出",
+                        onclick: move |_| {
+                            state.follow_bottom.set(true);
+                            if let Some(el) = scroll_el.read().clone() {
+                                let opts = web_sys::ScrollToOptions::new();
+                                opts.set_top(el.scroll_height() as f64);
+                                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                                el.scroll_with_scroll_to_options(&opts);                            }
+                        },
+                        "回到底部 ↓"
+                    }
+                }
                 InputArea { busy }
             }
             if panel_open {
-                ContextPanel {}
+                InspectPanel {}
             }
         }
     }
 }
 
+/// IntersectionObserver 持有器：组件卸载时先 disconnect 再释放回调闭包，
+/// 避免 JS 回调打进已释放的 Rust 闭包。
+struct TurnObserver {
+    observer: web_sys::IntersectionObserver,
+    _closure: wasm_bindgen::closure::Closure<
+        dyn FnMut(Vec<web_sys::IntersectionObserverEntry>, web_sys::IntersectionObserver),
+    >,
+}
+
+impl Drop for TurnObserver {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+    }
+}
+
+/// 一个 Turn 容器：输入气泡（meta.text 直接渲染）+ Turn 气泡。header /
+/// footer 用 meta 渲染（actor、model、outcome、usage 都在），steps 区域
+/// 懒加载——容器接近视口（±400px）且缓存未命中时才 get_node，未加载时
+/// 渲染骨架以减少滚动跳动。
 #[component]
-fn Bubble(node: Node) -> Element {
-    match &node.kind {
-        NodeKind::Input { text, actor, tools } => {
-            rsx! {
-                div { class: "bubble bubble-input",
-                    div { class: "bubble-header",
-                        span { class: "bubble-actor", "{actor}" }
-                        span { class: "bubble-id", "#{short_id(&node.id)}" }
-                        span { class: "badge", "{crate::state::tools_label(tools)}" }
-                    }
-                    div { class: "bubble-text", "{text}" }
-                }
-            }
+fn TurnContainer(input: Option<NodeMeta>, turn: NodeMeta) -> Element {
+    let state = use_context::<AppState>();
+    let turn_id = turn.id.clone();
+    let detail = state.turn_details.read().get(&turn_id).cloned();
+    let mut near = use_signal(|| false);
+    let mut observer = use_signal(|| None::<TurnObserver>);
+
+    let effect_id = turn_id.clone();
+    use_effect(move || {
+        if *near.read() && !state.turn_details.read().contains_key(&effect_id) {
+            load_turn_detail(state, effect_id.clone());
         }
-        NodeKind::Turn {
-            steps,
-            outcome,
-            actor,
-            model,
-            usage,
-            ..
-        } => {
-            let outcome = *outcome;
-            // LlmCall 次数：有调用记录的回合才能看上下文快照。
-            let llm_calls = steps
-                .iter()
-                .filter(|s| matches!(s, Step::LlmCall { .. }))
-                .count();
-            rsx! {
-                div { class: "bubble bubble-turn outcome-{outcome.label()}",
-                    div { class: "bubble-header",
-                        span { class: "bubble-actor", "{actor}" }
-                        span { class: "bubble-id", "#{short_id(&node.id)}" }
-                        if llm_calls > 0 {
-                            SnapshotButton { node_id: node.id.clone(), last_call: llm_calls - 1 }
+    });
+
+    // chain 上的 Turn 都已提交，outcome 必有；None 只是防御性兜底。
+    let outcome = turn.outcome.unwrap_or(Outcome::Completed);
+    rsx! {
+        div {
+            class: "turn-container",
+            id: "turn-{turn_id}",
+            onmounted: move |event| {
+                let Some(el) = event.data().downcast::<web_sys::Element>().cloned() else {
+                    return;
+                };
+                let target = el.clone();
+                let cb = wasm_bindgen::closure::Closure::new(
+                    move |entries: Vec<web_sys::IntersectionObserverEntry>,
+                          obs: web_sys::IntersectionObserver| {
+                        if entries.iter().any(|e| e.is_intersecting()) {
+                            near.set(true);
+                            obs.unobserve(&target);
                         }
-                        ForkButton { node_id: node.id.clone() }
+                    },
+                );
+                let init = web_sys::IntersectionObserverInit::new();
+                init.set_root_margin(PREFETCH_MARGIN);
+                match web_sys::IntersectionObserver::new_with_options(
+                    cb.as_ref().unchecked_ref(),
+                    &init,
+                ) {
+                    Ok(obs) => {
+                        obs.observe(&el);
+                        observer.set(Some(TurnObserver {
+                            observer: obs,
+                            _closure: cb,
+                        }));
                     }
-                    for step in steps {
-                        StepView { step: step.clone() }
-                    }
-                    div { class: "bubble-footer",
+                    // IntersectionObserver 不可用时退化为立即加载。
+                    Err(_) => near.set(true),
+                }
+            },
+            if let Some(input) = &input {
+                InputBubble { meta: input.clone() }
+            }
+            div { class: "bubble bubble-turn outcome-{outcome.label()}",
+                div { class: "bubble-header",
+                    span { class: "bubble-actor", "{turn.actor}" }
+                    span { class: "bubble-id", "#{short_id(&turn.id)}" }
+                    FocusButton { node_id: turn.id.clone() }
+                    ForkButton { node_id: turn.id.clone() }
+                }
+                match &detail {
+                    Some(node) => rsx! {
+                        if let NodeKind::Turn { steps, .. } = &node.kind {
+                            for step in steps {
+                                StepView { step: step.clone() }
+                            }
+                        }
+                    },
+                    None => rsx! {
+                        div { class: "turn-skeleton",
+                            div { class: "skeleton-bar w70" }
+                            div { class: "skeleton-bar w90" }
+                            div { class: "skeleton-bar w45" }
+                        }
+                    },
+                }
+                div { class: "bubble-footer",
+                    if let Some(model) = &turn.model {
                         span { class: "bubble-model", "{model}" }
-                        span { class: "badge outcome-{outcome.label()}", {outcome_label(outcome)} }
+                    }
+                    span { class: "badge outcome-{outcome.label()}", { outcome_label(outcome) } }
+                    if let Some(usage) = &turn.usage {
                         UsageView { usage: *usage }
                     }
                 }
             }
         }
-        NodeKind::Context { .. } => unreachable!(),
+    }
+}
+
+/// 输入气泡：直接用 meta.text 渲染，不需要详情请求。
+#[component]
+fn InputBubble(meta: NodeMeta) -> Element {
+    let text = meta.text.clone().unwrap_or_default();
+    rsx! {
+        div { class: "bubble bubble-input",
+            div { class: "bubble-header",
+                span { class: "bubble-actor", "{meta.actor}" }
+                span { class: "bubble-id", "#{short_id(&meta.id)}" }
+                span { class: "badge", "{crate::state::tools_label(&meta.tools)}" }
+            }
+            div { class: "bubble-text", "{text}" }
+        }
     }
 }
 
@@ -155,7 +404,7 @@ fn StepView(step: Step) -> Element {
             details { class: "tool-exec",
                 summary {
                     span { class: "tool-name", "{name}" }
-                    span { class: "tool-args", {compact_args(&args)} }
+                    span { class: "tool-args", { compact_args(&args) } }
                     span { class: "tool-duration", "{duration_ms}ms" }
                 }
                 pre { class: "mono", "{output}" }
@@ -219,18 +468,18 @@ fn ForkButton(node_id: String) -> Element {
     }
 }
 
-/// Turn 气泡 header 的「上下文」按钮：打开侧栏并把快照 tab 指到本回合
-/// （默认落在最后一次 LlmCall，侧栏里可切换）。
+/// Turn 气泡 header 的「上下文」按钮：定位并聚焦本轮（滚动跟随会让
+/// inspect 侧栏自然显示该轮快照）。
 #[component]
-fn SnapshotButton(node_id: String, last_call: usize) -> Element {
+fn FocusButton(node_id: String) -> Element {
     let mut state = use_context::<AppState>();
     rsx! {
         button {
             class: "ctx-jump-btn",
-            title: "在上下文侧栏查看本轮发送给模型的请求快照",
+            title: "定位到本轮，并在 inspect 侧栏查看该轮快照",
             onclick: move |_| {
-                state.snapshot_target.set(Some((node_id.clone(), last_call)));
                 state.context_panel_open.set(true);
+                jump_to_turn(state, &node_id);
             },
             "上下文"
         }
@@ -270,7 +519,7 @@ fn InflightBubble(turn: Inflight) -> Element {
                     InflightItem::Tool(tool) => rsx! {
                         div { class: "tool-exec tool-running", key: "{tool.call_id}",
                             span { class: "tool-name", "{tool.name}" }
-                            span { class: "tool-args", {compact_args(&tool.args)} }
+                            span { class: "tool-args", { compact_args(&tool.args) } }
                             match (&tool.output_preview, tool.duration_ms) {
                                 (Some(preview), Some(ms)) => rsx! {
                                     span { class: "tool-duration", "{ms}ms" }
@@ -286,6 +535,102 @@ fn InflightBubble(turn: Inflight) -> Element {
             }
         }
     }
+}
+
+// ---- 左侧 Turn 导航条 ----
+
+/// 刻度体量映射：usage 总量（in+out tokens）线性映射到宽度 10..28px 与
+/// 透明度 0.35..0.85，4000 tokens 封顶；无 usage 记录给最小刻度。
+fn tick_scale(usage: Option<Usage>) -> (u32, f64) {
+    let total = usage
+        .map(|u| u.input_tokens + u.output_tokens)
+        .unwrap_or(0);
+    let scale = (total as f64 / 4000.0).min(1.0);
+    let width = 10 + (18.0 * scale).round() as u32;
+    let opacity = 0.35 + 0.5 * scale;
+    (width, opacity)
+}
+
+/// 常显细条，在聊天主区左缘：每个 Turn 一个刻度，长度/透明度映射该轮
+/// 体量；hover 出对应 Input 的 preview，点击定位该轮，条上滚轮以聚焦
+/// Turn 为基准按轮上/下跳。主内容区滚轮不受影响（导航条本身不可滚动
+/// 冒泡不到聊天容器）。
+#[component]
+fn TurnNav() -> Element {
+    let state = use_context::<AppState>();
+    let chain = state.chain.read();
+    let focused = state.focused_turn.read().clone();
+
+    // (turn meta, 对应 Input 的 preview)——配对规则同 group_chain。
+    let mut ticks: Vec<(NodeMeta, String)> = Vec::new();
+    let mut pending: Option<&NodeMeta> = None;
+    for m in chain.iter() {
+        match m.kind {
+            NodeKindTag::Input => pending = Some(m),
+            NodeKindTag::Turn => {
+                let tip = pending
+                    .filter(|i| !i.preview.is_empty())
+                    .map(|i| i.preview.clone())
+                    .unwrap_or_else(|| m.preview.clone());
+                ticks.push((m.clone(), tip));
+                pending = None;
+            }
+            NodeKindTag::Context => {}
+        }
+    }
+    let turn_ids: Vec<String> = ticks.iter().map(|(m, _)| m.id.clone()).collect();
+
+    rsx! {
+        div {
+            class: "turn-nav",
+            onwheel: move |e| {
+                let dy = e.delta().strip_units().y;
+                if dy == 0.0 {
+                    return;
+                }
+                nav_jump(state, &turn_ids, dy > 0.0);
+            },
+            for (meta, tip) in ticks {
+                {
+                    let id = meta.id.clone();
+                    let active = focused.as_deref() == Some(id.as_str());
+                    let (w, o) = tick_scale(meta.usage);
+                    rsx! {
+                        button {
+                            key: "{id}",
+                            class: if active { "turn-tick active" } else { "turn-tick" },
+                            style: "width: {w}px; opacity: {o};",
+                            title: "点击定位到该轮",
+                            onclick: move |_| {
+                                jump_to_turn(state, &id);
+                            },
+                            span { class: "turn-nav-tip", "{tip}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 导航条滚轮：以聚焦 Turn 为基准按轮上/下跳（无聚焦时向下跳首轮、
+/// 向上跳末轮）。
+fn nav_jump(state: AppState, turn_ids: &[String], down: bool) {
+    if turn_ids.is_empty() {
+        return;
+    }
+    let cur = state
+        .focused_turn
+        .read()
+        .clone()
+        .and_then(|f| turn_ids.iter().position(|id| id == &f));
+    let next = match cur {
+        Some(i) if down => (i + 1).min(turn_ids.len() - 1),
+        Some(i) => i.saturating_sub(1),
+        None if down => 0,
+        None => turn_ids.len() - 1,
+    };
+    jump_to_turn(state, &turn_ids[next]);
 }
 
 /// 模型选择下拉（发送时覆盖；「默认」= daemon 配置模型）。多 provider：
@@ -318,7 +663,7 @@ pub(crate) fn ModelPicker() -> Element {
             },
             option { value: "", "模型: 默认 ({short_model(&default_model)})" }
             for (provider, entries) in groups {
-                // rua-core 的 DEFAULT_PROVIDER = "default"（UI 不依赖 rua-core）。
+                // rua-engine 的 DEFAULT_PROVIDER = "default"（UI 不依赖 rua-engine）。
                 optgroup { label: if provider == "default" { "默认 provider".to_string() } else { provider.clone() },
                     for e in entries {
                         option {
@@ -429,7 +774,7 @@ fn InputArea(busy: bool) -> Element {
             div { class: "input-toolbar",
                 ModelPicker {}
                 ToolToggles {}
-                ContextPanelToggle {}
+                InspectPanelToggle {}
             }
             textarea {
                 class: "input-box",
@@ -465,17 +810,17 @@ fn InputArea(busy: bool) -> Element {
     }
 }
 
-// ---- 上下文侧栏 ----
+// ---- inspect 侧栏 ----
 
 /// InputArea 工具栏的「上下文」开关按钮（带开关态样式）。
 #[component]
-fn ContextPanelToggle() -> Element {
+fn InspectPanelToggle() -> Element {
     let mut state = use_context::<AppState>();
     let open = *state.context_panel_open.read();
     rsx! {
         button {
             class: if open { "ctx-toggle-btn active" } else { "ctx-toggle-btn" },
-            title: "打开/关闭上下文侧栏（预览下一轮请求 / 查看已发送快照）",
+            title: "打开/关闭 inspect 侧栏（聚焦最新轮 = 预览下一轮请求；聚焦旧轮 = 该轮快照）",
             onclick: move |_| {
                 let cur = *state.context_panel_open.read();
                 state.context_panel_open.set(!cur);
@@ -485,38 +830,30 @@ fn ContextPanelToggle() -> Element {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextTab {
-    /// 下一轮请求的实时装配预览（默认）。
-    Preview,
-    /// 已提交回合的 LlmCall 请求快照（逐字记录）。
-    Snapshot,
-}
-
-/// 聊天视图右侧的上下文侧栏：预览 / 快照两个 tab 共享消息列表组件。
+/// 聊天视图右侧的 inspect 侧栏，与滚动联动：聚焦 Turn = 视口内最靠上
+/// 的可见容器（滚动即聚焦，无需点击）。聚焦最新轮 / 进行中轮 / 未聚焦
+/// 时显示下一轮请求的实时装配预览；聚焦旧轮显示该轮快照。
 #[component]
-fn ContextPanel() -> Element {
+fn InspectPanel() -> Element {
     let mut state = use_context::<AppState>();
-    let mut tab = use_signal(|| ContextTab::Preview);
-    // Turn 气泡的「上下文」按钮写入 snapshot_target 时跳到快照 tab。
-    use_effect(move || {
-        if state.snapshot_target.read().is_some() {
-            tab.set(ContextTab::Snapshot);
-        }
-    });
-    let cur = *tab.read();
+    let chain = state.chain.read();
+    let focused = state.focused_turn.read().clone();
+    let last_turn_id = chain
+        .iter()
+        .rev()
+        .find(|m| m.kind == NodeKindTag::Turn)
+        .map(|m| m.id.clone());
+    let inflight_id = state.current_inflight().map(|t| t.node_id);
+    let preview = match &focused {
+        None => true,
+        Some(id) => Some(id) == last_turn_id.as_ref() || Some(id) == inflight_id.as_ref(),
+    };
+
     rsx! {
         aside { class: "context-panel",
             div { class: "ctx-tabs",
-                button {
-                    class: if cur == ContextTab::Preview { "ctx-tab active" } else { "ctx-tab" },
-                    onclick: move |_| tab.set(ContextTab::Preview),
-                    "预览"
-                }
-                button {
-                    class: if cur == ContextTab::Snapshot { "ctx-tab active" } else { "ctx-tab" },
-                    onclick: move |_| tab.set(ContextTab::Snapshot),
-                    "快照"
+                span { class: "ctx-panel-title",
+                    if preview { "下一轮请求（预览）" } else { "回合快照" }
                 }
                 button {
                     class: "detail-close",
@@ -526,17 +863,18 @@ fn ContextPanel() -> Element {
                 }
             }
             div { class: "ctx-scroll",
-                match cur {
-                    ContextTab::Preview => rsx! { PreviewTab {} },
-                    ContextTab::Snapshot => rsx! { SnapshotTab {} },
+                if preview {
+                    PreviewTab {}
+                } else if let Some(turn_id) = focused {
+                    TurnSnapshot { turn_id }
                 }
             }
         }
     }
 }
 
-/// 预览 tab：当前 tip + 工具勾选实时装配出的下一轮请求。换游标、链增长
-/// （新 commit）、改工具勾选都会触发重新拉取。
+/// 预览：当前 tip + 工具勾选实时装配出的下一轮请求。换游标、链增长
+/// （新节点 commit）、改工具勾选都会触发重新拉取。
 #[component]
 fn PreviewTab() -> Element {
     let mut state = use_context::<AppState>();
@@ -551,7 +889,7 @@ fn PreviewTab() -> Element {
         failed.set(false);
         if let Some(cid) = cursor {
             spawn(async move {
-                match api::get_context_preview(&cid, tools.as_deref()).await {
+                match crate::api::get_context_preview(&cid, tools.as_deref()).await {
                     Ok(p) => preview.set(Some(p)),
                     Err(e) => {
                         state.set_error(format!("获取上下文预览失败: {e}"));
@@ -601,86 +939,81 @@ fn PreviewTab() -> Element {
     }
 }
 
-/// 快照 tab：某个已提交回合一次 LlmCall 的逐字请求记录（首条 System 即
-/// 当时实际生效的系统提示词）。默认显示链上最新 Turn 的最后一次调用；
-/// Turn 气泡的「上下文」按钮把目标切到对应回合。
+/// 旧轮快照：当时的系统提示词（首个 LlmCall 的 request 首条 System，可
+/// 展开/收起）、usage 汇总（含缓存 %）、steps 概要列表。详情与聊天主区
+/// 共用 `turn_details` 缓存；聚焦的轮可能还没懒加载过，这里兜底拉取。
 #[component]
-fn SnapshotTab() -> Element {
-    let mut state = use_context::<AppState>();
-    let chain = state.chain.read();
-    // 链上有 LlmCall 记录的 Turn（旧数据/纯工具回合可能没有）。
-    let turns: Vec<&Node> = chain
-        .iter()
-        .filter(|n| {
-            matches!(&n.kind, NodeKind::Turn { steps, .. }
-                if steps.iter().any(|s| matches!(s, Step::LlmCall { .. })))
-        })
-        .collect();
-    if turns.is_empty() {
+fn TurnSnapshot(turn_id: String) -> Element {
+    let state = use_context::<AppState>();
+    let load_id = turn_id.clone();
+    use_effect(move || {
+        if !state.turn_details.read().contains_key(&load_id) {
+            load_turn_detail(state, load_id.clone());
+        }
+    });
+    let detail = state.turn_details.read().get(&turn_id).cloned();
+    let Some(node) = detail else {
         return rsx! {
-            div { class: "ctx-empty",
-                p { "链上还没有带调用记录的回合。" }
-                p { "发送一条消息，回合提交后即可查看请求快照。" }
-            }
+            div { class: "detail-loading", "加载回合快照…" }
         };
-    }
-
-    // 目标解析：snapshot_target 仍指向链上的回合时用它（调用序号夹取到
-    // 有效范围），否则回落到最新 Turn 的最后一次调用。
-    let target = state.snapshot_target.read().clone();
-    let latest = *turns.last().expect("non-empty");
-    let calls_of = |turn: &Node| -> Vec<(Usage, Vec<CoreMessageView>)> {
-        let NodeKind::Turn { steps, .. } = &turn.kind else {
-            unreachable!()
-        };
-        steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::LlmCall { usage, request, .. } => Some((*usage, request.clone())),
-                _ => None,
-            })
-            .collect()
     };
-    let (turn, sel) = match &target {
-        Some((id, idx)) if turns.iter().any(|t| &t.id == id) => {
-            let turn = turns.iter().find(|t| &t.id == id).expect("checked");
-            let n = calls_of(turn).len();
-            (*turn, (*idx).min(n - 1))
-        }
-        _ => {
-            let n = calls_of(latest).len();
-            (latest, n - 1)
-        }
+    let NodeKind::Turn {
+        steps,
+        usage,
+        model,
+        ..
+    } = &node.kind
+    else {
+        return rsx! {};
     };
-    let turn_id = turn.id.clone();
-    let calls = calls_of(turn);
-    let (_, request) = calls[sel].clone();
+    let system_prompt = steps.iter().find_map(|s| match s {
+        Step::LlmCall { request, .. } => match request.first() {
+            Some(CoreMessageView::System { content }) => Some(content.clone()),
+            _ => None,
+        },
+        _ => None,
+    });
 
     rsx! {
         div { class: "ctx-section",
             span { class: "ctx-label", "回合 #{short_id(&turn_id)}" }
+            span { class: "badge", "{short_model(model)}" }
         }
-        div { class: "ctx-call-switch",
-            for (i, (usage, _)) in calls.iter().enumerate() {
-                {
-                    let tid = turn_id.clone();
-                    rsx! {
-                        div { class: "ctx-call-item", key: "{i}",
-                            button {
-                                class: if i == sel { "ctx-call-btn active" } else { "ctx-call-btn" },
-                                title: "查看本次调用的请求快照",
-                                onclick: move |_| {
-                                    state.snapshot_target.set(Some((tid.clone(), i)));
-                                },
-                                "调用 {i + 1}"
-                            }
-                            span { class: "ctx-call-usage", "{usage_label(usage)}" }
+        div { class: "ctx-section",
+            span { class: "ctx-label", "用量" }
+            span { class: "ctx-call-usage", "{usage_label(usage)}" }
+        }
+        if let Some(prompt) = &system_prompt {
+            details { class: "ctx-msg ctx-system",
+                summary {
+                    span { class: "ctx-role ctx-role-system", "system" }
+                    span { class: "ctx-msg-note", "当时生效的系统提示词" }
+                    span { class: "ctx-msg-chars", "{prompt.chars().count()} 字符" }
+                }
+                pre { class: "mono", "{prompt}" }
+            }
+        }
+        div { class: "ctx-section",
+            span { class: "ctx-label", "steps（{steps.len()}）" }
+        }
+        div { class: "ctx-step-list",
+            for (i, step) in steps.iter().enumerate() {
+                match step {
+                    Step::LlmCall { usage, .. } => rsx! {
+                        div { class: "ctx-step", key: "{i}",
+                            span { class: "ctx-step-name", "LLM 调用" }
+                            span { class: "ctx-step-note", "{usage_label(usage)}" }
                         }
-                    }
+                    },
+                    Step::ToolExec { name, duration_ms, .. } => rsx! {
+                        div { class: "ctx-step", key: "{i}",
+                            span { class: "ctx-step-name mono", "tool {name}" }
+                            span { class: "ctx-step-note", "{duration_ms}ms" }
+                        }
+                    },
                 }
             }
         }
-        ContextMessageList { messages: request }
     }
 }
 
@@ -793,5 +1126,62 @@ mod tests {
             usage_label(&usage(1000, 200, 40, 250)),
             "↑1000 ↓200 · 缓存250(25%) · 思考40"
         );
+    }
+
+    fn meta(id: &str, kind: NodeKindTag) -> NodeMeta {
+        NodeMeta {
+            id: id.to_string(),
+            parent: None,
+            context_refs: vec![],
+            kind,
+            outcome: None,
+            actor: "t".to_string(),
+            created_at: 0,
+            usage: None,
+            context_tokens: None,
+            created_by: None,
+            model: None,
+            tools: vec![],
+            text: None,
+            preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn group_chain_pairs_input_with_following_turn() {
+        let chain = vec![
+            meta("i1", NodeKindTag::Input),
+            meta("t1", NodeKindTag::Turn),
+            meta("c", NodeKindTag::Context),
+            meta("i2", NodeKindTag::Input),
+            meta("t2", NodeKindTag::Turn),
+            // 末尾新提交的 Input（turn 尚在飞）：单列。
+            meta("i3", NodeKindTag::Input),
+        ];
+        let items = group_chain(&chain);
+        assert_eq!(items.len(), 3);
+        match &items[0] {
+            ChatItem::Turn(g) => {
+                assert_eq!(g.input.as_ref().unwrap().id, "i1");
+                assert_eq!(g.turn.id, "t1");
+            }
+            _ => panic!("expected turn group"),
+        }
+        // Context 材料不进对话流。
+        match &items[1] {
+            ChatItem::Turn(g) => assert_eq!(g.turn.id, "t2"),
+            _ => panic!("expected turn group"),
+        }
+        match &items[2] {
+            ChatItem::StrayInput(m) => assert_eq!(m.id, "i3"),
+            _ => panic!("expected stray input"),
+        }
+    }
+
+    #[test]
+    fn tick_scale_caps_at_max() {
+        assert_eq!(tick_scale(None), (10, 0.35));
+        assert_eq!(tick_scale(Some(usage(4000, 4000, 0, 0))), (28, 0.85));
+        assert_eq!(tick_scale(Some(usage(1000, 1000, 0, 0))), (19, 0.6));
     }
 }

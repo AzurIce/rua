@@ -70,7 +70,9 @@ pub async fn get_cursors() -> Result<Vec<Cursor>, String> {
     unwrap(resp).await
 }
 
-pub async fn get_chain(cursor_id: &str) -> Result<Vec<Node>, String> {
+/// `GET /api/cursors/:id/chain`：轻量链（NodeMeta 列表，不含 steps）。
+/// Turn 详情走 `get_node` 按需取。
+pub async fn get_chain(cursor_id: &str) -> Result<Vec<NodeMeta>, String> {
     let resp = Request::get(&format!("{}/api/cursors/{cursor_id}/chain", api_base()))
         .send()
         .await
