@@ -11,6 +11,7 @@ pub mod graphs;
 pub mod spawn;
 pub mod state;
 pub mod turn;
+pub mod view;
 
 use std::path::PathBuf;
 

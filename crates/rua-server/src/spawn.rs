@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use rua_core::id::NodeId;
-use rua_core::node::{Node, NodeKind, NodeKindTag, Step};
+use rua_graph::id::NodeId;
+use rua_graph::node::{Node, NodeKind, NodeKindTag, Step};
 use rua_engine::{InspectOutcome, SpawnedTurn, TurnParams, TurnSpawner};
 use tokio_util::sync::CancellationToken;
 
@@ -78,7 +78,8 @@ impl TurnSpawner for ServerSpawner {
                 node: Some(input_id),
             });
             let handle = graph.begin_turn(cursor.id).map_err(|e| e.to_string())?;
-            let history = graph.assemble_chain(input_id).map_err(|e| e.to_string())?;
+            let (chain, materials) = graph.load_chain(input_id).map_err(|e| e.to_string())?;
+            let history = rua_engine::assemble(&chain, &materials).map_err(|e| e.to_string())?;
             let cursor_id = cursor.id;
             drop(graph);
 
@@ -98,6 +99,8 @@ impl TurnSpawner for ServerSpawner {
                     depth,
                     // 继承父 turn 的有效工具集（engine 已校验/展开的显式列表）。
                     tools: Some(tools),
+                    // sink 由 spawn_turn 统一注入（见 turn.rs）。
+                    sink: None,
                 },
                 cancel,
             );

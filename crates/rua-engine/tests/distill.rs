@@ -1,6 +1,6 @@
 //! Integration test for `summarize` against a mock non-streaming endpoint.
 
-use rua_core::config::ProviderConfig;
+use rua_engine::config::ProviderConfig;
 use rua_engine::Engine;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -14,7 +14,7 @@ fn engine_for(server: &MockServer) -> Engine {
         additional_params: serde_json::Map::new(),
     };
     Engine::new(
-        &[(rua_core::config::DEFAULT_PROVIDER.to_string(), config)],
+        &[(rua_engine::config::DEFAULT_PROVIDER.to_string(), config)],
         std::env::current_dir().unwrap(),
     )
     .unwrap()

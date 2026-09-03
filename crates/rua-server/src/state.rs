@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rua_core::graph::Graph;
-use rua_core::id::CursorId;
+use rua_graph::graph::Graph;
+use rua_graph::id::CursorId;
 use tokio::sync::{broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -28,11 +28,11 @@ pub struct AppState {
     /// Cancellation token per in-flight turn, keyed by cursor.
     pub cancels: Mutex<HashMap<CursorId, CancellationToken>>,
     /// 默认模型（默认 provider 的裸模型名；model ref 规则见
-    /// `rua_core::config::parse_model_ref`）。
+    /// `rua_engine::config::parse_model_ref`）。
     pub default_model: String,
     /// 全部 provider（默认在前，名为 "default"）：/api/models 聚合代理和
     /// Engine 的 model ref 解析都要用。
-    pub providers: Vec<(String, rua_core::config::ProviderConfig)>,
+    pub providers: Vec<(String, rua_engine::config::ProviderConfig)>,
     /// /api/models 按 provider 的缓存：provider 不可达时代理请求会挂到
     /// 超时（数秒），UI 每次刷新都调这个端点，不能每次都等。
     pub models_cache: Mutex<HashMap<String, (std::time::Instant, Vec<String>)>>,
@@ -47,7 +47,7 @@ impl AppState {
         default_model: String,
         graphs_root: std::path::PathBuf,
         current_graph: String,
-        providers: Vec<(String, rua_core::config::ProviderConfig)>,
+        providers: Vec<(String, rua_engine::config::ProviderConfig)>,
     ) -> Self {
         Self {
             graph: Mutex::new(graph),

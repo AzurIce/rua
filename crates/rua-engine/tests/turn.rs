@@ -1,11 +1,13 @@
 //! Integration tests for `run_turn` against a mock OpenAI-compatible
 //! (DeepSeek-shaped) SSE endpoint.
 
-use rua_core::config::ProviderConfig;
-use rua_core::events::TurnEvent;
-use rua_core::id::{CursorId, NodeId};
-use rua_core::message::CoreMessage;
-use rua_core::node::{NodeKind, Outcome, Step};
+use std::sync::{Arc, Mutex};
+
+use rua_engine::config::ProviderConfig;
+use rua_graph::events::TurnEvent;
+use rua_graph::id::{CursorId, NodeId};
+use rua_graph::message::CoreMessage;
+use rua_graph::node::{NodeKind, Outcome, Step, TurnLine};
 use rua_engine::{Engine, TurnParams};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -92,7 +94,7 @@ fn engine_for(server: &MockServer) -> Engine {
         additional_params: serde_json::Map::new(),
     };
     Engine::new(
-        &[(rua_core::config::DEFAULT_PROVIDER.to_string(), config)],
+        &[(rua_engine::config::DEFAULT_PROVIDER.to_string(), config)],
         std::env::current_dir().unwrap(),
     )
     .unwrap()
@@ -110,7 +112,53 @@ fn params(history: Vec<CoreMessage>) -> TurnParams {
         system_prompt: Some("You are helpful.".to_string()),
         depth: 0,
         tools: None,
+        sink: None,
     }
+}
+
+/// 收集型 sink：把 run_turn 期间发出的所有 TurnLine 收进共享 vec。
+fn collecting_sink() -> (Arc<Mutex<Vec<TurnLine>>>, Box<dyn FnMut(TurnLine) + Send>) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let into = lines.clone();
+    (
+        lines,
+        Box::new(move |line: TurnLine| into.lock().unwrap().push(line)),
+    )
+}
+
+/// 从 sink 行流重放每次 LLM 调用的 request：Init 锚点起步，LlmCall 输出
+/// 当前累积后推入 Assistant 消息，ToolExec 推入 ToolResult（与 server 的
+/// wire 视图折叠同一套语义）。
+fn replay_requests(lines: &[TurnLine]) -> Vec<Vec<CoreMessage>> {
+    let mut acc = Vec::new();
+    let mut out = Vec::new();
+    for line in lines {
+        match line {
+            TurnLine::Init { request } => acc = request.clone(),
+            TurnLine::LlmCall {
+                response_text,
+                tool_calls,
+                ..
+            } => {
+                out.push(acc.clone());
+                acc.push(CoreMessage::Assistant {
+                    content: response_text.clone(),
+                    tool_calls: tool_calls.clone(),
+                });
+            }
+            TurnLine::ToolExec {
+                call_id,
+                name,
+                output,
+                ..
+            } => acc.push(CoreMessage::ToolResult {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                output: output.clone(),
+            }),
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -158,16 +206,12 @@ async fn plain_text_turn_completes() {
 
     let engine = engine_for(&server);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = engine
-        .run_turn(
-            params(vec![CoreMessage::User {
-                content: "hi".to_string(),
-            }]),
-            tx,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let (lines, sink) = collecting_sink();
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.sink = Some(sink);
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
     let NodeKind::Turn {
         steps,
@@ -187,11 +231,11 @@ async fn plain_text_turn_completes() {
     assert_eq!(tools, &vec!["bash".to_string()]);
     assert_eq!(steps.len(), 1);
     let Step::LlmCall {
-        request,
         response_text,
         tool_calls,
         reasoning,
         usage: step_usage,
+        ..
     } = &steps[0]
     else {
         panic!("expected llm call step");
@@ -199,13 +243,21 @@ async fn plain_text_turn_completes() {
     assert_eq!(response_text, "Hello, world!");
     assert!(tool_calls.is_empty());
     assert_eq!(reasoning.as_deref(), Some("let me think"));
-    // Snapshot: system prompt + the user message.
-    assert_eq!(request.len(), 2);
-    assert!(matches!(&request[0], CoreMessage::System { .. }));
     assert_eq!(step_usage.input_tokens, 10);
     assert_eq!(step_usage.output_tokens, 5);
     assert_eq!(step_usage.cached_input_tokens, 4);
     assert_eq!(usage.input_tokens, 10);
+
+    // Sink: Init 锚点（系统提示 + 初始 user 消息）+ 一条 LlmCall 行。
+    let lines = lines.lock().unwrap();
+    assert_eq!(lines.len(), 2);
+    let TurnLine::Init { request } = &lines[0] else {
+        panic!("expected init anchor");
+    };
+    assert_eq!(request.len(), 2);
+    assert!(matches!(&request[0], CoreMessage::System { .. }));
+    assert!(matches!(&lines[1], TurnLine::LlmCall { response_text, .. } if response_text == "Hello, world!"));
+    drop(lines);
 
     // Events: Started, reasoning delta, two text deltas.
     let mut events = Vec::new();
@@ -258,14 +310,13 @@ async fn tool_call_turn_executes_bash_and_feeds_back_result() {
 
     let engine = engine_for(&server);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (lines, sink) = collecting_sink();
+    let mut p = params(vec![CoreMessage::User {
+        content: "run something".to_string(),
+    }]);
+    p.sink = Some(sink);
     let node = engine
-        .run_turn(
-            params(vec![CoreMessage::User {
-                content: "run something".to_string(),
-            }]),
-            tx,
-            CancellationToken::new(),
-        )
+        .run_turn(p, tx, CancellationToken::new())
         .await
         .unwrap();
 
@@ -295,25 +346,30 @@ async fn tool_call_turn_executes_bash_and_feeds_back_result() {
     assert_eq!(name, "bash");
     assert_eq!(output.trim_end(), "rua-tool-ok");
 
-    let Step::LlmCall { request, response_text, .. } = &steps[2] else {
+    let Step::LlmCall { response_text, .. } = &steps[2] else {
         panic!("expected llm call");
     };
     assert_eq!(response_text, "done with tools");
-    // Second request snapshot carries assistant tool call + tool result.
+
+    // 第二次调用的 request 从 sink 行重建（Init 锚点 + 折叠前序行）：
+    // 必须携带 assistant 工具调用与 tool result。
+    let requests_replayed = replay_requests(&lines.lock().unwrap());
+    assert_eq!(requests_replayed.len(), 2);
+    let second = &requests_replayed[1];
     assert!(
-        request.iter().any(|m| matches!(
+        second.iter().any(|m| matches!(
             m,
             CoreMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()
         )),
-        "snapshot should contain the assistant tool call"
+        "rebuilt request should contain the assistant tool call"
     );
     assert!(
-        request.iter().any(|m| matches!(
+        second.iter().any(|m| matches!(
             m,
             CoreMessage::ToolResult { call_id, output, .. }
                 if call_id == "call_abc" && output.contains("rua-tool-ok")
         )),
-        "snapshot should contain the tool result"
+        "rebuilt request should contain the tool result"
     );
 
     // The tool result actually went back over the wire.

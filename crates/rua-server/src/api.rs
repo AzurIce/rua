@@ -1,4 +1,4 @@
-//! REST + WS handlers. JSON shapes are the rua-core types verbatim; errors
+//! REST + WS handlers. JSON shapes are the rua-graph types verbatim; errors
 //! are `{"error": "..."}` with 404 / 409 / 400 as appropriate.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -7,11 +7,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rua_core::cursor::Cursor;
-use rua_core::graph::NodeMeta;
-use rua_core::id::{CursorId, NodeId};
-use rua_core::node::{Node, NodeKind, Step};
-use rua_core::Error as CoreError;
+use rua_graph::cursor::Cursor;
+use rua_graph::graph::NodeMeta;
+use rua_graph::id::{CursorId, NodeId};
+use rua_graph::node::{Node, NodeKind, Step};
+use rua_graph::Error as CoreError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -21,6 +21,7 @@ use rua_engine::TurnParams;
 use crate::events::ServerEvent;
 use crate::state::SharedState;
 use crate::turn::spawn_turn;
+use crate::view::{node_view, NodeView};
 
 pub fn api_router(state: SharedState) -> Router {
     Router::new()
@@ -120,10 +121,12 @@ async fn get_graph(State(state): State<SharedState>) -> Json<Value> {
 async fn get_node(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<NodeView>, ApiError> {
     let id = parse_node_id(&id)?;
     let mut graph = state.graph.lock().await;
-    Ok(Json(graph.node(id)?.clone()))
+    let init = graph.turn_init(id)?;
+    let node = graph.node(id)?.clone();
+    Ok(Json(node_view(&node, init)))
 }
 
 // ---- cursors ----
@@ -155,22 +158,24 @@ async fn create_cursor(
     (StatusCode::CREATED, Json(cursor))
 }
 
+/// 轻量链：只回 NodeMeta（Input 的全量 text 内联在 meta 里，聊天列表够用）。
+/// Turn 的 steps（含重建 request，物化贵）走 `GET /api/nodes/{id}` 按需取。
 async fn get_chain(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<Node>>, ApiError> {
+) -> Result<Json<Vec<NodeMeta>>, ApiError> {
     let cursor_id = parse_cursor_id(&id)?;
-    let mut graph = state.graph.lock().await;
+    let graph = state.graph.lock().await;
     let tip = graph.cursors.get(cursor_id)?.node;
     let Some(tip) = tip else {
         return Ok(Json(Vec::new()));
     };
     let ids = graph.chain_to_root(tip)?;
-    let mut nodes = Vec::with_capacity(ids.len());
-    for id in ids {
-        nodes.push(graph.node(id)?.clone());
-    }
-    Ok(Json(nodes))
+    let metas = ids
+        .into_iter()
+        .filter_map(|id| graph.meta(id).cloned())
+        .collect();
+    Ok(Json(metas))
 }
 
 #[derive(Deserialize)]
@@ -198,7 +203,10 @@ async fn get_context_preview(
     let mut graph = state.graph.lock().await;
     // 无 tip（detached 指针）= 空链；draft 会话 UI 侧不调用本端点。
     let messages = match graph.cursors.get(cursor_id)?.node {
-        Some(tip) => graph.assemble_chain(tip)?,
+        Some(tip) => {
+            let (chain, materials) = graph.load_chain(tip)?;
+            rua_engine::assemble(&chain, &materials)?
+        }
         None => Vec::new(),
     };
     // 预览恒按用户发送的语义计算：depth=0 且 spawner 在位（同 post_input）。
@@ -265,7 +273,8 @@ async fn post_input(
         node: Some(input_id),
     });
     let handle = graph.begin_turn(cursor_id)?;
-    let history = graph.assemble_chain(input_id)?;
+    let (chain, materials) = graph.load_chain(input_id)?;
+    let history = rua_engine::assemble(&chain, &materials)?;
     let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
 
@@ -284,6 +293,8 @@ async fn post_input(
             system_prompt: None,
             depth: 0,
             tools: Some(tools),
+            // sink 由 spawn_turn 统一注入（见 turn.rs）。
+            sink: None,
         },
         cancel,
     );
@@ -326,7 +337,7 @@ async fn post_root_input(
     if let Some(parent) = body.parent {
         match graph.meta(parent) {
             None => return Err(CoreError::NodeNotFound(parent).into()),
-            Some(meta) if meta.kind != rua_core::node::NodeKindTag::Turn => {
+            Some(meta) if meta.kind != rua_graph::node::NodeKindTag::Turn => {
                 return Err(ApiError::bad_request(
                     "attach point must be a turn node",
                 ));
@@ -366,7 +377,8 @@ async fn post_root_input(
         node: Some(input_id),
     });
     let handle = graph.begin_turn(cursor.id)?;
-    let history = graph.assemble_chain(input_id)?;
+    let (chain, materials) = graph.load_chain(input_id)?;
+    let history = rua_engine::assemble(&chain, &materials)?;
     let cursor_id = cursor.id;
     let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
@@ -386,6 +398,8 @@ async fn post_root_input(
             system_prompt: None,
             depth: 0,
             tools: Some(tools),
+            // sink 由 spawn_turn 统一注入（见 turn.rs）。
+            sink: None,
         },
         cancel,
     );
@@ -418,7 +432,7 @@ async fn post_move(
     // footholds (re-answering an input would need an explicit retry op), and
     // context nodes are material (rejected inside the core).
     match graph.meta(body.node_id) {
-        Some(meta) if meta.kind == rua_core::node::NodeKindTag::Input => {
+        Some(meta) if meta.kind == rua_graph::node::NodeKindTag::Input => {
             return Err(ApiError::bad_request(
                 "cannot attach to an input node; attach to a turn node",
             ));
@@ -586,7 +600,7 @@ async fn list_models(State(state): State<SharedState>) -> Json<Value> {
     let mut models = Vec::new();
     for (name, list) in futures::future::join_all(fetches).await {
         for m in list {
-            let id = if name == rua_core::config::DEFAULT_PROVIDER {
+            let id = if name == rua_engine::config::DEFAULT_PROVIDER {
                 m.clone()
             } else {
                 format!("{name}/{m}")
@@ -603,7 +617,7 @@ async fn fetch_provider_models(
     state: &SharedState,
     client: &reqwest::Client,
     name: &str,
-    cfg: &rua_core::config::ProviderConfig,
+    cfg: &rua_engine::config::ProviderConfig,
 ) -> Vec<String> {
     const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 

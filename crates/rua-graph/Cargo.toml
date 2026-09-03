@@ -1,5 +1,5 @@
 [package]
-name = "rua-core"
+name = "rua-graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,6 @@ serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 thiserror.workspace = true
-toml.workspace = true
-dirs.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

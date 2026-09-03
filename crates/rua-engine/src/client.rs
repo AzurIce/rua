@@ -9,7 +9,7 @@
 //!
 //! Multiple providers are registered by name (config `[[providers]]`); a
 //! model ref is `"provider/model"`, a bare model name resolves to the
-//! default provider (`rua_core::config::DEFAULT_PROVIDER`).
+//! default provider (`crate::config::DEFAULT_PROVIDER`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use rig_core::completion::{CompletionError, CompletionModel, CompletionRequest, 
 use rig_core::providers::{deepseek, openai};
 use rig_core::streaming::StreamingCompletionResponse;
 use rig_core::wasm_compat::WasmCompatSend;
-use rua_core::config::{ProviderConfig, parse_model_ref};
+use crate::config::{ProviderConfig, parse_model_ref};
 
 use crate::error::{Error, Result};
 use crate::tools::BashTool;
@@ -27,7 +27,7 @@ use crate::tools::BashTool;
 /// The agent engine: owns per-provider rig clients and the bash tool
 /// executor.
 ///
-/// Deliberately has no view of `rua_core::Graph`; it consumes assembled
+/// Deliberately has no view of `rua_graph::Graph`; it consumes assembled
 /// history and produces turn nodes.
 pub struct Engine {
     pub(crate) providers: HashMap<String, ProviderRuntime>,

@@ -8,10 +8,10 @@
 use futures::StreamExt;
 use rig_core::completion::CompletionModel;
 use rig_core::streaming::StreamedAssistantContent;
-use rua_core::events::TurnEvent;
-use rua_core::id::{CursorId, NodeId};
-use rua_core::message::{CoreMessage, CoreToolCall};
-use rua_core::node::{Node, NodeKind, Outcome, Step, Usage};
+use rua_graph::events::TurnEvent;
+use rua_graph::id::{CursorId, NodeId};
+use rua_graph::message::{CoreMessage, CoreToolCall};
+use rua_graph::node::{Node, NodeKind, Outcome, Step, TurnLine, Usage};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +36,7 @@ pub struct TurnParams {
     pub context_refs: Vec<NodeId>,
     pub actor: String,
     pub model: String,
-    /// Assembled history (`rua_core::assemble` output); must be non-empty.
+    /// Assembled history (`crate::assemble` output); must be non-empty.
     pub history: Vec<CoreMessage>,
     /// 调用方附加段：拼在 engine 按有效工具集组装出的系统提示词之后
     /// （空行分隔）。不再是完整提示词。
@@ -47,6 +47,10 @@ pub struct TurnParams {
     /// 本次发送的工具列表覆盖（None = 全部可用工具）。改工具列表会改变
     /// 请求前缀 → 前缀缓存失效（开发测试时这正是目的）。
     pub tools: Option<Vec<String>>,
+    /// 增量落盘回调：每个 step 完成时同步收到对应的 `TurnLine`（首个 LLM
+    /// 调用前另收一条 `Init` 锚点）。engine 的未来是 `!Send`、跑在专用
+    /// 线程，sink 只需可调用；返回 ()，错误由闭包内部自己吞掉。
+    pub sink: Option<Box<dyn FnMut(TurnLine) + Send>>,
 }
 
 /// What one streamed LLM call produced.
@@ -77,6 +81,7 @@ impl Engine {
             system_prompt,
             depth,
             tools,
+            mut sink,
         } = params;
         if history.is_empty() {
             return Err(Error::EmptyHistory);
@@ -96,12 +101,19 @@ impl Engine {
         };
         send(TurnEvent::Started { cursor_id, node_id });
 
+        // Init 锚点：首次 LLM 调用的完整请求快照（系统提示 + 初始历史），
+        // 一轮至多一份，是轮内 request 重建的起点。
+        if let Some(sink) = &mut sink {
+            sink(TurnLine::Init {
+                request: request_snapshot(&history, &prompt),
+            });
+        }
+
         let mut steps: Vec<Step> = Vec::new();
         let mut usage = Usage::default();
         let mut tool_rounds = 0usize;
 
         let outcome = loop {
-            let snapshot = request_snapshot(&history, &prompt);
             let call = self
                 .stream_call(
                     &model,
@@ -117,13 +129,17 @@ impl Engine {
                 .await;
 
             usage.add_assign(&call.usage);
-            steps.push(Step::LlmCall {
-                request: snapshot,
+            let step = Step::LlmCall {
                 response_text: call.text.clone(),
                 tool_calls: call.tool_calls.clone(),
                 reasoning: (!call.reasoning.is_empty()).then_some(call.reasoning.clone()),
                 usage: call.usage,
-            });
+                provider_data: None,
+            };
+            if let Some(sink) = &mut sink {
+                sink(TurnLine::from(step.clone()));
+            }
+            steps.push(step);
             history.push(CoreMessage::Assistant {
                 content: call.text.clone(),
                 tool_calls: call.tool_calls.clone(),
@@ -190,13 +206,17 @@ impl Engine {
                     output_preview: output.chars().take(OUTPUT_PREVIEW_CHARS).collect(),
                     duration_ms,
                 });
-                steps.push(Step::ToolExec {
+                let step = Step::ToolExec {
                     call_id: call_tool.id.clone(),
                     name: call_tool.name.clone(),
                     args: call_tool.args.clone(),
                     output: output.clone(),
                     duration_ms,
-                });
+                };
+                if let Some(sink) = &mut sink {
+                    sink(TurnLine::from(step.clone()));
+                }
+                steps.push(step);
                 history.push(CoreMessage::ToolResult {
                     call_id: call_tool.id.clone(),
                     name: call_tool.name.clone(),
@@ -376,8 +396,9 @@ impl Engine {
     }
 }
 
-/// The `CoreMessage` snapshot recorded on a `Step::LlmCall`: the history as
-/// sent, with the final system prompt rendered as a leading System message.
+/// The `CoreMessage` snapshot emitted as the turn's `TurnLine::Init` anchor:
+/// the initial history as sent, with the final system prompt rendered as a
+/// leading System message.
 fn request_snapshot(history: &[CoreMessage], prompt: &str) -> Vec<CoreMessage> {
     let mut snapshot = Vec::with_capacity(history.len() + 1);
     snapshot.push(CoreMessage::System {

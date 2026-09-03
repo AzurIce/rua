@@ -2,11 +2,11 @@
 //! `event` tag. Turn increments (`TurnEvent` from the engine) are mapped 1:1
 //! onto the matching variants; graph mutations are broadcast by the API layer.
 
-use rua_core::cursor::Cursor;
-use rua_core::graph::NodeMeta;
-use rua_core::id::{CursorId, NodeId};
-use rua_core::node::Outcome;
-use rua_core::TurnEvent;
+use rua_graph::cursor::Cursor;
+use rua_graph::graph::NodeMeta;
+use rua_graph::id::{CursorId, NodeId};
+use rua_graph::node::Outcome;
+use rua_graph::TurnEvent;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]

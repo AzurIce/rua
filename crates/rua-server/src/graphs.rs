@@ -1,7 +1,7 @@
 //! Multi-graph management (user-side only): graphs live in
 //! `<project>/.rua/graphs/<name>/`, each a self-contained Store
-//! (`nodes/` + `journal.jsonl`). The daemon serves exactly one active graph;
-//! switching swaps the `Graph` under the state mutex.
+//! (`journal.jsonl` + `turns/` + `contexts/`). The daemon serves exactly one
+//! active graph; switching swaps the `Graph` under the state mutex.
 //!
 //! Safety rules:
 //! - Every mutation (create/activate/rename/delete) is rejected with 409
@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rua_core::graph::Graph;
+use rua_graph::graph::Graph;
 
 use crate::events::ServerEvent;
 use crate::state::SharedState;
@@ -27,7 +27,7 @@ pub enum GraphOpError {
     AlreadyExists(String),
     Busy,
     Io(std::io::Error),
-    Core(rua_core::Error),
+    Core(rua_graph::Error),
 }
 
 impl std::fmt::Display for GraphOpError {
@@ -247,7 +247,7 @@ pub async fn delete_graph(state: &SharedState, name: &str) -> Result<()> {
 pub async fn clone_subgraph(
     state: &SharedState,
     from_graph: &str,
-    selected: Vec<rua_core::id::NodeId>,
+    selected: Vec<rua_graph::id::NodeId>,
 ) -> Result<usize> {
     let from_graph = validate_name(from_graph)?;
     let src_dir = graph_dir(&state.graphs_root, from_graph);
@@ -260,8 +260,8 @@ pub async fn clone_subgraph(
     let mut src = Graph::open(&src_dir).map_err(GraphOpError::Core)?;
 
     // 1. 扩张克隆集：选中节点 + 全部结构后继 + 一层 context 引用。
-    let mut set: std::collections::HashSet<rua_core::id::NodeId> = selected.into_iter().collect();
-    let mut stack: Vec<rua_core::id::NodeId> = set.iter().cloned().collect();
+    let mut set: std::collections::HashSet<rua_graph::id::NodeId> = selected.into_iter().collect();
+    let mut stack: Vec<rua_graph::id::NodeId> = set.iter().cloned().collect();
     while let Some(id) = stack.pop() {
         for &child in src.children(id) {
             if set.insert(child) {
@@ -269,10 +269,10 @@ pub async fn clone_subgraph(
             }
         }
     }
-    let structural: Vec<rua_core::id::NodeId> = set.iter().cloned().collect();
+    let structural: Vec<rua_graph::id::NodeId> = set.iter().cloned().collect();
     for id in structural {
         if let Ok(node) = src.node(id) {
-            let refs: Vec<rua_core::id::NodeId> = node.context_refs.clone();
+            let refs: Vec<rua_graph::id::NodeId> = node.context_refs.clone();
             for r in refs {
                 if src.meta(r).is_some() {
                     set.insert(r);
@@ -282,21 +282,21 @@ pub async fn clone_subgraph(
     }
 
     // 2. 按 created_at 升序（父必先于子 commit）依次重建节点。
-    let mut ordered: Vec<rua_core::node::Node> = set
+    let mut ordered: Vec<rua_graph::node::Node> = set
         .iter()
         .filter_map(|id| src.node(*id).ok().cloned())
         .collect();
     ordered.sort_by_key(|n| n.created_at);
 
-    let remap: std::collections::HashMap<rua_core::id::NodeId, rua_core::id::NodeId> = ordered
+    let remap: std::collections::HashMap<rua_graph::id::NodeId, rua_graph::id::NodeId> = ordered
         .iter()
-        .map(|n| (n.id, rua_core::id::NodeId::new()))
+        .map(|n| (n.id, rua_graph::id::NodeId::new()))
         .collect();
 
     let mut graph = state.graph.lock().await;
     let mut count = 0usize;
     for old in ordered {
-        let node = rua_core::node::Node {
+        let node = rua_graph::node::Node {
             id: remap[&old.id],
             parent: old.parent.and_then(|p| remap.get(&p).copied()),
             context_refs: old
@@ -305,7 +305,7 @@ pub async fn clone_subgraph(
                 .filter_map(|r| remap.get(r).copied())
                 .collect(),
             created_by: old.created_by.and_then(|c| remap.get(&c).copied()),
-            created_at: rua_core::node::Node::now_millis(),
+            created_at: rua_graph::node::Node::now_millis(),
             kind: old.kind.clone(),
         };
         graph.commit_node(node).map_err(GraphOpError::Core)?;

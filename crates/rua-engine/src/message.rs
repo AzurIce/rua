@@ -2,7 +2,7 @@
 //! `Message` types.
 
 use rig_core::completion::message::{AssistantContent, Message};
-use rua_core::message::CoreMessage;
+use rua_graph::message::CoreMessage;
 
 /// Render one `CoreMessage` as a rig `Message`.
 pub fn to_rig(msg: &CoreMessage) -> Message {
@@ -56,8 +56,8 @@ pub fn history_to_rig(history: &[CoreMessage]) -> Vec<Message> {
 mod tests {
     use super::*;
     use rig_core::completion::message::{ToolResultContent, UserContent};
-    use rua_core::id::NodeId;
-    use rua_core::message::CoreToolCall;
+    use rua_graph::id::NodeId;
+    use rua_graph::message::CoreToolCall;
 
     #[test]
     fn maps_system_and_user() {

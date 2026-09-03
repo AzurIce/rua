@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rua-core", "crates/rua-engine", "crates/rua-server", "crates/rua-ui"]
+members = ["crates/rua-graph", "crates/rua-engine", "crates/rua-server", "crates/rua-ui"]
 
 [workspace.package]
 version = "0.1.0"

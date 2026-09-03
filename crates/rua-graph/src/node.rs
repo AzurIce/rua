@@ -38,12 +38,16 @@ pub enum Outcome {
 
 /// One step inside a turn. The full interior of a turn is preserved;
 /// operations on the graph only ever address whole turns.
+///
+/// `LlmCall` deliberately does not store the request messages: inside a turn
+/// the history is append-only, so request_k ≡ init anchor + replay of prior
+/// steps (see docs/graph.md). The init anchor lives in the turn's jsonl body
+/// (`TurnLine::Init`); the wire view re-materializes `request` server-side.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Step {
-    /// One LLM call: the exact request messages and what came back.
+    /// One LLM call: what came back (the request is replayable, not stored).
     LlmCall {
-        request: Vec<CoreMessage>,
         /// Final assistant text (may be empty when the call only requested tools).
         response_text: String,
         /// Tool calls requested by this response.
@@ -54,6 +58,10 @@ pub enum Step {
         reasoning: Option<String>,
         #[serde(default)]
         usage: Usage,
+        /// Provider-specific round-trip data (reasoning signatures, provider
+        /// call ids, …), stored verbatim, never interpreted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data: Option<serde_json::Value>,
     },
     /// One tool execution (incl. distill calls, per the design memo).
     ToolExec {
@@ -63,6 +71,105 @@ pub enum Step {
         output: String,
         duration_ms: u64,
     },
+}
+
+/// One line of a turn's jsonl body (`turns/<ulid>.jsonl`): the incremental,
+/// as-it-happens record appended by the engine's sink during the turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TurnLine {
+    /// Full request snapshot of the first LLM call (system prompt + initial
+    /// history). At most one per turn; the anchor for request replay.
+    /// Not a step: `into_step` maps it to `None`.
+    Init { request: Vec<CoreMessage> },
+    /// Same fields as `Step::LlmCall`.
+    LlmCall {
+        response_text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<crate::message::CoreToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        #[serde(default)]
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data: Option<serde_json::Value>,
+    },
+    /// Same fields as `Step::ToolExec`.
+    ToolExec {
+        call_id: String,
+        name: String,
+        args: serde_json::Value,
+        output: String,
+        duration_ms: u64,
+    },
+}
+
+impl From<Step> for TurnLine {
+    fn from(step: Step) -> Self {
+        match step {
+            Step::LlmCall {
+                response_text,
+                tool_calls,
+                reasoning,
+                usage,
+                provider_data,
+            } => TurnLine::LlmCall {
+                response_text,
+                tool_calls,
+                reasoning,
+                usage,
+                provider_data,
+            },
+            Step::ToolExec {
+                call_id,
+                name,
+                args,
+                output,
+                duration_ms,
+            } => TurnLine::ToolExec {
+                call_id,
+                name,
+                args,
+                output,
+                duration_ms,
+            },
+        }
+    }
+}
+
+impl TurnLine {
+    /// Fold a line back into a step; `Init` is an anchor, not a step.
+    pub fn into_step(self) -> Option<Step> {
+        match self {
+            TurnLine::Init { .. } => None,
+            TurnLine::LlmCall {
+                response_text,
+                tool_calls,
+                reasoning,
+                usage,
+                provider_data,
+            } => Some(Step::LlmCall {
+                response_text,
+                tool_calls,
+                reasoning,
+                usage,
+                provider_data,
+            }),
+            TurnLine::ToolExec {
+                call_id,
+                name,
+                args,
+                output,
+                duration_ms,
+            } => Some(Step::ToolExec {
+                call_id,
+                name,
+                args,
+                output,
+                duration_ms,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

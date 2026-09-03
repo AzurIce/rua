@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::error::Result;
-use crate::id::NodeId;
-use crate::message::CoreMessage;
-use crate::node::{Node, NodeKind, Step};
+use rua_graph::error::Result;
+use rua_graph::id::NodeId;
+use rua_graph::message::CoreMessage;
+use rua_graph::node::{Node, NodeKind, Step};
 
 /// Verbatim material passthrough is allowed up to this size (bytes); larger
 /// bodies are truncated with a marker.
@@ -101,8 +101,8 @@ fn project(node: &Node, out: &mut Vec<CoreMessage>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::CoreToolCall;
-    use crate::node::{Outcome, Usage};
+    use rua_graph::message::CoreToolCall;
+    use rua_graph::node::{Outcome, Usage};
 
     fn input(text: &str, refs: Vec<NodeId>) -> Node {
         Node {
@@ -129,7 +129,6 @@ mod tests {
             kind: NodeKind::Turn {
                 steps: vec![
                     Step::LlmCall {
-                        request: vec![],
                         response_text: String::new(),
                         tool_calls: vec![CoreToolCall {
                             id: "c1".into(),
@@ -138,6 +137,7 @@ mod tests {
                         }],
                         reasoning: Some("thinking…".into()),
                         usage: Usage::default(),
+                        provider_data: None,
                     },
                     Step::ToolExec {
                         call_id: "c1".into(),
@@ -147,11 +147,11 @@ mod tests {
                         duration_ms: 5,
                     },
                     Step::LlmCall {
-                        request: vec![],
                         response_text: "done".into(),
                         tool_calls: vec![],
                         reasoning: None,
                         usage: Usage::default(),
+                        provider_data: None,
                     },
                 ],
                 outcome: Outcome::Completed,

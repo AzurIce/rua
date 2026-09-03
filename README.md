@@ -65,10 +65,11 @@ an agent has memory for free: its own history is the graph it lives in.
 
 ```
 crates/
-├── rua-core     # Graph engine (pure library; no rig/axum/tokio):
-│                #   nodes, cursors, journal, assembly (pure function)
+├── rua-graph    # Graph model (pure library; no rig/axum/tokio):
+│                #   nodes, cursors, journal, chain loading
 ├── rua-engine   # Agent loop: rig-core 0.42 (OpenAI-compatible / DeepSeek),
-│                #   tools, EffectiveTools, dynamic system prompt
+│                #   provider config, graph→history assembly, tools,
+│                #   EffectiveTools, dynamic system prompt
 ├── rua-server   # Daemon (binary `rua`): graph + runtime, REST + WS API,
 │                #   serves the built web UI (127.0.0.1 only)
 └── rua-ui       # Dioxus 0.7 web UI: chat view + graph view

@@ -1,8 +1,8 @@
 //! In-flight turn lifecycle: bridge engine `TurnEvent`s onto the WS bus,
 //! then commit the returned turn node and release the cursor.
 
-use rua_core::node::{NodeKind, Outcome};
-use rua_core::TurnEvent;
+use rua_graph::node::{NodeKind, Outcome};
+use rua_graph::TurnEvent;
 use rua_engine::TurnParams;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -37,12 +37,19 @@ pub fn spawn_turn(state: &SharedState, params: TurnParams, cancel: CancellationT
 
 async fn run_and_commit(
     state: SharedState,
-    params: TurnParams,
+    mut params: TurnParams,
     tx: mpsc::UnboundedSender<TurnEvent>,
     cancel: CancellationToken,
 ) {
     let cursor_id = params.cursor_id;
     let node_id = params.node_id;
+    // 统一注入增量落盘 sink：turn 的每个 step（+ 首条 Init 锚点）即时追加到
+    // turns/<node_id>.jsonl，崩溃不丢轮内进度。单条写入失败只丢该行的增量
+    // 副本（完整 steps 仍会随节点提交），故静默忽略。
+    let store = state.graph.lock().await.store().clone();
+    params.sink = Some(Box::new(move |line: rua_graph::TurnLine| {
+        let _ = store.append_turn_line(node_id, &line);
+    }));
     let result = state.engine.run_turn(params, tx, cancel).await;
 
     let mut graph = state.graph.lock().await;

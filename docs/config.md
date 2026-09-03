@@ -10,7 +10,7 @@ auto-created with sensible defaults on first run if it does not exist.
 ```
 
 You can also inspect the resolved path at runtime via
-`rua_core::config::config_path()`.
+`rua_engine::config::config_path()`.
 
 ## `provider` section
 

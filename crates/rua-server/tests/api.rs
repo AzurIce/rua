@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use rua_core::id::{CursorId, NodeId};
-use rua_core::node::{Node, NodeKind, Outcome, Usage};
-use rua_core::graph::Graph;
-use rua_core::TurnEvent;
+use rua_graph::id::{CursorId, NodeId};
+use rua_graph::message::CoreMessage;
+use rua_graph::node::{Node, NodeKind, Outcome, Step, TurnLine, Usage};
+use rua_graph::graph::Graph;
+use rua_graph::TurnEvent;
 use rua_engine::TurnParams;
 use rua_server::engine::AgentEngine;
 use rua_server::state::AppState;
@@ -33,7 +34,7 @@ struct MockEngine {
 impl AgentEngine for MockEngine {
     fn run_turn<'a>(
         &'a self,
-        params: TurnParams,
+        mut params: TurnParams,
         events: UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node>> + 'a>> {
@@ -58,6 +59,29 @@ impl AgentEngine for MockEngine {
             } else {
                 Outcome::Completed
             };
+            // 一个空响应的 LlmCall step：经 sink 走增量落盘（Init 锚点 +
+            // 行），同时留在返回节点的 steps 里。空响应不进装配投影，不
+            // 影响链/preview 测试。
+            let step = Step::LlmCall {
+                response_text: String::new(),
+                tool_calls: vec![],
+                reasoning: None,
+                usage: Usage::default(),
+                provider_data: None,
+            };
+            if let Some(sink) = params.sink.as_mut() {
+                sink(TurnLine::Init {
+                    request: vec![
+                        CoreMessage::System {
+                            content: "sys".into(),
+                        },
+                        CoreMessage::User {
+                            content: "hi".into(),
+                        },
+                    ],
+                });
+                sink(TurnLine::from(step.clone()));
+            }
             Ok(Node {
                 id: params.node_id,
                 parent: params.parent,
@@ -65,7 +89,7 @@ impl AgentEngine for MockEngine {
                 created_by: None,
                 created_at: Node::now_millis(),
                 kind: NodeKind::Turn {
-                    steps: vec![],
+                    steps: vec![step],
                     outcome,
                     actor: params.actor,
                     model: params.model,
@@ -109,8 +133,8 @@ async fn spawn_server() -> TestServer {
         graphs_root,
         "default".into(),
         vec![(
-            rua_core::config::DEFAULT_PROVIDER.to_string(),
-            rua_core::config::ProviderConfig::default(),
+            rua_engine::config::DEFAULT_PROVIDER.to_string(),
+            rua_engine::config::ProviderConfig::default(),
         )],
     ));
     let app = rua_server::build_router(state, None);
@@ -253,12 +277,15 @@ async fn cursor_input_chain_move_graph() {
         .unwrap();
     let chain: Value = resp.json().await.unwrap();
     let chain = chain.as_array().unwrap();
+    // 链端点回轻量 meta（不含 steps）。
     assert_eq!(chain.len(), 2);
     assert_eq!(chain[0]["id"], json!(input_id));
-    assert_eq!(chain[0]["kind"]["type"], "input");
-    assert_eq!(chain[0]["kind"]["text"], "hello");
+    assert_eq!(chain[0]["kind"], "input");
+    assert_eq!(chain[0]["text"], "hello");
     assert_eq!(chain[1]["id"], json!(turn_id));
-    assert_eq!(chain[1]["kind"]["outcome"], "cancelled");
+    assert_eq!(chain[1]["kind"], "turn");
+    assert_eq!(chain[1]["outcome"], "cancelled");
+    assert!(chain[1].get("steps").is_none());
 
     // Node body endpoint; bad id -> 400, unknown id -> 404.
     let resp = server
@@ -536,8 +563,8 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
         graphs_root,
         "default".into(),
         vec![(
-            rua_core::config::DEFAULT_PROVIDER.to_string(),
-            rua_core::config::ProviderConfig::default(),
+            rua_engine::config::DEFAULT_PROVIDER.to_string(),
+            rua_engine::config::ProviderConfig::default(),
         )],
     ));
     let spawner = ServerSpawner::new(state.clone());
@@ -898,7 +925,7 @@ async fn models_aggregates_providers_with_model_refs() {
         .mount(&provider)
         .await;
 
-    let mk = |base_url: String, model: &str| rua_core::config::ProviderConfig {
+    let mk = |base_url: String, model: &str| rua_engine::config::ProviderConfig {
         kind: "openai".into(),
         api_key: "k".into(),
         base_url,
@@ -920,7 +947,7 @@ async fn models_aggregates_providers_with_model_refs() {
         "default".into(),
         vec![
             (
-                rua_core::config::DEFAULT_PROVIDER.to_string(),
+                rua_engine::config::DEFAULT_PROVIDER.to_string(),
                 mk(provider.uri(), "m-a"),
             ),
             // 不可达 provider（连接拒绝，快速失败）：回退到配置模型。
@@ -1082,4 +1109,70 @@ async fn context_preview_endpoint() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// get_node 的 wire 视图：盘上 LlmCall 不存 request，响应里按 init 锚点 +
+/// 轮内重放重建（UI 快照 tab 依赖该字段）。mock engine 经 sink 增量落盘。
+#[tokio::test]
+async fn get_node_rebuilds_llm_request_snapshot() {
+    let server = spawn_server().await;
+    let cursor_id = server.create_cursor().await;
+    let resp = server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/input", server.base))
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let turn_id = resp.json::<Value>().await.unwrap()["turn_node_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.release.notify_one();
+    server.wait_for_nodes(2).await;
+
+    // get_node：steps[0].request 重建为 init 锚点内容。
+    let resp = server
+        .client
+        .get(format!("{}/api/nodes/{turn_id}", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let node: Value = resp.json().await.unwrap();
+    let steps = node["kind"]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(
+        steps[0]["request"],
+        json!([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ])
+    );
+    assert_eq!(steps[0]["response_text"], "");
+
+    // chain 端点是轻量 meta（request 快照只在 get_node 里重建）。
+    let resp = server
+        .client
+        .get(format!("{}/api/cursors/{cursor_id}/chain", server.base))
+        .send()
+        .await
+        .unwrap();
+    let chain: Value = resp.json().await.unwrap();
+    assert_eq!(chain[1]["kind"], "turn");
+    assert!(chain[1].get("steps").is_none());
+
+    // 盘上确实落了 turns/<id>.jsonl（sink 增量写入），且带 init 行。
+    let turn_file = server
+        ._dir
+        .path()
+        .join("graphs/default/turns")
+        .join(format!("{turn_id}.jsonl"));
+    let body = std::fs::read_to_string(turn_file).unwrap();
+    assert!(body.contains("\"type\":\"init\""), "got: {body}");
+    assert!(body.contains("\"type\":\"llm_call\""), "got: {body}");
+    // 行内不内嵌 request（只有 init 行有）。
+    let llm_line = body.lines().nth(1).unwrap();
+    assert!(!llm_line.contains("\"request\""), "got: {llm_line}");
 }

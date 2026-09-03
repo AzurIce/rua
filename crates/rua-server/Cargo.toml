@@ -13,7 +13,7 @@ name = "rua_server"
 path = "src/lib.rs"
 
 [dependencies]
-rua-core = { path = "../rua-core" }
+rua-graph = { path = "../rua-graph" }
 rua-engine = { path = "../rua-engine" }
 serde.workspace = true
 serde_json.workspace = true

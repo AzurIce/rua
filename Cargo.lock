@@ -4803,32 +4803,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "rua-core"
+name = "rua-engine"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "futures",
+ "libc",
+ "rig-core",
+ "rua-graph",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "toml",
- "ulid",
+ "wiremock",
 ]
 
 [[package]]
-name = "rua-engine"
+name = "rua-graph"
 version = "0.1.0"
 dependencies = [
- "futures",
- "libc",
- "rig-core",
- "rua-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "wiremock",
+ "ulid",
 ]
 
 [[package]]
@@ -4838,8 +4839,8 @@ dependencies = [
  "axum",
  "futures",
  "reqwest 0.12.28",
- "rua-core",
  "rua-engine",
+ "rua-graph",
  "serde",
  "serde_json",
  "tempfile",
@@ -4859,6 +4860,7 @@ dependencies = [
  "futures",
  "gloo-net",
  "gloo-timers 0.3.0",
+ "js-sys",
  "pulldown-cmark",
  "serde",
  "serde_json",

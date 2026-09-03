@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rig_core::completion::ToolDefinition;
-use rua_core::id::NodeId;
-use rua_core::node::Usage;
+use rua_graph::id::NodeId;
+use rua_graph::node::Usage;
 use tokio_util::sync::CancellationToken;
 
 /// 递归上限：子 turn 也带这套工具，深度到顶后不再注册 spawn/inspect。

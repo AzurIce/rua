@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rua_core::config::Config;
-use rua_core::graph::Graph;
+use rua_engine::config::Config;
+use rua_graph::graph::Graph;
 use rua_engine::Engine;
 use rua_server::state::AppState;
 

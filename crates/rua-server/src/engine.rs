@@ -4,8 +4,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use rua_core::node::Node;
-use rua_core::TurnEvent;
+use rua_graph::node::Node;
+use rua_graph::TurnEvent;
 use rua_engine::{Engine, TurnParams};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;

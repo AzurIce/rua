@@ -19,4 +19,10 @@ pub enum Error {
 
     #[error("distill returned no text")]
     EmptyDistill,
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("config error: {0}")]
+    Config(String),
 }
