@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use rua_graph::error::Result;
+use rua_graph::error::{Error, Result};
 use rua_graph::id::NodeId;
 use rua_graph::message::CoreMessage;
-use rua_graph::node::{Node, NodeKind, Step};
+use rua_graph::node::{AnyNode, Step};
 
 /// Verbatim material passthrough is allowed up to this size (bytes); larger
 /// bodies are truncated with a marker.
@@ -11,7 +11,8 @@ pub const MAX_MATERIAL_BYTES: usize = 32 * 1024;
 
 /// Pure assembly: `(chain, refs) → messages[]`.
 ///
-/// - `chain`: structural nodes root → tip (Input / Turn only).
+/// - `chain`: structural nodes root → tip (Input / Turn only), bodies loaded
+///   (`load_chain` guarantees `data: Some`).
 /// - `materials`: resolved `context_refs` targets (context nodes), keyed by id.
 ///
 /// v1 projection: linear backtrack along the chain. Each node projects to
@@ -19,25 +20,24 @@ pub const MAX_MATERIAL_BYTES: usize = 32 * 1024;
 /// own projection so the model sees material before the instruction that
 /// cites it. Turn reasoning is preserved in the node but never fed back.
 pub fn assemble(
-    chain: &[Node],
-    materials: &HashMap<NodeId, Node>,
+    chain: &[AnyNode],
+    materials: &HashMap<NodeId, AnyNode>,
 ) -> Result<Vec<CoreMessage>> {
     let mut out = Vec::new();
     for node in chain {
-        for r in &node.context_refs {
-            if let Some(Node {
-                kind: NodeKind::Context { body, .. },
-                context_refs: sources,
-                ..
-            }) = materials.get(r)
-            {
+        for r in node.context_refs() {
+            if let Some(AnyNode::Context(ctx)) = materials.get(r) {
+                let data = ctx
+                    .data
+                    .as_ref()
+                    .ok_or(Error::DataNotLoaded(ctx.id))?;
                 out.push(CoreMessage::Context {
-                    body: clamp_material(body),
-                    sources: sources.clone(),
+                    body: clamp_material(&data.body),
+                    sources: ctx.context_refs.clone(),
                 });
             }
         }
-        project(node, &mut out);
+        project(node, &mut out)?;
     }
     Ok(out)
 }
@@ -54,15 +54,16 @@ fn clamp_material(body: &str) -> String {
     }
 }
 
-fn project(node: &Node, out: &mut Vec<CoreMessage>) {
-    match &node.kind {
-        NodeKind::Input { text, .. } => {
+fn project(node: &AnyNode, out: &mut Vec<CoreMessage>) -> Result<()> {
+    match node {
+        AnyNode::Input(n) => {
             out.push(CoreMessage::User {
-                content: text.clone(),
+                content: n.kind.text.clone(),
             });
         }
-        NodeKind::Turn { steps, .. } => {
-            for step in steps {
+        AnyNode::Turn(n) => {
+            let data = n.data.as_ref().ok_or(Error::DataNotLoaded(n.id))?;
+            for step in &data.steps {
                 match step {
                     Step::LlmCall {
                         response_text,
@@ -94,39 +95,29 @@ fn project(node: &Node, out: &mut Vec<CoreMessage>) {
         }
         // Context nodes are material, not conversation steps; they only
         // appear via `context_refs`, never on a chain.
-        NodeKind::Context { .. } => {}
+        AnyNode::Context(_) => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rua_graph::message::CoreToolCall;
-    use rua_graph::node::{Outcome, Usage};
+    use rua_graph::node::{Context, Input, Outcome, Turn, TurnData, Usage};
 
-    fn input(text: &str, refs: Vec<NodeId>) -> Node {
-        Node {
-            id: NodeId::new(),
-            parent: None,
-            context_refs: refs,
-            created_by: None,
-            created_at: 0,
-            kind: NodeKind::Input {
-                text: text.into(),
-                actor: "human".into(),
-                tools: vec![],
-            },
-        }
-    }
-
-    fn turn() -> Node {
-        Node {
-            id: NodeId::new(),
-            parent: None,
-            context_refs: vec![],
-            created_by: None,
-            created_at: 0,
-            kind: NodeKind::Turn {
+    fn turn() -> AnyNode {
+        AnyNode::Turn(Turn::node(
+            NodeId::new(),
+            None,
+            vec![],
+            None,
+            Outcome::Completed,
+            "agent",
+            "m",
+            Usage::default(),
+            vec![],
+            TurnData {
                 steps: vec![
                     Step::LlmCall {
                         response_text: String::new(),
@@ -154,18 +145,21 @@ mod tests {
                         provider_data: None,
                     },
                 ],
-                outcome: Outcome::Completed,
-                actor: "agent".into(),
-                model: "m".into(),
-                usage: Usage::default(),
-                tools: vec![],
             },
-        }
+        ))
     }
 
     #[test]
     fn linear_chain_projection() {
-        let msgs = assemble(&[input("hi", vec![]), turn()], &HashMap::new()).unwrap();
+        let input_node = AnyNode::Input(Input::node(
+            NodeId::new(),
+            None,
+            "hi",
+            "human",
+            vec![],
+            None,
+        ));
+        let msgs = assemble(&[input_node, turn()], &HashMap::new()).unwrap();
         assert_eq!(
             msgs,
             vec![
@@ -195,21 +189,21 @@ mod tests {
 
     #[test]
     fn material_injected_before_referencing_node() {
-        let ctx = Node {
-            id: NodeId::new(),
-            parent: None,
-            context_refs: vec![],
-            created_by: None,
-            created_at: 0,
-            kind: NodeKind::Context {
-                body: "distilled facts".into(),
-                created_by: NodeId::new(),
-                model: "m".into(),
-            },
-        };
+        let src = NodeId::new();
+        let ctx = Context::node(NodeId::new(), "distilled facts", vec![], src, "m");
+        let ctx_id = ctx.id;
         let mut materials = HashMap::new();
-        materials.insert(ctx.id, ctx.clone());
-        let msgs = assemble(&[input("use this", vec![ctx.id])], &materials).unwrap();
+        materials.insert(ctx_id, AnyNode::Context(ctx));
+        let mut input_node = Input::node(
+            NodeId::new(),
+            None,
+            "use this",
+            "human",
+            vec![],
+            None,
+        );
+        input_node.context_refs = vec![ctx_id];
+        let msgs = assemble(&[AnyNode::Input(input_node)], &materials).unwrap();
         assert_eq!(
             msgs,
             vec![

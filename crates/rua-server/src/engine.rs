@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use rua_graph::node::Node;
+use rua_graph::node::{Node, Turn};
 use rua_graph::TurnEvent;
 use rua_engine::{Engine, TurnParams};
 use tokio::sync::mpsc::UnboundedSender;
@@ -19,7 +19,7 @@ pub trait AgentEngine: Send + Sync {
         params: TurnParams,
         events: UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node<Turn>>> + 'a>>;
 
     fn summarize<'a>(
         &'a self,
@@ -34,7 +34,7 @@ impl AgentEngine for Engine {
         params: TurnParams,
         events: UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node<Turn>>> + 'a>> {
         Box::pin(Engine::run_turn(self, params, events, cancel))
     }
 

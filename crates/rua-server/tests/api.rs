@@ -11,7 +11,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::message::CoreMessage;
-use rua_graph::node::{Node, NodeKind, Outcome, Step, TurnLine, Usage};
+use rua_graph::node::{Node, Outcome, Step, Turn, TurnData, TurnLine, Usage};
 use rua_graph::graph::Graph;
 use rua_graph::TurnEvent;
 use rua_engine::TurnParams;
@@ -37,7 +37,7 @@ impl AgentEngine for MockEngine {
         mut params: TurnParams,
         events: UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = rua_engine::Result<Node<Turn>>> + 'a>> {
         Box::pin(async move {
             let _ = events.send(TurnEvent::Started {
                 cursor_id: params.cursor_id,
@@ -82,21 +82,18 @@ impl AgentEngine for MockEngine {
                 });
                 sink(TurnLine::from(step.clone()));
             }
-            Ok(Node {
-                id: params.node_id,
-                parent: params.parent,
-                context_refs: params.context_refs,
-                created_by: None,
-                created_at: Node::now_millis(),
-                kind: NodeKind::Turn {
-                    steps: vec![step],
-                    outcome,
-                    actor: params.actor,
-                    model: params.model,
-                    usage: Usage::default(),
-                    tools: params.tools.clone().unwrap_or_default(),
-                },
-            })
+            Ok(Turn::node(
+                params.node_id,
+                params.parent,
+                params.context_refs,
+                None,
+                outcome,
+                params.actor,
+                params.model,
+                Usage::default(),
+                params.tools.clone().unwrap_or_default(),
+                TurnData { steps: vec![step] },
+            ))
         })
     }
 
@@ -588,8 +585,8 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
     {
         let graph = state.graph.lock().await;
         let meta = graph.meta(input_id).unwrap();
-        assert_eq!(meta.created_by, Some(creator));
-        assert_eq!(meta.tools, all_tools);
+        assert_eq!(meta.created_by(), Some(creator));
+        assert_eq!(meta.input().unwrap().kind.tools, all_tools);
     }
 
     // Input 节点已同步 commit，inspect 立即可读。

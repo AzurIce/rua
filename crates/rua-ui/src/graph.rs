@@ -63,7 +63,7 @@ fn layout(metas: &HashMap<String, NodeMeta>) -> HashMap<String, Point> {
                 .entry(p.to_string())
                 .or_default()
                 .push(meta.id.clone());
-        } else if let Some(c) = meta.created_by.as_deref().filter(|c| metas.contains_key(*c)) {
+        } else if let Some(c) = meta.provenance().map(String::as_str).filter(|c| metas.contains_key(*c)) {
             spawn_children
                 .entry(c.to_string())
                 .or_default()
@@ -179,7 +179,7 @@ fn collect_hidden(
                 .or_default()
                 .push(meta.id.clone());
         }
-        if let Some(cb) = meta.created_by.as_deref() {
+        if let Some(cb) = meta.provenance().map(String::as_str) {
             spawned
                 .entry(cb.to_string())
                 .or_default()
@@ -264,6 +264,7 @@ pub fn GraphView() -> Element {
                     usage: None,
                     context_tokens: None,
                     created_by: None,
+                    distilled_from: None,
                     model: None,
                     tools: vec![],
                     text: None,
@@ -280,7 +281,7 @@ pub fn GraphView() -> Element {
     // 每个创建者 turn 直接 spawn 出的根节点列表（按 created_at 排序）。
     let mut spawn_children: HashMap<String, Vec<String>> = HashMap::new();
     for meta in metas.values() {
-        if let Some(cb) = meta.created_by.as_deref() {
+        if let Some(cb) = meta.provenance().map(String::as_str) {
             spawn_children.entry(cb.to_string()).or_default().push(meta.id.clone());
         }
     }
@@ -333,7 +334,7 @@ pub fn GraphView() -> Element {
             // 发起方着色：人发起的节点（用户输入 / 人发起的回合）accent
             // 左侧条，agent spawn 的回合紫色左侧条——一眼区分「我说的」
             // 和 agent 繁殖出的节点。
-            if meta.created_by.is_none()
+            if meta.provenance().is_none()
                 && (meta.kind == NodeKindTag::Input
                     || (meta.kind == NodeKindTag::Turn && meta.actor == "human"))
             {
@@ -390,7 +391,7 @@ pub fn GraphView() -> Element {
         }
         // spawn 边（provenance）：创建者 turn → 它 spawn 出的根节点（在
         // 创建者下一行同一列），垂直直线 + 虚线区分「创建/归属」。
-        if let Some(creator) = meta.created_by.as_deref().filter(|c| metas.contains_key(*c)) {
+        if let Some(creator) = meta.provenance().map(String::as_str).filter(|c| metas.contains_key(*c)) {
             edges.push(FlowEdge {
                 id: format!("s-{}", meta.id),
                 source: NodeId::from(creator),
@@ -857,7 +858,7 @@ fn DetailPanel() -> Element {
                         dd { "{meta.created_at}" }
                         dt { "parent" }
                         dd { {meta.parent.as_deref().map(short_id).unwrap_or("—").to_string()} }
-                        if let Some(creator) = meta.created_by.clone() {
+                        if let Some(creator) = meta.provenance().cloned() {
                             dt { "创建者" }
                             dd {
                                 button {
@@ -1191,6 +1192,7 @@ mod layout_tests {
                 usage: None,
                 context_tokens: None,
                 created_by: created_by.map(str::to_string),
+                distilled_from: None,
                 model: None,
                 tools: vec![],
                 text: None,
@@ -1227,7 +1229,7 @@ mod layout_tests {
             return;
         };
         let creators: HashSet<String> =
-            metas.values().filter_map(|m| m.created_by.clone()).collect();
+            metas.values().filter_map(|m| m.provenance().cloned()).collect();
         assert!(!creators.is_empty());
         for creator in creators {
             let hidden = collect_hidden(&metas, &HashSet::from([creator.clone()]));
@@ -1235,7 +1237,7 @@ mod layout_tests {
                 if hidden.contains(&m.id) {
                     continue;
                 }
-                if let Some(cb) = &m.created_by {
+                if let Some(cb) = m.provenance() {
                     assert!(
                         !hidden.contains(cb),
                         "collapsing {creator} leaves orphan spawn root {} (creator {cb} hidden)",

@@ -1,7 +1,7 @@
 //! In-flight turn lifecycle: bridge engine `TurnEvent`s onto the WS bus,
 //! then commit the returned turn node and release the cursor.
 
-use rua_graph::node::{NodeKind, Outcome};
+use rua_graph::node::Outcome;
 use rua_graph::TurnEvent;
 use rua_engine::TurnParams;
 use tokio::sync::mpsc;
@@ -55,13 +55,13 @@ async fn run_and_commit(
     let mut graph = state.graph.lock().await;
     match result {
         Ok(node) => {
-            let outcome = match &node.kind {
-                NodeKind::Turn { outcome, .. } => *outcome,
-                _ => Outcome::Failed,
-            };
-            match graph.commit_node(node) {
+            let outcome = node.kind.outcome;
+            match graph.commit(node) {
                 Ok(()) => {
-                    let meta = graph.meta(node_id).expect("just committed").clone();
+                    let meta = graph
+                        .meta(node_id)
+                        .expect("just committed")
+                        .header_value();
                     let _ = graph.finish_turn(cursor_id, outcome);
                     let _ = graph.move_cursor(cursor_id, node_id);
                     drop(graph);

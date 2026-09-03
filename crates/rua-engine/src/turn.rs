@@ -11,7 +11,7 @@ use rig_core::streaming::StreamedAssistantContent;
 use rua_graph::events::TurnEvent;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::message::{CoreMessage, CoreToolCall};
-use rua_graph::node::{Node, NodeKind, Outcome, Step, TurnLine, Usage};
+use rua_graph::node::{Node, Outcome, Step, Turn, TurnData, TurnLine, Usage};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -69,7 +69,7 @@ impl Engine {
         params: TurnParams,
         events: UnboundedSender<TurnEvent>,
         cancel: CancellationToken,
-    ) -> Result<Node> {
+    ) -> Result<Node<Turn>> {
         let TurnParams {
             cursor_id,
             node_id,
@@ -225,21 +225,18 @@ impl Engine {
             }
         };
 
-        Ok(Node {
-            id: node_id,
+        Ok(Turn::node(
+            node_id,
             parent,
             context_refs,
-            created_by: None,
-            created_at: Node::now_millis(),
-            kind: NodeKind::Turn {
-                steps,
-                outcome,
-                actor,
-                model,
-                usage,
-                tools: effective.names(),
-            },
-        })
+            None,
+            outcome,
+            actor,
+            model,
+            usage,
+            effective.names(),
+            TurnData { steps },
+        ))
     }
 
     /// One streaming LLM call over the current history. `model_ref` is the

@@ -48,7 +48,7 @@ impl CursorRegistry {
             node: None,
             actor: actor.into(),
             capabilities,
-            created_at: crate::node::Node::now_millis(),
+            created_at: crate::node::now_millis(),
         };
         self.cursors.insert(cursor.id, cursor.clone());
         cursor
@@ -91,7 +91,7 @@ impl CursorRegistry {
         let handle = TurnHandle {
             cursor_id,
             node_id,
-            started_at: crate::node::Node::now_millis(),
+            started_at: crate::node::now_millis(),
         };
         self.in_flight.insert(cursor_id, handle.clone());
         Ok(handle)

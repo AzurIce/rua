@@ -3,7 +3,6 @@
 //! onto the matching variants; graph mutations are broadcast by the API layer.
 
 use rua_graph::cursor::Cursor;
-use rua_graph::graph::NodeMeta;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::node::Outcome;
 use rua_graph::TurnEvent;
@@ -45,7 +44,9 @@ pub enum ServerEvent {
         node_id: NodeId,
         outcome: Outcome,
     },
-    NodeCommitted { meta: NodeMeta },
+    /// 节点提交广播：header 形状（信封 + kind tag + meta 平铺，无正文），
+    /// 与 chain 端点同形。
+    NodeCommitted { meta: serde_json::Value },
     CursorCreated { cursor: Cursor },
     CursorMoved { cursor_id: CursorId, node: Option<NodeId> },
     /// The daemon switched the active graph; clients should drop all

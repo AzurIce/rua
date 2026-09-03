@@ -272,7 +272,7 @@ pub async fn clone_subgraph(
     let structural: Vec<rua_graph::id::NodeId> = set.iter().cloned().collect();
     for id in structural {
         if let Ok(node) = src.node(id) {
-            let refs: Vec<rua_graph::id::NodeId> = node.context_refs.clone();
+            let refs: Vec<rua_graph::id::NodeId> = node.context_refs().to_vec();
             for r in refs {
                 if src.meta(r).is_some() {
                     set.insert(r);
@@ -282,34 +282,58 @@ pub async fn clone_subgraph(
     }
 
     // 2. 按 created_at 升序（父必先于子 commit）依次重建节点。
-    let mut ordered: Vec<rua_graph::node::Node> = set
+    let mut ordered: Vec<rua_graph::node::AnyNode> = set
         .iter()
         .filter_map(|id| src.node(*id).ok().cloned())
         .collect();
-    ordered.sort_by_key(|n| n.created_at);
+    ordered.sort_by_key(rua_graph::node::AnyNode::created_at);
 
     let remap: std::collections::HashMap<rua_graph::id::NodeId, rua_graph::id::NodeId> = ordered
         .iter()
-        .map(|n| (n.id, rua_graph::id::NodeId::new()))
+        .map(|n| (n.id(), rua_graph::id::NodeId::new()))
         .collect();
 
     let mut graph = state.graph.lock().await;
     let mut count = 0usize;
     for old in ordered {
-        let node = rua_graph::node::Node {
-            id: remap[&old.id],
-            parent: old.parent.and_then(|p| remap.get(&p).copied()),
-            context_refs: old
-                .context_refs
-                .iter()
-                .filter_map(|r| remap.get(r).copied())
-                .collect(),
-            created_by: old.created_by.and_then(|c| remap.get(&c).copied()),
-            created_at: rua_graph::node::Node::now_millis(),
-            kind: old.kind.clone(),
+        // 节点本体不可变所以 kind 原样复制，id/时间戳/归属边换新（只保留
+        // 指向克隆集内部的边）。
+        let node = match old {
+            rua_graph::node::AnyNode::Input(mut n) => {
+                n.id = remap[&n.id];
+                n.parent = n.parent.and_then(|p| remap.get(&p).copied());
+                n.context_refs = n
+                    .context_refs
+                    .iter()
+                    .filter_map(|r| remap.get(r).copied())
+                    .collect();
+                n.created_by = n.created_by.and_then(|c| remap.get(&c).copied());
+                rua_graph::node::AnyNode::Input(n)
+            }
+            rua_graph::node::AnyNode::Turn(mut n) => {
+                n.id = remap[&n.id];
+                n.parent = n.parent.and_then(|p| remap.get(&p).copied());
+                n.context_refs = n
+                    .context_refs
+                    .iter()
+                    .filter_map(|r| remap.get(r).copied())
+                    .collect();
+                n.created_by = n.created_by.and_then(|c| remap.get(&c).copied());
+                rua_graph::node::AnyNode::Turn(n)
+            }
+            rua_graph::node::AnyNode::Context(mut n) => {
+                n.id = remap[&n.id];
+                n.context_refs = n
+                    .context_refs
+                    .iter()
+                    .filter_map(|r| remap.get(r).copied())
+                    .collect();
+                rua_graph::node::AnyNode::Context(n)
+            }
         };
-        graph.commit_node(node).map_err(GraphOpError::Core)?;
-        let meta = graph.meta(remap[&old.id]).expect("just committed").clone();
+        let id = node.id();
+        graph.commit(node).map_err(GraphOpError::Core)?;
+        let meta = graph.meta(id).expect("just committed").header_value();
         state.broadcast(ServerEvent::NodeCommitted { meta });
         count += 1;
     }

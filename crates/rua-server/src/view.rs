@@ -6,13 +6,16 @@
 //! accumulated messages as its `request`, then its own Assistant message is
 //! pushed; a `ToolExec` step pushes a ToolResult. The serde shape matches
 //! rua-ui's `types.rs` exactly (`Node`/`Step`/`CoreMessageView`).
-//! （chain 端点只回轻量 NodeMeta，不经此视图。）
+//! （chain 端点只回轻量 header，不经此视图。）
 
 use rua_graph::id::NodeId;
 use rua_graph::message::{CoreMessage, CoreToolCall};
-use rua_graph::node::{Node, NodeKind, Outcome, Step, Usage};
+use rua_graph::node::{AnyNode, Step, Usage};
 use serde::Serialize;
 
+/// 详情端点的节点视图：信封 + 完整 kind 形状（`kind: {type, ...meta,
+/// ...data}`；data 的 steps 由 [`step_views`] 重放出逐字 request）。
+/// kind 内容来自 `AnyNode::kind_json`，没有第二个和类型声明。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NodeView {
     pub id: NodeId,
@@ -23,33 +26,45 @@ pub struct NodeView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<NodeId>,
     pub created_at: u64,
-    pub kind: NodeKindView,
+    pub kind: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum NodeKindView {
-    Input {
-        text: String,
-        actor: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tools: Vec<String>,
-    },
-    Turn {
-        steps: Vec<StepView>,
-        outcome: Outcome,
-        actor: String,
-        model: String,
-        #[serde(default)]
-        usage: Usage,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tools: Vec<String>,
-    },
-    Context {
-        body: String,
-        created_by: NodeId,
-        model: String,
-    },
+/// Build the wire view of a node. `init` is the turn's init anchor
+/// (`Graph::turn_init`; ignored for non-turn kinds). 调用方先经
+/// `Graph::node` 懒加载，正文必已就位；缺席时按空正文处理。
+pub fn node_view(node: &AnyNode, init: Option<Vec<CoreMessage>>) -> NodeView {
+    // Turn：重放 steps，把重建的 request 逐条塞回 wire step。
+    if let AnyNode::Turn(n) = node {
+        let steps: Vec<Step> = n
+            .data
+            .as_ref()
+            .map(|d| d.steps.clone())
+            .unwrap_or_default();
+        let mut kind = node.kind_json();
+        if let Some(obj) = kind.as_object_mut() {
+            obj.insert(
+                "steps".into(),
+                serde_json::to_value(step_views(&steps, init.unwrap_or_default()))
+                    .expect("step view serialization is infallible"),
+            );
+        }
+        return NodeView {
+            id: node.id(),
+            parent: node.parent(),
+            context_refs: node.context_refs().to_vec(),
+            created_by: node.created_by(),
+            created_at: node.created_at(),
+            kind,
+        };
+    }
+    NodeView {
+        id: node.id(),
+        parent: node.parent(),
+        context_refs: node.context_refs().to_vec(),
+        created_by: node.created_by(),
+        created_at: node.created_at(),
+        kind: node.kind_json(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -76,50 +91,6 @@ pub enum StepView {
         output: String,
         duration_ms: u64,
     },
-}
-
-/// Build the wire view of a node. `init` is the turn's init anchor
-/// (`Graph::turn_init`; ignored for non-turn kinds).
-pub fn node_view(node: &Node, init: Option<Vec<CoreMessage>>) -> NodeView {
-    let kind = match &node.kind {
-        NodeKind::Input { text, actor, tools } => NodeKindView::Input {
-            text: text.clone(),
-            actor: actor.clone(),
-            tools: tools.clone(),
-        },
-        NodeKind::Turn {
-            steps,
-            outcome,
-            actor,
-            model,
-            usage,
-            tools,
-        } => NodeKindView::Turn {
-            steps: step_views(steps, init.unwrap_or_default()),
-            outcome: *outcome,
-            actor: actor.clone(),
-            model: model.clone(),
-            usage: *usage,
-            tools: tools.clone(),
-        },
-        NodeKind::Context {
-            body,
-            created_by,
-            model,
-        } => NodeKindView::Context {
-            body: body.clone(),
-            created_by: *created_by,
-            model: model.clone(),
-        },
-    };
-    NodeView {
-        id: node.id,
-        parent: node.parent,
-        context_refs: node.context_refs.clone(),
-        created_by: node.created_by,
-        created_at: node.created_at,
-        kind,
-    }
 }
 
 /// Replay a turn's steps into wire steps, re-materializing each LlmCall's
@@ -178,27 +149,26 @@ fn step_views(steps: &[Step], init: Vec<CoreMessage>) -> Vec<StepView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rua_graph::node::{Outcome, Turn, TurnData};
 
-    fn turn(steps: Vec<Step>) -> Node {
-        Node {
-            id: NodeId::new(),
-            parent: None,
-            context_refs: vec![],
-            created_by: None,
-            created_at: 0,
-            kind: NodeKind::Turn {
-                steps,
-                outcome: Outcome::Completed,
-                actor: "agent".into(),
-                model: "m".into(),
-                usage: Usage::default(),
-                tools: vec![],
-            },
-        }
+    fn turn(steps: Vec<Step>) -> AnyNode {
+        AnyNode::Turn(Turn::node(
+            NodeId::new(),
+            None,
+            vec![],
+            None,
+            Outcome::Completed,
+            "agent",
+            "m",
+            Usage::default(),
+            vec![],
+            TurnData { steps },
+        ))
     }
 
     /// 重放折叠：request_0 = init 锚点，request_k 携带前序 Assistant /
-    /// ToolResult；无锚点时从空 vec 起步。
+    /// ToolResult；无锚点时从空 vec 起步。wire 的 kind 形状 = {type, ...meta,
+    /// ...data}（steps 带 request），与 UI 镜像一致。
     #[test]
     fn replays_requests_from_init_anchor() {
         let call = |text: &str, tool_calls: Vec<CoreToolCall>| Step::LlmCall {
@@ -233,30 +203,19 @@ mod tests {
             },
         ];
         let view = node_view(&node, Some(init.clone()));
-        let NodeKindView::Turn { steps, .. } = &view.kind else {
-            panic!("expected turn");
-        };
-        let StepView::LlmCall { request: r0, .. } = &steps[0] else {
-            panic!("expected llm call");
-        };
-        assert_eq!(r0, &init);
-        let StepView::LlmCall { request: r1, .. } = &steps[2] else {
-            panic!("expected llm call");
-        };
-        assert_eq!(r1.len(), 4);
-        assert!(matches!(&r1[2], CoreMessage::Assistant { tool_calls, .. } if tool_calls == &vec![bash_call]));
-        assert!(
-            matches!(&r1[3], CoreMessage::ToolResult { call_id, output, .. } if call_id == "c1" && output == "f.txt")
-        );
+        assert_eq!(view.kind["type"], "turn");
+        assert_eq!(view.kind["outcome"], "completed");
+        let steps = view.kind["steps"].as_array().unwrap();
+        let r0 = &steps[0]["request"];
+        assert_eq!(r0, &serde_json::to_value(&init).unwrap());
+        let r1 = &steps[2]["request"];
+        assert_eq!(r1.as_array().unwrap().len(), 4);
+        assert_eq!(steps[2]["response_text"], "done");
+        assert_eq!(steps[1]["type"], "tool_exec");
 
         // 无锚点：从空 vec 起步。
         let view = node_view(&node, None);
-        let NodeKindView::Turn { steps, .. } = &view.kind else {
-            panic!("expected turn");
-        };
-        let StepView::LlmCall { request: r0, .. } = &steps[0] else {
-            panic!("expected llm call");
-        };
-        assert!(r0.is_empty());
+        let steps = view.kind["steps"].as_array().unwrap();
+        assert!(steps[0]["request"].as_array().unwrap().is_empty());
     }
 }

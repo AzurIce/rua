@@ -3,7 +3,7 @@
 //! 图模型定义 + 图数据能力，不含 LLM/工具消费。
 //! Data plane: immutable, committed nodes (Input / Turn / Context). The
 //! journal (`journal.jsonl`) is the single source of truth for structure
-//! (node metas — Input bodies inline — + cursor state + turn lifecycle);
+//! (node headers — Input bodies inline — + cursor state + turn lifecycle);
 //! Turn bodies are append-only `turns/<ulid>.jsonl` event streams, Context
 //! bodies are `contexts/<ulid>.md` text files.
 
@@ -21,9 +21,12 @@ pub mod store;
 pub use cursor::{Cursor, CursorRegistry};
 pub use error::{Error, Result};
 pub use events::TurnEvent;
-pub use graph::{Graph, NodeMeta};
+pub use graph::Graph;
 pub use id::{CursorId, NodeId};
 pub use journal::JournalEvent;
 pub use message::{CoreMessage, CoreToolCall};
-pub use node::{Node, NodeKind, NodeKindTag, Outcome, Step, TurnLine, Usage};
+pub use node::{
+    AnyNode, Context, ContextData, Input, Kind, Node, Outcome, Step, Turn, TurnData, TurnLine,
+    Usage, now_millis,
+};
 pub use store::Store;

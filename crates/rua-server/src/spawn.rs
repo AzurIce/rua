@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use rua_graph::id::NodeId;
-use rua_graph::node::{Node, NodeKind, NodeKindTag, Step};
+use rua_graph::node::{AnyNode, Input, Step};
 use rua_engine::{InspectOutcome, SpawnedTurn, TurnParams, TurnSpawner};
 use tokio_util::sync::CancellationToken;
 
@@ -44,7 +44,7 @@ impl TurnSpawner for ServerSpawner {
             if let Some(parent) = parent {
                 match graph.meta(parent) {
                     None => return Err(format!("node not found: {parent}")),
-                    Some(meta) if meta.kind != NodeKindTag::Turn => {
+                    Some(meta) if !meta.is_turn() => {
                         return Err("pointer must be a committed turn node".to_string());
                     }
                     _ => {}
@@ -55,22 +55,21 @@ impl TurnSpawner for ServerSpawner {
             state.broadcast(ServerEvent::CursorCreated {
                 cursor: cursor.clone(),
             });
-            let input = Node {
-                id: NodeId::new(),
+            let input = Input::node(
+                NodeId::new(),
                 parent,
-                context_refs: vec![],
+                text,
+                actor.clone(),
+                tools.clone(),
                 // 溯源：这个 input 由 created_by（发起 spawn 的 turn）产生。
-                created_by: Some(created_by),
-                created_at: Node::now_millis(),
-                kind: NodeKind::Input {
-                    text,
-                    actor: actor.clone(),
-                    tools: tools.clone(),
-                },
-            };
+                Some(created_by),
+            );
             let input_id = input.id;
-            graph.commit_node(input).map_err(|e| e.to_string())?;
-            let input_meta = graph.meta(input_id).expect("just committed").clone();
+            graph.commit(input).map_err(|e| e.to_string())?;
+            let input_meta = graph
+                .meta(input_id)
+                .expect("just committed")
+                .header_value();
             state.broadcast(ServerEvent::NodeCommitted { meta: input_meta });
             graph.move_cursor(cursor.id, input_id).map_err(|e| e.to_string())?;
             state.broadcast(ServerEvent::CursorMoved {
@@ -142,38 +141,43 @@ impl TurnSpawner for ServerSpawner {
 /// Project a committed node to the inspect payload. Turn = outcome + final
 /// response text + usage; Input/Context are returned as their text verbatim
 /// (the agent may inspect any pointer it holds).
-fn project(node: &Node) -> InspectOutcome {
-    match &node.kind {
-        NodeKind::Turn {
-            steps,
-            outcome,
-            usage,
-            ..
-        } => {
-            let text = steps
-                .iter()
-                .rev()
-                .find_map(|s| match s {
-                    Step::LlmCall {
-                        response_text, ..
-                    } if !response_text.is_empty() => Some(response_text.clone()),
-                    _ => None,
+fn project(node: &AnyNode) -> InspectOutcome {
+    match node {
+        AnyNode::Turn(n) => {
+            let text = n
+                .data
+                .as_ref()
+                .map(|d| {
+                    d.steps
+                        .iter()
+                        .rev()
+                        .find_map(|s| match s {
+                            Step::LlmCall {
+                                response_text, ..
+                            } if !response_text.is_empty() => Some(response_text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
                 })
                 .unwrap_or_default();
             InspectOutcome::Committed {
-                outcome: Some(format!("{outcome:?}").to_lowercase()),
+                outcome: Some(format!("{:?}", n.kind.outcome).to_lowercase()),
                 text,
-                usage: Some(*usage),
+                usage: Some(n.kind.usage),
             }
         }
-        NodeKind::Input { text, .. } => InspectOutcome::Committed {
+        AnyNode::Input(n) => InspectOutcome::Committed {
             outcome: None,
-            text: text.clone(),
+            text: n.kind.text.clone(),
             usage: None,
         },
-        NodeKind::Context { body, .. } => InspectOutcome::Committed {
+        AnyNode::Context(n) => InspectOutcome::Committed {
             outcome: None,
-            text: body.clone(),
+            text: n
+                .data
+                .as_ref()
+                .map(|d| d.body.clone())
+                .unwrap_or_default(),
             usage: None,
         },
     }

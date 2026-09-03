@@ -8,9 +8,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rua_graph::cursor::Cursor;
-use rua_graph::graph::NodeMeta;
 use rua_graph::id::{CursorId, NodeId};
-use rua_graph::node::{Node, NodeKind, Step};
+use rua_graph::node::{AnyNode, Context, Input, Step};
 use rua_graph::Error as CoreError;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -158,12 +157,12 @@ async fn create_cursor(
     (StatusCode::CREATED, Json(cursor))
 }
 
-/// 轻量链：只回 NodeMeta（Input 的全量 text 内联在 meta 里，聊天列表够用）。
+/// 轻量链：只回 header（Input 的全量 text 内联在 header 里，聊天列表够用）。
 /// Turn 的 steps（含重建 request，物化贵）走 `GET /api/nodes/{id}` 按需取。
 async fn get_chain(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<NodeMeta>>, ApiError> {
+) -> Result<Json<Vec<Value>>, ApiError> {
     let cursor_id = parse_cursor_id(&id)?;
     let graph = state.graph.lock().await;
     let tip = graph.cursors.get(cursor_id)?.node;
@@ -171,11 +170,11 @@ async fn get_chain(
         return Ok(Json(Vec::new()));
     };
     let ids = graph.chain_to_root(tip)?;
-    let metas = ids
+    let headers = ids
         .into_iter()
-        .filter_map(|id| graph.meta(id).cloned())
+        .filter_map(|id| graph.meta(id).map(AnyNode::header_value))
         .collect();
-    Ok(Json(metas))
+    Ok(Json(headers))
 }
 
 #[derive(Deserialize)]
@@ -249,21 +248,17 @@ async fn post_input(
     // wire 层的 None（UI 全勾）就地展开为显式列表再落图：图数据里 tools
     // 就是 Vec，没有 None。用户发送恒 depth=0 且 spawner 在位。
     let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
-    let input = Node {
-        id: NodeId::new(),
-        parent: cursor.node,
-        context_refs: vec![],
-        created_by: None,
-        created_at: Node::now_millis(),
-        kind: NodeKind::Input {
-            text: body.text,
-            actor: cursor.actor.clone(),
-            tools: tools.clone(),
-        },
-    };
+    let input = Input::node(
+        NodeId::new(),
+        cursor.node,
+        body.text,
+        cursor.actor.clone(),
+        tools.clone(),
+        None,
+    );
     let input_id = input.id;
-    graph.commit_node(input)?;
-    let input_meta = graph.meta(input_id).expect("just committed").clone();
+    graph.commit(input)?;
+    let input_meta = graph.meta(input_id).expect("just committed").header_value();
     state.broadcast(ServerEvent::NodeCommitted {
         meta: input_meta.clone(),
     });
@@ -337,7 +332,7 @@ async fn post_root_input(
     if let Some(parent) = body.parent {
         match graph.meta(parent) {
             None => return Err(CoreError::NodeNotFound(parent).into()),
-            Some(meta) if meta.kind != rua_graph::node::NodeKindTag::Turn => {
+            Some(meta) if !meta.is_turn() => {
                 return Err(ApiError::bad_request(
                     "attach point must be a turn node",
                 ));
@@ -353,21 +348,10 @@ async fn post_root_input(
     });
     // wire 层的 None（UI 全勾）就地展开为显式列表再落图（同 post_input）。
     let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
-    let input = Node {
-        id: NodeId::new(),
-        parent: body.parent,
-        context_refs: vec![],
-        created_by: None,
-        created_at: Node::now_millis(),
-        kind: NodeKind::Input {
-            text: body.text,
-            actor: actor.clone(),
-            tools: tools.clone(),
-        },
-    };
+    let input = Input::node(NodeId::new(), body.parent, body.text, actor.clone(), tools.clone(), None);
     let input_id = input.id;
-    graph.commit_node(input)?;
-    let input_meta = graph.meta(input_id).expect("just committed").clone();
+    graph.commit(input)?;
+    let input_meta = graph.meta(input_id).expect("just committed").header_value();
     state.broadcast(ServerEvent::NodeCommitted {
         meta: input_meta.clone(),
     });
@@ -432,7 +416,7 @@ async fn post_move(
     // footholds (re-answering an input would need an explicit retry op), and
     // context nodes are material (rejected inside the core).
     match graph.meta(body.node_id) {
-        Some(meta) if meta.kind == rua_graph::node::NodeKindTag::Input => {
+        Some(meta) if meta.is_input() => {
             return Err(ApiError::bad_request(
                 "cannot attach to an input node; attach to a turn node",
             ));
@@ -496,28 +480,34 @@ struct SummarizeBody {
 }
 
 /// Project a node to plain text as distillation material.
-fn project_node(node: &Node) -> String {
-    match &node.kind {
-        NodeKind::Input { text, actor, .. } => format!("[input by {actor}]\n{text}"),
-        NodeKind::Context { body, .. } => body.clone(),
-        NodeKind::Turn { steps, actor, .. } => {
-            let mut out = format!("[turn by {actor}]");
-            for step in steps {
-                match step {
-                    Step::LlmCall { response_text, .. } if !response_text.is_empty() => {
-                        out.push('\n');
-                        out.push_str(response_text);
+fn project_node(node: &AnyNode) -> String {
+    match node {
+        AnyNode::Input(n) => format!("[input by {}]\n{}", n.kind.actor, n.kind.text),
+        AnyNode::Context(n) => n
+            .data
+            .as_ref()
+            .map(|d| d.body.clone())
+            .unwrap_or_default(),
+        AnyNode::Turn(n) => {
+            let mut out = format!("[turn by {}]", n.kind.actor);
+            if let Some(data) = &n.data {
+                for step in &data.steps {
+                    match step {
+                        Step::LlmCall { response_text, .. } if !response_text.is_empty() => {
+                            out.push('\n');
+                            out.push_str(response_text);
+                        }
+                        Step::ToolExec {
+                            name,
+                            args,
+                            output,
+                            ..
+                        } => {
+                            let preview: String = output.chars().take(200).collect();
+                            out.push_str(&format!("\n[tool {name}] args={args}\n{preview}"));
+                        }
+                        _ => {}
                     }
-                    Step::ToolExec {
-                        name,
-                        args,
-                        output,
-                        ..
-                    } => {
-                        let preview: String = output.chars().take(200).collect();
-                        out.push_str(&format!("\n[tool {name}] args={args}\n{preview}"));
-                    }
-                    _ => {}
                 }
             }
             out
@@ -528,7 +518,7 @@ fn project_node(node: &Node) -> String {
 async fn post_summarize(
     State(state): State<SharedState>,
     Json(body): Json<SummarizeBody>,
-) -> Result<Json<NodeMeta>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     if body.sources.is_empty() {
         return Err(ApiError::bad_request("sources must be non-empty"));
     }
@@ -548,22 +538,17 @@ async fn post_summarize(
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("summarize failed: {e}")))?;
 
-    let node = Node {
-        id: NodeId::new(),
-        parent: None,
-        context_refs: body.sources.clone(),
-        created_by: None,
-        created_at: Node::now_millis(),
-        kind: NodeKind::Context {
-            body: summary,
-            created_by: body.sources[0],
-            model: state.default_model.clone(),
-        },
-    };
+    let node = Context::node(
+        NodeId::new(),
+        summary,
+        body.sources.clone(),
+        body.sources[0],
+        state.default_model.clone(),
+    );
     let node_id = node.id;
     let mut graph = state.graph.lock().await;
-    graph.commit_node(node)?;
-    let meta = graph.meta(node_id).expect("just committed").clone();
+    graph.commit(node)?;
+    let meta = graph.meta(node_id).expect("just committed").header_value();
     drop(graph);
     state.broadcast(ServerEvent::NodeCommitted { meta: meta.clone() });
     Ok(Json(meta))

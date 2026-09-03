@@ -1140,6 +1140,7 @@ mod tests {
             usage: None,
             context_tokens: None,
             created_by: None,
+            distilled_from: None,
             model: None,
             tools: vec![],
             text: None,

@@ -16,7 +16,7 @@ use crate::node::TurnLine;
 /// └── contexts/<ulid>.md  Context 正文：文本材料（tmp + rename 原子写）
 /// ```
 ///
-/// Input 正文内联在 journal meta（`NodeMeta.text`），不落正文文件。
+/// Input 正文内联在 journal header（`Input.text`），不落正文文件。
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
@@ -127,11 +127,23 @@ impl Store {
     pub fn append_journal(&self, event: &JournalEvent) -> Result<()> {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
+        self.append_journal_bytes(&line)
+    }
+
+    /// Append a pre-encoded journal line (commit 路径用：header 直接从
+    /// 节点序列化，避免为落盘深拷贝正文)。
+    pub fn append_journal_value(&self, value: &serde_json::Value) -> Result<()> {
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        self.append_journal_bytes(&line)
+    }
+
+    fn append_journal_bytes(&self, line: &[u8]) -> Result<()> {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.journal_path())?;
-        file.write_all(&line)?;
+        file.write_all(line)?;
         file.sync_data()?;
         Ok(())
     }

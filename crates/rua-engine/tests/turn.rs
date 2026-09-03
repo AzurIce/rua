@@ -7,7 +7,7 @@ use rua_engine::config::ProviderConfig;
 use rua_graph::events::TurnEvent;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::message::CoreMessage;
-use rua_graph::node::{NodeKind, Outcome, Step, TurnLine};
+use rua_graph::node::{Outcome, Step, TurnLine};
 use rua_engine::{Engine, TurnParams};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -183,11 +183,8 @@ async fn model_override_reaches_the_request() {
     }]);
     p.model = "other-model".to_string();
     let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
-    let NodeKind::Turn { outcome, model, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
-    assert_eq!(*outcome, Outcome::Completed);
-    assert_eq!(model, "other-model");
+    assert_eq!(node.kind.outcome, Outcome::Completed);
+    assert_eq!(node.kind.model, "other-model");
 }
 
 #[tokio::test]
@@ -213,22 +210,12 @@ async fn plain_text_turn_completes() {
     p.sink = Some(sink);
     let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
-    let NodeKind::Turn {
-        steps,
-        outcome,
-        actor,
-        model,
-        usage,
-        tools,
-    } = &node.kind
-    else {
-        panic!("expected turn node");
-    };
-    assert_eq!(*outcome, Outcome::Completed);
-    assert_eq!(actor, "human");
-    assert_eq!(model, "deepseek-v4-pro");
+    let steps = &node.data.as_ref().unwrap().steps;
+    assert_eq!(node.kind.outcome, Outcome::Completed);
+    assert_eq!(node.kind.actor, "human");
+    assert_eq!(node.kind.model, "deepseek-v4-pro");
     // 无 spawner：有效工具集只有 bash，记录在 Turn 节点上。
-    assert_eq!(tools, &vec!["bash".to_string()]);
+    assert_eq!(node.kind.tools, vec!["bash".to_string()]);
     assert_eq!(steps.len(), 1);
     let Step::LlmCall {
         response_text,
@@ -246,7 +233,7 @@ async fn plain_text_turn_completes() {
     assert_eq!(step_usage.input_tokens, 10);
     assert_eq!(step_usage.output_tokens, 5);
     assert_eq!(step_usage.cached_input_tokens, 4);
-    assert_eq!(usage.input_tokens, 10);
+    assert_eq!(node.kind.usage.input_tokens, 10);
 
     // Sink: Init 锚点（系统提示 + 初始 user 消息）+ 一条 LlmCall 行。
     let lines = lines.lock().unwrap();
@@ -320,9 +307,7 @@ async fn tool_call_turn_executes_bash_and_feeds_back_result() {
         .await
         .unwrap();
 
-    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
     assert_eq!(*outcome, Outcome::Completed);
     assert_eq!(steps.len(), 3, "llm call + tool exec + llm call");
 
@@ -422,9 +407,7 @@ async fn cancelled_turn_yields_cancelled_node_with_steps_preserved() {
         .await
         .unwrap();
 
-    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
     assert_eq!(*outcome, Outcome::Cancelled);
     // The in-flight LLM call is still recorded (empty response).
     assert_eq!(steps.len(), 1);
@@ -453,9 +436,7 @@ async fn provider_error_yields_failed_node() {
         .await
         .unwrap();
 
-    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
     assert_eq!(*outcome, Outcome::Failed);
     assert_eq!(steps.len(), 1);
 }
@@ -577,9 +558,11 @@ async fn spawn_turn_then_inspect_roundtrip() {
         .await
         .unwrap();
 
-    let NodeKind::Turn { steps, outcome, tools, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let (steps, outcome, tools) = (
+        &node.data.as_ref().unwrap().steps,
+        &node.kind.outcome,
+        &node.kind.tools,
+    );
     assert_eq!(*outcome, Outcome::Completed);
     assert_eq!(steps.len(), 5, "llm + spawn + llm + inspect + llm");
     // Turn 节点记录该轮有效工具集（spawner 在位、depth 0 → 全量）。
@@ -745,9 +728,7 @@ async fn disabled_tool_call_is_soft_rejected() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
-    let NodeKind::Turn { steps, outcome, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
     assert_eq!(*outcome, Outcome::Completed);
     assert_eq!(steps.len(), 3, "llm + rejected tool exec + llm");
     let Step::ToolExec { name, output, .. } = &steps[1] else {
@@ -805,9 +786,7 @@ async fn spawn_explicit_tools_subset_passes_validation() {
         .await
         .unwrap();
 
-    let NodeKind::Turn { outcome, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let outcome = &node.kind.outcome;
     assert_eq!(*outcome, Outcome::Completed);
     let spawned = spawner.spawned.lock().unwrap();
     assert_eq!(spawned.len(), 1);
@@ -855,9 +834,7 @@ async fn spawn_invalid_tools_subset_is_rejected() {
         )
         .await
         .unwrap();
-    let NodeKind::Turn { steps, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let steps = &node.data.as_ref().unwrap().steps;
     let Step::ToolExec { output, .. } = &steps[1] else {
         panic!("expected tool exec");
     };
@@ -897,9 +874,7 @@ async fn spawn_invalid_tools_subset_is_rejected() {
     p.tools = Some(vec!["bash".to_string(), "spawn_turn".to_string()]);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
-    let NodeKind::Turn { steps, .. } = &node.kind else {
-        panic!("expected turn node");
-    };
+    let steps = &node.data.as_ref().unwrap().steps;
     let Step::ToolExec { output, .. } = &steps[1] else {
         panic!("expected tool exec");
     };

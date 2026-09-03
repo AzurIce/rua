@@ -42,6 +42,8 @@ pub struct NodeMeta {
     pub kind: NodeKindTag,
     #[serde(default)]
     pub outcome: Option<Outcome>,
+    /// Input/Turn = 发起方。Context 行不带此字段（缺省空串）。
+    #[serde(default)]
     pub actor: String,
     pub created_at: u64,
     #[serde(default)]
@@ -52,6 +54,9 @@ pub struct NodeMeta {
     /// 创建者（哪个 turn 的 spawn_turn 产生）；None = 用户/直接操作。
     #[serde(default)]
     pub created_by: Option<String>,
+    /// Context 节点的蒸馏来源（新 wire 字段；旧 wire 曾借 created_by 槽）。
+    #[serde(default)]
+    pub distilled_from: Option<String>,
     /// 该 turn 使用的模型（turn 节点才有）。
     #[serde(default)]
     pub model: Option<String>,
@@ -64,6 +69,14 @@ pub struct NodeMeta {
     #[serde(default)]
     pub text: Option<String>,
     pub preview: String,
+}
+
+impl NodeMeta {
+    /// 溯源边：Input/Turn = spawn 来源（created_by）；Context = 蒸馏来源
+    /// （distilled_from）。图视图的引入边统一走这里。
+    pub fn provenance(&self) -> Option<&String> {
+        self.created_by.as_ref().or(self.distilled_from.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,7 +195,9 @@ pub enum NodeKind {
     },
     Context {
         body: String,
-        created_by: String,
+        /// 蒸馏来源（新 wire 键名；旧格式为 created_by，别名兼容）。
+        #[serde(alias = "created_by")]
+        distilled_from: String,
         model: String,
     },
 }

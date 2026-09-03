@@ -34,6 +34,9 @@ pub enum Error {
     #[error("cursor has no in-flight turn: {0}")]
     CursorIdle(CursorId),
 
+    #[error("node body not loaded (data: None): {0}")]
+    DataNotLoaded(NodeId),
+
     #[error("journal corrupted at line {line}: {reason}")]
     JournalCorrupted { line: usize, reason: String },
 

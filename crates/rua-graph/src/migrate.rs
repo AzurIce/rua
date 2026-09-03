@@ -3,7 +3,7 @@
 //! Legacy layout: `nodes/<ulid>.json` single files holding envelope + body
 //! (`Step::LlmCall` embedding the full request message list). Current layout:
 //! the journal is the only structural source of truth (Input bodies inline in
-//! `NodeMeta.text`), Turn bodies are `turns/<ulid>.jsonl` event streams
+//! the header), Turn bodies are `turns/<ulid>.jsonl` event streams
 //! (request dropped; the first call's request kept as the `init` anchor),
 //! Context bodies are `contexts/<ulid>.md` text files.
 //!
@@ -17,11 +17,9 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::error::Result;
-use crate::graph::NodeMeta;
 use crate::id::NodeId;
-use crate::journal::JournalEvent;
 use crate::message::{CoreMessage, CoreToolCall};
-use crate::node::{Node, NodeKind, Outcome, TurnLine, Usage};
+use crate::node::{AnyNode, Context, Input, Outcome, Step, Turn, TurnData, TurnLine, Usage};
 use crate::store::Store;
 
 // ---- legacy serde types (mirror the old format; never written) ----
@@ -106,7 +104,7 @@ pub(crate) fn migrate_legacy_nodes(store: &Store) -> Result<bool> {
 
     // 1. Read every legacy node; convert to the current model and write the
     //    new body files.
-    let mut converted: Vec<Node> = Vec::with_capacity(files.len());
+    let mut converted: Vec<AnyNode> = Vec::with_capacity(files.len());
     for path in &files {
         let bytes = fs::read(path)?;
         let legacy: LegacyNode = serde_json::from_slice(&bytes)?;
@@ -126,36 +124,33 @@ pub(crate) fn migrate_legacy_nodes(store: &Store) -> Result<bool> {
     let had_journal = journal.exists();
     if had_journal {
         fs::rename(&journal, trash.join("journal.jsonl"))?;
-        // 3. Rewrite the journal: node metas are regenerated from the
-        //    converted nodes (Input metas gain the inline `text`); cursor /
-        //    turn events pass through unchanged.
-        let old_events: Vec<JournalEvent> = {
-            let text = fs::read_to_string(trash.join("journal.jsonl"))?;
-            let mut events = Vec::new();
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                // 旧 journal 是迁移前最后写入的完整文件，不容忍坏行。
-                events.push(serde_json::from_str(line)?);
-            }
-            events
-        };
+        // 3. Rewrite the journal: node_committed lines whose meta id matches
+        //    a converted node are replaced with the new header (Input headers
+        //    gain the inline `text`); everything else passes through as raw
+        //    JSON — 旧行不做 schema 反序列化（旧 meta 形状 ≠ 新 header 形状，
+        //    迁移边界只做 Value 级替换，未知字段原样保留）。
+        let text = fs::read_to_string(trash.join("journal.jsonl"))?;
         let mut out: Vec<u8> = Vec::new();
-        for ev in old_events {
-            let ev = match ev {
-                JournalEvent::NodeCommitted { meta } => {
-                    match converted.iter().find(|n| n.id == meta.id) {
-                        Some(node) => JournalEvent::NodeCommitted {
-                            meta: NodeMeta::of(node),
-                        },
-                        // meta 没有对应正文文件（手坏的数据）：原样保留。
-                        None => JournalEvent::NodeCommitted { meta },
-                    }
-                }
-                other => other,
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)?;
+            let replaced = if v["event"] == "node_committed" {
+                v["meta"]["id"]
+                    .as_str()
+                    .and_then(|s| s.parse::<NodeId>().ok())
+                    .and_then(|id| converted.iter().find(|n| n.id() == id))
+                    .map(|node| {
+                        serde_json::json!({
+                            "event": "node_committed",
+                            "meta": node.header_value(),
+                        })
+                    })
+            } else {
+                None
             };
-            out.extend_from_slice(&serde_json::to_vec(&ev)?);
+            out.extend_from_slice(&serde_json::to_vec(&replaced.unwrap_or(v))?);
             out.push(b'\n');
         }
         let tmp = store.root().join(".journal.jsonl.tmp");
@@ -173,9 +168,18 @@ pub(crate) fn migrate_legacy_nodes(store: &Store) -> Result<bool> {
 }
 
 /// Convert one legacy node to the current model, writing its new body file.
-fn convert(legacy: LegacyNode, store: &Store) -> Result<Node> {
-    let kind = match legacy.kind {
-        LegacyNodeKind::Input { text, actor, tools } => NodeKind::Input { text, actor, tools },
+fn convert(legacy: LegacyNode, store: &Store) -> Result<AnyNode> {
+    let node = match legacy.kind {
+        LegacyNodeKind::Input { text, actor, tools } => {
+            AnyNode::Input(Input::node(
+                legacy.id,
+                legacy.parent,
+                text,
+                actor,
+                tools,
+                legacy.created_by,
+            ))
+        }
         LegacyNodeKind::Turn {
             steps,
             outcome,
@@ -202,7 +206,7 @@ fn convert(legacy: LegacyNode, store: &Store) -> Result<Node> {
                         usage,
                         ..
                     } => {
-                        let step = crate::node::Step::LlmCall {
+                        let step = Step::LlmCall {
                             response_text,
                             tool_calls,
                             reasoning,
@@ -218,7 +222,7 @@ fn convert(legacy: LegacyNode, store: &Store) -> Result<Node> {
                         output,
                         duration_ms,
                     } => {
-                        let step = crate::node::Step::ToolExec {
+                        let step = Step::ToolExec {
                             call_id,
                             name,
                             args,
@@ -231,14 +235,18 @@ fn convert(legacy: LegacyNode, store: &Store) -> Result<Node> {
                 store.append_turn_line(legacy.id, &line)?;
                 new_steps.push(new_step);
             }
-            NodeKind::Turn {
-                steps: new_steps,
+            AnyNode::Turn(Turn::node(
+                legacy.id,
+                legacy.parent,
+                legacy.context_refs,
+                legacy.created_by,
                 outcome,
                 actor,
                 model,
                 usage,
                 tools,
-            }
+                TurnData { steps: new_steps },
+            ))
         }
         LegacyNodeKind::Context {
             body,
@@ -246,19 +254,14 @@ fn convert(legacy: LegacyNode, store: &Store) -> Result<Node> {
             model,
         } => {
             store.write_context(legacy.id, &body)?;
-            NodeKind::Context {
+            AnyNode::Context(Context::node(
+                legacy.id,
                 body,
+                legacy.context_refs,
                 created_by,
                 model,
-            }
+            ))
         }
     };
-    Ok(Node {
-        id: legacy.id,
-        parent: legacy.parent,
-        context_refs: legacy.context_refs,
-        created_by: legacy.created_by,
-        created_at: legacy.created_at,
-        kind,
-    })
+    Ok(node.with_created_at(legacy.created_at))
 }

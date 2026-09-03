@@ -1,39 +1,31 @@
+//! Turn：一轮完整 agent 交互。meta 进 journal；正文是
+//! `turns/<ulid>.jsonl` 轮内事件流（引擎 sink 逐行增量追加，崩溃不丢
+//! 轮内进度），折叠成内存里的 [`TurnData`]。
+
 use serde::{Deserialize, Serialize};
 
+use crate::error::Result;
 use crate::id::NodeId;
 use crate::message::CoreMessage;
+use crate::node::{Outcome, truncate_preview, Kind, Node, Usage, now_millis};
+use crate::store::Store;
 
-/// Normalized token usage, summed over a turn's LLM calls.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Usage {
+/// Turn meta = journal 平铺字段，必填。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Turn {
+    pub outcome: Outcome,
+    pub actor: String,
+    pub model: String,
     #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub reasoning_tokens: u64,
-    #[serde(default)]
-    pub cached_input_tokens: u64,
-}
-
-impl Usage {
-    pub fn add_assign(&mut self, other: &Usage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
-        self.cached_input_tokens += other.cached_input_tokens;
-    }
-}
-
-/// Terminal state of a turn. A node existing at all means its turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    Completed,
-    Failed,
-    Cancelled,
-    /// The daemon died mid-turn; discovered on journal replay.
-    Interrupted,
+    pub usage: Usage,
+    /// 该回合最后一次 LLM 调用实际吃掉的上下文量（input tokens，含缓存；
+    /// 构造时从 steps 算好，chain 端点免读正文）。无 LLM 调用（纯失败
+    /// 回合）为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// 该轮实际生效的工具集（规范序记录，非配置）。空 = 未记录（旧数据）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 /// One step inside a turn. The full interior of a turn is preserved;
@@ -172,85 +164,100 @@ impl TurnLine {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum NodeKind {
-    /// Input on an edge, modelled as a node. Roots a conversation when
-    /// `parent` is `None`.
-    Input {
-        text: String,
-        actor: String,
-        /// 本轮的工具覆盖（展开后的显式列表，wire 层的 None 在 commit 前
-        /// 就地展开）。空数组 = 未记录（旧数据）或该轮无工具。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tools: Vec<String>,
-    },
-    /// A complete turn: LLM calls + tool executions + outcome.
-    Turn {
-        steps: Vec<Step>,
+/// Turn 正文：折叠后的 steps（Init 锚点不是 step，不在这里）。
+/// `Serialize` 供详情端点的 `kind: {type, ...meta, ...data}` 平铺；
+/// 反序列化不走 serde（正文从 jsonl 折叠而来）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TurnData {
+    pub steps: Vec<Step>,
+}
+
+impl Kind for Turn {
+    type Data = TurnData;
+}
+
+impl Turn {
+    /// 构造一个已提交形态的 Turn 节点：context_tokens（最后一次有产量的
+    /// LlmCall 的 input tokens）与 preview（最后一条非空 response）从
+    /// steps 算好。
+    #[allow(clippy::too_many_arguments)]
+    pub fn node(
+        id: NodeId,
+        parent: Option<NodeId>,
+        context_refs: Vec<NodeId>,
+        created_by: Option<NodeId>,
         outcome: Outcome,
-        actor: String,
-        model: String,
-        #[serde(default)]
+        actor: impl Into<String>,
+        model: impl Into<String>,
         usage: Usage,
-        /// 该轮实际生效的工具集（规范序记录，非配置）。空 = 旧数据未记录。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tools: Vec<String>,
-    },
-    /// Distilled material. Never a cursor/attach/fork landing point; its
-    /// `context_refs` are provenance edges to the nodes it was distilled
-    /// from.
-    Context {
-        body: String,
-        created_by: NodeId,
-        model: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKindTag {
-    Input,
-    Turn,
-    Context,
-}
-
-/// An immutable, committed node. `parent` is the immutable structural link;
-/// `context_refs` are material links to already-committed nodes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Node {
-    pub id: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<NodeId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_refs: Vec<NodeId>,
-    /// 创建者（provenance）：由哪个 turn 内部的 spawn_turn 工具调用产生。
-    /// 只打在 spawn 出的根 Input 上（子树归属沿 chain 传递推导）；
-    /// None = 用户/直接操作产生。不影响装配，纯属图上的溯源。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_by: Option<NodeId>,
-    /// Unix epoch milliseconds.
-    pub created_at: u64,
-    pub kind: NodeKind,
-}
-
-impl Node {
-    pub fn kind_tag(&self) -> NodeKindTag {
-        match &self.kind {
-            NodeKind::Input { .. } => NodeKindTag::Input,
-            NodeKind::Turn { .. } => NodeKindTag::Turn,
-            NodeKind::Context { .. } => NodeKindTag::Context,
+        data: TurnData,
+    ) -> Node<Turn> {
+        let final_text = data
+            .steps
+            .iter()
+            .rev()
+            .find_map(|s| match s {
+                Step::LlmCall {
+                    response_text, ..
+                } if !response_text.is_empty() => Some(response_text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let context_tokens = data.steps.iter().rev().find_map(|s| match s {
+            Step::LlmCall { usage, .. } if usage.input_tokens > 0 => Some(usage.input_tokens),
+            _ => None,
+        });
+        Node {
+            id,
+            parent,
+            context_refs,
+            created_by,
+            created_at: now_millis(),
+            preview: truncate_preview(&final_text, 80),
+            kind: Turn {
+                outcome,
+                actor: actor.into(),
+                model: model.into(),
+                usage,
+                context_tokens,
+                tools,
+            },
+            data: Some(data),
         }
     }
 
-    pub fn is_structural(&self) -> bool {
-        !matches!(self.kind, NodeKind::Context { .. })
+    /// 读正文：jsonl 逐行折叠成 steps（Init 锚点不是 step）。
+    /// 缺失文件 = 空正文；撕裂尾行容忍（崩溃在 append 中途）。
+    pub fn read_data(store: &Store, id: NodeId) -> Result<TurnData> {
+        let steps = store
+            .read_turn_lines(id)?
+            .into_iter()
+            .filter_map(TurnLine::into_step)
+            .collect();
+        Ok(TurnData { steps })
     }
 
-    pub fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+    /// commit 时的正文收尾（幂等）：sink 已增量写过（文件存在）则跳过；
+    /// 直接提交路径（无 sink，如测试）把 steps 整体转出（无 Init 行）。
+    pub fn write_data(store: &Store, id: NodeId, data: &TurnData) -> Result<()> {
+        if store.has_turn_lines(id) {
+            return Ok(());
+        }
+        for step in &data.steps {
+            store.append_turn_line(id, &TurnLine::from(step.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// The turn's init anchor: the first LLM call's full request snapshot
+    /// (`None` when the body has no `Init` line, e.g. direct-commit paths).
+    pub fn init_anchor(store: &Store, id: NodeId) -> Result<Option<Vec<CoreMessage>>> {
+        Ok(store.read_turn_lines(id)?.into_iter().find_map(|line| {
+            match line {
+                TurnLine::Init { request } => Some(request),
+                _ => None,
+            }
+        }))
     }
 }
