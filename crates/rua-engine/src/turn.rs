@@ -11,7 +11,7 @@ use rig_core::streaming::StreamedAssistantContent;
 use rua_graph::events::TurnEvent;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::message::{CoreMessage, CoreToolCall};
-use rua_graph::node::{Node, Outcome, Step, Turn, TurnData, TurnLine, Usage};
+use rua_graph::node::{Input, Node, Outcome, Step, Turn, TurnLine, Usage};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -29,11 +29,11 @@ const OUTPUT_PREVIEW_CHARS: usize = 500;
 
 pub struct TurnParams {
     pub cursor_id: CursorId,
-    /// Pre-allocated landing node id.
-    pub node_id: NodeId,
-    /// The cursor's current tip.
-    pub parent: Option<NodeId>,
-    pub context_refs: Vec<NodeId>,
+    /// Pre-allocated landing node id（`CursorMut::open_turn` 铸好并注册了
+    /// 数据面空条目）。
+    pub node_id: NodeId<Turn>,
+    /// 相继边：本轮回应的 Input。
+    pub parent: NodeId<Input>,
     pub actor: String,
     pub model: String,
     /// Assembled history (`crate::assemble` output); must be non-empty.
@@ -48,9 +48,12 @@ pub struct TurnParams {
     /// 请求前缀 → 前缀缓存失效（开发测试时这正是目的）。
     pub tools: Option<Vec<String>>,
     /// 增量落盘回调：每个 step 完成时同步收到对应的 `TurnLine`（首个 LLM
-    /// 调用前另收一条 `Init` 锚点）。engine 的未来是 `!Send`、跑在专用
-    /// 线程，sink 只需可调用；返回 ()，错误由闭包内部自己吞掉。
-    pub sink: Option<Box<dyn FnMut(TurnLine) + Send>>,
+    /// 调用前另收一条 `Init` 锚点）。server 侧注入的是数据面条目的
+    /// `Entry<Turn>::append`（文件 + 内存同一临界区）。engine 的未来是
+    /// `!Send`、跑在专用线程，sink 只需可调用。返回 Err = 正文无法
+    /// 持久化：engine 以 `Outcome::Failed` 终止本轮，**落盘失败的 step
+    /// 不入账**（数据面是唯一账本；meta 由落盘成功的 steps 推导）。
+    pub sink: Option<Box<dyn FnMut(TurnLine) -> std::result::Result<(), String> + Send>>,
 }
 
 /// What one streamed LLM call produced.
@@ -74,7 +77,6 @@ impl Engine {
             cursor_id,
             node_id,
             parent,
-            context_refs,
             actor,
             model,
             mut history,
@@ -99,21 +101,32 @@ impl Engine {
         let send = |event: TurnEvent| {
             let _ = events.send(event);
         };
-        send(TurnEvent::Started { cursor_id, node_id });
+        send(TurnEvent::Started {
+            cursor_id,
+            node_id: node_id.raw(),
+        });
 
         // Init 锚点：首次 LLM 调用的完整请求快照（系统提示 + 初始历史），
-        // 一轮至多一份，是轮内 request 重建的起点。
+        // 一轮至多一份，是轮内 request 重建的起点。落盘失败 = 正文无法
+        // 持久化，以此终止本轮（Failed、零 step）。
+        let mut persist_ok = true;
         if let Some(sink) = &mut sink {
-            sink(TurnLine::Init {
+            if let Err(e) = sink(TurnLine::Init {
                 request: request_snapshot(&history, &prompt),
-            });
+            }) {
+                eprintln!("rua: turn {node_id} init anchor persist failed: {e}");
+                persist_ok = false;
+            }
         }
 
         let mut steps: Vec<Step> = Vec::new();
         let mut usage = Usage::default();
         let mut tool_rounds = 0usize;
 
-        let outcome = loop {
+        let outcome = 'agent: loop {
+            if !persist_ok {
+                break Outcome::Failed;
+            }
             let call = self
                 .stream_call(
                     &model,
@@ -136,8 +149,12 @@ impl Engine {
                 usage: call.usage,
                 provider_data: None,
             };
+            // 先落盘再入账：落盘失败的 step 不进 steps（数据面是唯一账本）。
             if let Some(sink) = &mut sink {
-                sink(TurnLine::from(step.clone()));
+                if let Err(e) = sink(TurnLine::from(step.clone())) {
+                    eprintln!("rua: turn {node_id} body persist failed: {e}");
+                    break Outcome::Failed;
+                }
             }
             steps.push(step);
             history.push(CoreMessage::Assistant {
@@ -162,7 +179,7 @@ impl Engine {
             for call_tool in &call.tool_calls {
                 send(TurnEvent::ToolExecStarted {
                     cursor_id,
-                    node_id,
+                    node_id: node_id.raw(),
                     call_id: call_tool.id.clone(),
                     name: call_tool.name.clone(),
                     args: call_tool.args.clone(),
@@ -201,7 +218,7 @@ impl Engine {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 send(TurnEvent::ToolExecFinished {
                     cursor_id,
-                    node_id,
+                    node_id: node_id.raw(),
                     call_id: call_tool.id.clone(),
                     output_preview: output.chars().take(OUTPUT_PREVIEW_CHARS).collect(),
                     duration_ms,
@@ -213,8 +230,12 @@ impl Engine {
                     output: output.clone(),
                     duration_ms,
                 };
+                // 先落盘再入账：落盘失败的 step 不进 steps（数据面是唯一账本）。
                 if let Some(sink) = &mut sink {
-                    sink(TurnLine::from(step.clone()));
+                    if let Err(e) = sink(TurnLine::from(step.clone())) {
+                        eprintln!("rua: turn {node_id} body persist failed: {e}");
+                        break 'agent Outcome::Failed;
+                    }
                 }
                 steps.push(step);
                 history.push(CoreMessage::ToolResult {
@@ -228,14 +249,12 @@ impl Engine {
         Ok(Turn::node(
             node_id,
             parent,
-            context_refs,
-            None,
             outcome,
             actor,
             model,
             usage,
             effective.names(),
-            TurnData { steps },
+            &steps,
         ))
     }
 
@@ -251,7 +270,7 @@ impl Engine {
         history: &[CoreMessage],
         prompt: &str,
         cursor_id: CursorId,
-        node_id: NodeId,
+        node_id: NodeId<Turn>,
         depth: usize,
         tools: &EffectiveTools,
         send: &dyn Fn(TurnEvent),
@@ -340,7 +359,7 @@ impl Engine {
                     outcome.text.push_str(&text.text);
                     send(TurnEvent::TextDelta {
                         cursor_id,
-                        node_id,
+                        node_id: node_id.raw(),
                         delta: text.text,
                     });
                 }
@@ -348,7 +367,7 @@ impl Engine {
                     outcome.reasoning.push_str(&reasoning);
                     send(TurnEvent::ReasoningDelta {
                         cursor_id,
-                        node_id,
+                        node_id: node_id.raw(),
                         delta: reasoning,
                     });
                 }
@@ -361,7 +380,7 @@ impl Engine {
                             outcome.reasoning = text.clone();
                             send(TurnEvent::ReasoningDelta {
                                 cursor_id,
-                                node_id,
+                                node_id: node_id.raw(),
                                 delta: text,
                             });
                         }

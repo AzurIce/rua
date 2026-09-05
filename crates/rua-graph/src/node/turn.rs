@@ -1,18 +1,22 @@
 //! Turn：一轮完整 agent 交互。meta 进 journal；正文是
-//! `turns/<ulid>.jsonl` 轮内事件流（引擎 sink 逐行增量追加，崩溃不丢
-//! 轮内进度），折叠成内存里的 [`TurnData`]。
+//! `turns/<ulid>.jsonl` 轮内事件流（engine sink 经 `Entry<Turn>::append`
+//! 逐行增量追加，崩溃不丢轮内进度），折叠成内存里的 [`TurnData`]。
+
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::NodeId;
 use crate::message::CoreMessage;
-use crate::node::{Outcome, truncate_preview, Kind, Node, Usage, now_millis};
-use crate::store::Store;
+use crate::node::{Data, Input, Kind, Node, Outcome, Usage, now_millis, truncate_preview};
 
 /// Turn meta = journal 平铺字段，必填。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
+    /// 相继边：一轮必然回应一个 Input（不可选；链严格交替）。
+    pub parent: NodeId<Input>,
     pub outcome: Outcome,
     pub actor: String,
     pub model: String,
@@ -176,25 +180,108 @@ impl Kind for Turn {
     type Data = TurnData;
 }
 
+impl Data for TurnData {
+    fn path(root: &Path, id: Ulid) -> PathBuf {
+        root.join("turns").join(format!("{id}.jsonl"))
+    }
+
+    /// 读正文：jsonl 逐行折叠成 steps（Init 锚点不是 step）。
+    /// 缺失文件 = 空正文（首轮前就失败的闭环）；撕裂尾行容忍（崩溃在
+    /// append 中途），中间坏行报错。
+    fn load(path: &Path) -> Result<Self> {
+        let steps = read_lines(path)?
+            .into_iter()
+            .filter_map(TurnLine::into_step)
+            .collect();
+        Ok(TurnData { steps })
+    }
+
+    /// 整体写出正文（无 Init 行）：迁移/克隆路径用。调用方（
+    /// `DataStore::create`）已确认文件不存在。
+    fn save(&self, path: &Path) -> Result<()> {
+        let mut bytes = Vec::new();
+        for step in &self.steps {
+            bytes.extend_from_slice(&serde_json::to_vec(&TurnLine::from(step.clone()))?);
+            bytes.push(b'\n');
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
+/// 追加一行到正文文件（首次追加时创建），耐久性与 journal 同级
+/// （append + `sync_data`）。`Entry<Turn>::append` 与迁移路径共用。
+pub(crate) fn append_line(path: &Path, line: &TurnLine) -> Result<()> {
+    use std::io::Write;
+    let mut line_bytes = serde_json::to_vec(line)?;
+    line_bytes.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(&line_bytes)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Read all lines of a turn body, tolerating a truncated/corrupt final
+/// line (the daemon may have died mid-append; same policy as the journal).
+/// A missing file reads as an empty body.
+fn read_lines(path: &Path) -> Result<Vec<TurnLine>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let mut lines = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(l) => lines.push(l),
+            Err(e) => {
+                // Only the last line may be incomplete (crash mid-append).
+                if i + 1 == text.lines().count() {
+                    break;
+                }
+                return Err(Error::JournalCorrupted {
+                    line: i + 1,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// The turn's init anchor: the first LLM call's full request snapshot
+/// (`None` when the body has no `Init` line, e.g. direct-commit paths).
+pub fn init_anchor(root: &Path, id: Ulid) -> Result<Option<Vec<CoreMessage>>> {
+    Ok(read_lines(&TurnData::path(root, id))?
+        .into_iter()
+        .find_map(|line| match line {
+            TurnLine::Init { request } => Some(request),
+            _ => None,
+        }))
+}
+
 impl Turn {
     /// 构造一个已提交形态的 Turn 节点：context_tokens（最后一次有产量的
     /// LlmCall 的 input tokens）与 preview（最后一条非空 response）从
-    /// steps 算好。
+    /// steps 算好。steps 只用于推导派生字段——正文归 DataStore，节点
+    /// 本身不携带它。
     #[allow(clippy::too_many_arguments)]
     pub fn node(
-        id: NodeId,
-        parent: Option<NodeId>,
-        context_refs: Vec<NodeId>,
-        created_by: Option<NodeId>,
+        id: NodeId<Turn>,
+        parent: NodeId<Input>,
         outcome: Outcome,
         actor: impl Into<String>,
         model: impl Into<String>,
         usage: Usage,
         tools: Vec<String>,
-        data: TurnData,
+        steps: &[Step],
     ) -> Node<Turn> {
-        let final_text = data
-            .steps
+        let final_text = steps
             .iter()
             .rev()
             .find_map(|s| match s {
@@ -204,18 +291,16 @@ impl Turn {
                 _ => None,
             })
             .unwrap_or_default();
-        let context_tokens = data.steps.iter().rev().find_map(|s| match s {
+        let context_tokens = steps.iter().rev().find_map(|s| match s {
             Step::LlmCall { usage, .. } if usage.input_tokens > 0 => Some(usage.input_tokens),
             _ => None,
         });
         Node {
             id,
-            parent,
-            context_refs,
-            created_by,
             created_at: now_millis(),
             preview: truncate_preview(&final_text, 80),
             kind: Turn {
+                parent,
                 outcome,
                 actor: actor.into(),
                 model: model.into(),
@@ -223,41 +308,6 @@ impl Turn {
                 context_tokens,
                 tools,
             },
-            data: Some(data),
         }
-    }
-
-    /// 读正文：jsonl 逐行折叠成 steps（Init 锚点不是 step）。
-    /// 缺失文件 = 空正文；撕裂尾行容忍（崩溃在 append 中途）。
-    pub fn read_data(store: &Store, id: NodeId) -> Result<TurnData> {
-        let steps = store
-            .read_turn_lines(id)?
-            .into_iter()
-            .filter_map(TurnLine::into_step)
-            .collect();
-        Ok(TurnData { steps })
-    }
-
-    /// commit 时的正文收尾（幂等）：sink 已增量写过（文件存在）则跳过；
-    /// 直接提交路径（无 sink，如测试）把 steps 整体转出（无 Init 行）。
-    pub fn write_data(store: &Store, id: NodeId, data: &TurnData) -> Result<()> {
-        if store.has_turn_lines(id) {
-            return Ok(());
-        }
-        for step in &data.steps {
-            store.append_turn_line(id, &TurnLine::from(step.clone()))?;
-        }
-        Ok(())
-    }
-
-    /// The turn's init anchor: the first LLM call's full request snapshot
-    /// (`None` when the body has no `Init` line, e.g. direct-commit paths).
-    pub fn init_anchor(store: &Store, id: NodeId) -> Result<Option<Vec<CoreMessage>>> {
-        Ok(store.read_turn_lines(id)?.into_iter().find_map(|line| {
-            match line {
-                TurnLine::Init { request } => Some(request),
-                _ => None,
-            }
-        }))
     }
 }

@@ -238,17 +238,23 @@ pub async fn delete_graph(state: &SharedState, name: &str) -> Result<()> {
 /// 引用的 context 材料节点）以新 id 复制进**当前活跃图**。
 ///
 /// 语义：
-/// - 克隆集 = 选中节点 + 结构后继（parent 链向下）+ 一层被引用的 context 节点；
-/// - parent / context_refs / created_by 只保留指向克隆集内部的边（重映射到
-///   新 id），指向集外的引用一律丢弃（溯源断链是可接受的：跨图复制本来
-///   就是「脱离上下文另起炉灶」）；
-/// - cursor 不克隆；节点本体不可变所以 kind 原样复制，id/时间戳/归属边换新；
+/// - 克隆集 = 选中节点 + 结构后继（parent 链向下）+ 每个 Turn 回应的 Input
+///   （相继边必选——克隆不能造出 parentless Turn）+ 一层被引用的 context 节点；
+/// - parent / context_refs / created_by / sources 只保留指向克隆集内部的边
+///   （重映射到新 id），指向集外的引用一律丢弃（溯源断链是可接受的：跨图复制
+///   本来就是「脱离上下文另起炉灶」）；Context.distilled_from 不在集内则原样
+///   保留（允许悬空，同 sources）；
+/// - cursor 不克隆；节点本体不可变所以 meta 原样复制，id/归属边换新，正文经
+///   数据面重写入目标图（Turn 的 Init 锚点不复制——与直接提交路径同形）；
 /// - 返回克隆的节点数。
 pub async fn clone_subgraph(
     state: &SharedState,
     from_graph: &str,
-    selected: Vec<rua_graph::id::NodeId>,
+    selected: Vec<rua_graph::Ulid>,
 ) -> Result<usize> {
+    use rua_graph::node::{Context, ContextData, Input, Meta, Turn, TurnData};
+    use rua_graph::{NodeId, Ulid};
+
     let from_graph = validate_name(from_graph)?;
     let src_dir = graph_dir(&state.graphs_root, from_graph);
     if !src_dir.is_dir() {
@@ -257,11 +263,11 @@ pub async fn clone_subgraph(
     if selected.is_empty() {
         return Ok(0);
     }
-    let mut src = Graph::open(&src_dir).map_err(GraphOpError::Core)?;
+    let src = Graph::open(&src_dir).map_err(GraphOpError::Core)?;
 
-    // 1. 扩张克隆集：选中节点 + 全部结构后继 + 一层 context 引用。
-    let mut set: std::collections::HashSet<rua_graph::id::NodeId> = selected.into_iter().collect();
-    let mut stack: Vec<rua_graph::id::NodeId> = set.iter().cloned().collect();
+    // 1. 扩张克隆集：选中节点 + 全部结构后继。
+    let mut set: std::collections::HashSet<Ulid> = selected.into_iter().collect();
+    let mut stack: Vec<Ulid> = set.iter().copied().collect();
     while let Some(id) = stack.pop() {
         for &child in src.children(id) {
             if set.insert(child) {
@@ -269,68 +275,141 @@ pub async fn clone_subgraph(
             }
         }
     }
-    let structural: Vec<rua_graph::id::NodeId> = set.iter().cloned().collect();
-    for id in structural {
-        if let Ok(node) = src.node(id) {
-            let refs: Vec<rua_graph::id::NodeId> = node.context_refs().to_vec();
-            for r in refs {
-                if src.meta(r).is_some() {
-                    set.insert(r);
+    // 每个 Turn 回应的 Input 必须随集（Turn.parent 必选）。
+    let snapshot: Vec<Ulid> = set.iter().copied().collect();
+    for id in snapshot {
+        if let Some(Meta::Turn(t)) = src.meta(id) {
+            set.insert(t.kind.parent.raw());
+        }
+    }
+    // 一层被引用的 context 材料。
+    let snapshot: Vec<Ulid> = set.iter().copied().collect();
+    for id in snapshot {
+        if let Some(meta) = src.meta(id) {
+            for r in meta.material_refs() {
+                if src.meta(r.raw()).is_some() {
+                    set.insert(r.raw());
                 }
             }
         }
     }
 
     // 2. 按 created_at 升序（父必先于子 commit）依次重建节点。
-    let mut ordered: Vec<rua_graph::node::AnyNode> = set
+    let mut ordered: Vec<Meta> = set
         .iter()
-        .filter_map(|id| src.node(*id).ok().cloned())
+        .filter_map(|id| src.meta(*id).cloned())
         .collect();
-    ordered.sort_by_key(rua_graph::node::AnyNode::created_at);
-
-    let remap: std::collections::HashMap<rua_graph::id::NodeId, rua_graph::id::NodeId> = ordered
-        .iter()
-        .map(|n| (n.id(), rua_graph::id::NodeId::new()))
-        .collect();
+    ordered.sort_by_key(Meta::created_at);
 
     let mut graph = state.graph.lock().await;
+
+    // 新 id 按 kind 铸造：DataStore::allocate 是 crate 外获得 typed id 的
+    // 唯一通道（NodeId::from_raw 是 pub(crate)——typed id 必须由图亲手发）。
+    // remap 是它们的裸 Ulid 形态，供 sources 这类裸边域过滤。
+    let new_inputs: std::collections::HashMap<Ulid, NodeId<Input>> = ordered
+        .iter()
+        .filter_map(|m| match m {
+            Meta::Input(n) => Some((n.id.raw(), graph.data().allocate::<Input>())),
+            _ => None,
+        })
+        .collect();
+    let new_turns: std::collections::HashMap<Ulid, NodeId<Turn>> = ordered
+        .iter()
+        .filter_map(|m| match m {
+            Meta::Turn(n) => Some((n.id.raw(), graph.data().allocate::<Turn>())),
+            _ => None,
+        })
+        .collect();
+    let new_ctxs: std::collections::HashMap<Ulid, NodeId<Context>> = ordered
+        .iter()
+        .filter_map(|m| match m {
+            Meta::Context(n) => Some((n.id.raw(), graph.data().allocate::<Context>())),
+            _ => None,
+        })
+        .collect();
+    let remap: std::collections::HashMap<Ulid, Ulid> = new_inputs
+        .iter()
+        .map(|(k, v)| (*k, v.raw()))
+        .chain(new_turns.iter().map(|(k, v)| (*k, v.raw())))
+        .chain(new_ctxs.iter().map(|(k, v)| (*k, v.raw())))
+        .collect();
+
     let mut count = 0usize;
     for old in ordered {
-        // 节点本体不可变所以 kind 原样复制，id/时间戳/归属边换新（只保留
-        // 指向克隆集内部的边）。
-        let node = match old {
-            rua_graph::node::AnyNode::Input(mut n) => {
-                n.id = remap[&n.id];
-                n.parent = n.parent.and_then(|p| remap.get(&p).copied());
-                n.context_refs = n
+        // 节点本体不可变所以 meta 原样复制，id/归属边换新（只保留指向
+        // 克隆集内部的边）；正文经数据面重写入目标图。
+        let node: Meta = match &old {
+            Meta::Input(n) => {
+                let mut new = Input::node(
+                    new_inputs[&n.id.raw()],
+                    n.kind.parent.and_then(|p| new_turns.get(&p.raw()).copied()),
+                    n.kind.text.clone(),
+                    n.kind.actor.clone(),
+                    n.kind.tools.clone(),
+                    n.kind.created_by.and_then(|c| new_turns.get(&c.raw()).copied()),
+                );
+                new.kind.context_refs = n
+                    .kind
                     .context_refs
                     .iter()
-                    .filter_map(|r| remap.get(r).copied())
+                    .filter_map(|r| new_ctxs.get(&r.raw()).copied())
                     .collect();
-                n.created_by = n.created_by.and_then(|c| remap.get(&c).copied());
-                rua_graph::node::AnyNode::Input(n)
+                Meta::from(new)
             }
-            rua_graph::node::AnyNode::Turn(mut n) => {
-                n.id = remap[&n.id];
-                n.parent = n.parent.and_then(|p| remap.get(&p).copied());
-                n.context_refs = n
-                    .context_refs
-                    .iter()
-                    .filter_map(|r| remap.get(r).copied())
-                    .collect();
-                n.created_by = n.created_by.and_then(|c| remap.get(&c).copied());
-                rua_graph::node::AnyNode::Turn(n)
+            Meta::Turn(n) => {
+                let steps = src
+                    .data()
+                    .entry(n.id)
+                    .and_then(|e| e.cloned())
+                    .map_err(GraphOpError::Core)?
+                    .steps;
+                let new_id: NodeId<Turn> = new_turns[&n.id.raw()];
+                graph
+                    .data()
+                    .create(new_id, TurnData { steps: steps.clone() })
+                    .map_err(GraphOpError::Core)?;
+                Meta::from(Turn::node(
+                    new_id,
+                    *new_inputs
+                        .get(&n.kind.parent.raw())
+                        .expect("克隆集扩张已纳入每个 Turn 的父 Input"),
+                    n.kind.outcome,
+                    n.kind.actor.clone(),
+                    n.kind.model.clone(),
+                    n.kind.usage,
+                    n.kind.tools.clone(),
+                    &steps,
+                ))
             }
-            rua_graph::node::AnyNode::Context(mut n) => {
-                n.id = remap[&n.id];
-                n.context_refs = n
-                    .context_refs
-                    .iter()
-                    .filter_map(|r| remap.get(r).copied())
-                    .collect();
-                rua_graph::node::AnyNode::Context(n)
+            Meta::Context(n) => {
+                let body = src
+                    .data()
+                    .entry(n.id)
+                    .and_then(|e| e.cloned())
+                    .map_err(GraphOpError::Core)?
+                    .body;
+                let new_id: NodeId<Context> = new_ctxs[&n.id.raw()];
+                graph
+                    .data()
+                    .create(new_id, ContextData { body: body.clone() })
+                    .map_err(GraphOpError::Core)?;
+                Meta::from(Context::node(
+                    new_id,
+                    n.kind
+                        .sources
+                        .iter()
+                        .filter_map(|s| remap.get(s).copied())
+                        .collect(),
+                    // distilled_from 在集内则重映射，否则原样保留（允许悬空）。
+                    n.kind
+                        .distilled_from
+                        .map(|d| new_turns.get(&d.raw()).copied().unwrap_or(d)),
+                    n.kind.model.clone(),
+                    &body,
+                ))
             }
         };
+        let node = node.with_created_at(old.created_at());
         let id = node.id();
         graph.commit(node).map_err(GraphOpError::Core)?;
         let meta = graph.meta(id).expect("just committed").header_value();

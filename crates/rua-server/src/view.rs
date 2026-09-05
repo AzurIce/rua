@@ -8,63 +8,59 @@
 //! rua-ui's `types.rs` exactly (`Node`/`Step`/`CoreMessageView`).
 //! （chain 端点只回轻量 header，不经此视图。）
 
-use rua_graph::id::NodeId;
 use rua_graph::message::{CoreMessage, CoreToolCall};
-use rua_graph::node::{AnyNode, Step, Usage};
+use rua_graph::node::{Meta, Step, Usage};
+use rua_graph::Ulid;
 use serde::Serialize;
 
 /// 详情端点的节点视图：信封 + 完整 kind 形状（`kind: {type, ...meta,
-/// ...data}`；data 的 steps 由 [`step_views`] 重放出逐字 request）。
-/// kind 内容来自 `AnyNode::kind_json`，没有第二个和类型声明。
+/// ...data}`；Turn 的 steps 由 [`turn_steps_value`] 重放出逐字 request）。
+/// 信封字段从各 kind 的 meta 边字段擦回平铺（wire 形状不变）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NodeView {
-    pub id: NodeId,
+    pub id: Ulid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<NodeId>,
+    pub parent: Option<Ulid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_refs: Vec<NodeId>,
+    pub context_refs: Vec<Ulid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_by: Option<NodeId>,
+    pub created_by: Option<Ulid>,
     pub created_at: u64,
     pub kind: serde_json::Value,
 }
 
-/// Build the wire view of a node. `init` is the turn's init anchor
-/// (`Graph::turn_init`; ignored for non-turn kinds). 调用方先经
-/// `Graph::node` 懒加载，正文必已就位；缺席时按空正文处理。
-pub fn node_view(node: &AnyNode, init: Option<Vec<CoreMessage>>) -> NodeView {
-    // Turn：重放 steps，把重建的 request 逐条塞回 wire step。
-    if let AnyNode::Turn(n) = node {
-        let steps: Vec<Step> = n
-            .data
-            .as_ref()
-            .map(|d| d.steps.clone())
-            .unwrap_or_default();
-        let mut kind = node.kind_json();
-        if let Some(obj) = kind.as_object_mut() {
-            obj.insert(
-                "steps".into(),
-                serde_json::to_value(step_views(&steps, init.unwrap_or_default()))
-                    .expect("step view serialization is infallible"),
-            );
-        }
-        return NodeView {
-            id: node.id(),
-            parent: node.parent(),
-            context_refs: node.context_refs().to_vec(),
-            created_by: node.created_by(),
-            created_at: node.created_at(),
-            kind,
-        };
-    }
+/// Build the wire view of a node. `data` 是详情端点 kind 形状里的
+/// `...data` 部分（Turn 用 [`turn_steps_value`] 造，Context 是
+/// `{"body": ...}`，Input 为 None）。
+pub fn node_view(meta: &Meta, data: Option<serde_json::Value>) -> NodeView {
+    // 边字段擦回信封平铺（wire 兼容：UI 的 Node 形状不变）。
+    let (parent, context_refs, created_by) = match meta {
+        Meta::Input(n) => (
+            n.kind.parent.map(|p| p.raw()),
+            n.kind.context_refs.iter().map(|r| r.raw()).collect(),
+            n.kind.created_by.map(|c| c.raw()),
+        ),
+        Meta::Turn(n) => (Some(n.kind.parent.raw()), Vec::new(), None),
+        // Context 的 sources 在 wire 上沿用 context_refs 槽位（展示用溯源）。
+        Meta::Context(n) => (None, n.kind.sources.clone(), None),
+    };
     NodeView {
-        id: node.id(),
-        parent: node.parent(),
-        context_refs: node.context_refs().to_vec(),
-        created_by: node.created_by(),
-        created_at: node.created_at(),
-        kind: node.kind_json(),
+        id: meta.id(),
+        parent,
+        context_refs,
+        created_by,
+        created_at: meta.created_at(),
+        kind: meta.kind_value(data.as_ref()),
     }
+}
+
+/// Turn 详情的 data 部分：`{"steps": [...]}`，每个 LlmCall step 带重放
+/// 重建的逐字 request（init 锚点 + 轮内重放；首条 System = 当时生效的
+/// 系统提示词；无锚点时从空 vec 起步）。
+pub fn turn_steps_value(steps: &[Step], init: Option<Vec<CoreMessage>>) -> serde_json::Value {
+    serde_json::json!({
+        "steps": step_views(steps, init.unwrap_or_default()),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -149,20 +145,19 @@ fn step_views(steps: &[Step], init: Vec<CoreMessage>) -> Vec<StepView> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rua_graph::node::{Outcome, Turn, TurnData};
+    use rua_graph::node::{Input, Node, Outcome, Turn};
+    use rua_graph::NodeId;
 
-    fn turn(steps: Vec<Step>) -> AnyNode {
-        AnyNode::Turn(Turn::node(
+    fn turn(parent: NodeId<Input>, steps: &[Step]) -> Meta {
+        Meta::from(Turn::node(
             NodeId::new(),
-            None,
-            vec![],
-            None,
+            parent,
             Outcome::Completed,
             "agent",
             "m",
             Usage::default(),
             vec![],
-            TurnData { steps },
+            steps,
         ))
     }
 
@@ -183,7 +178,7 @@ mod tests {
             name: "bash".into(),
             args: serde_json::json!({"command": "ls"}),
         };
-        let node = turn(vec![
+        let steps = vec![
             call("", vec![bash_call.clone()]),
             Step::ToolExec {
                 call_id: "c1".into(),
@@ -193,7 +188,9 @@ mod tests {
                 duration_ms: 3,
             },
             call("done", vec![]),
-        ]);
+        ];
+        let input: Node<Input> = Input::node(NodeId::new(), None, "hi", "human", vec![], None);
+        let meta = turn(input.id, &steps);
         let init = vec![
             CoreMessage::System {
                 content: "sys".into(),
@@ -202,20 +199,22 @@ mod tests {
                 content: "hi".into(),
             },
         ];
-        let view = node_view(&node, Some(init.clone()));
+        let view = node_view(&meta, Some(turn_steps_value(&steps, Some(init.clone()))));
         assert_eq!(view.kind["type"], "turn");
         assert_eq!(view.kind["outcome"], "completed");
-        let steps = view.kind["steps"].as_array().unwrap();
-        let r0 = &steps[0]["request"];
+        // 相继边擦回信封平铺。
+        assert_eq!(view.parent, Some(input.id.raw()));
+        let wire_steps = view.kind["steps"].as_array().unwrap();
+        let r0 = &wire_steps[0]["request"];
         assert_eq!(r0, &serde_json::to_value(&init).unwrap());
-        let r1 = &steps[2]["request"];
+        let r1 = &wire_steps[2]["request"];
         assert_eq!(r1.as_array().unwrap().len(), 4);
-        assert_eq!(steps[2]["response_text"], "done");
-        assert_eq!(steps[1]["type"], "tool_exec");
+        assert_eq!(wire_steps[2]["response_text"], "done");
+        assert_eq!(wire_steps[1]["type"], "tool_exec");
 
         // 无锚点：从空 vec 起步。
-        let view = node_view(&node, None);
-        let steps = view.kind["steps"].as_array().unwrap();
-        assert!(steps[0]["request"].as_array().unwrap().is_empty());
+        let view = node_view(&meta, Some(turn_steps_value(&steps, None)));
+        let wire_steps = view.kind["steps"].as_array().unwrap();
+        assert!(wire_steps[0]["request"].as_array().unwrap().is_empty());
     }
 }

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// Tool call issued by the assistant inside a turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,10 +32,11 @@ pub enum CoreMessage {
         name: String,
         output: String,
     },
-    /// Distilled material injected via a context node's `context_refs`.
+    /// Distilled material injected via an input node's `context_refs`.
     /// Rendered by the engine as a user-role message with provenance header.
+    /// sources 是异构溯源（裸 Ulid）。
     Context {
         body: String,
-        sources: Vec<crate::id::NodeId>,
+        sources: Vec<Ulid>,
     },
 }

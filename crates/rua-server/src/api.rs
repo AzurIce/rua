@@ -9,8 +9,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rua_graph::cursor::Cursor;
 use rua_graph::id::{CursorId, NodeId};
-use rua_graph::node::{AnyNode, Context, Input, Step};
-use rua_graph::Error as CoreError;
+use rua_graph::node::{Context, ContextData, Input, Meta, Step};
+use rua_graph::{Error as CoreError, Ulid};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -20,7 +20,7 @@ use rua_engine::TurnParams;
 use crate::events::ServerEvent;
 use crate::state::SharedState;
 use crate::turn::spawn_turn;
-use crate::view::{node_view, NodeView};
+use crate::view::{node_view, turn_steps_value, NodeView};
 
 pub fn api_router(state: SharedState) -> Router {
     Router::new()
@@ -83,9 +83,10 @@ impl From<CoreError> for ApiError {
             | CoreError::CursorIdle(_)
             | CoreError::NodeAlreadyCommitted(_) => StatusCode::CONFLICT,
             CoreError::CursorOnContextNode(_)
-            | CoreError::ContextNodeHasParent(_)
             | CoreError::ContextRefNotContextNode(_)
             | CoreError::ContextRefNotCommitted(_)
+            | CoreError::WrongKind { .. }
+            | CoreError::ParentKindMismatch { .. }
             | CoreError::ParentNotCommitted(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -93,7 +94,7 @@ impl From<CoreError> for ApiError {
     }
 }
 
-fn parse_node_id(raw: &str) -> Result<NodeId, ApiError> {
+fn parse_node_id(raw: &str) -> Result<Ulid, ApiError> {
     raw.parse()
         .map_err(|_| ApiError::bad_request(format!("invalid node id: {raw:?}")))
 }
@@ -122,10 +123,22 @@ async fn get_node(
     Path(id): Path<String>,
 ) -> Result<Json<NodeView>, ApiError> {
     let id = parse_node_id(&id)?;
-    let mut graph = state.graph.lock().await;
-    let init = graph.turn_init(id)?;
-    let node = graph.node(id)?.clone();
-    Ok(Json(node_view(&node, init)))
+    let graph = state.graph.lock().await;
+    let meta = graph.meta(id).cloned().ok_or(CoreError::NodeNotFound(id))?;
+    let view = match &meta {
+        Meta::Input(_) => node_view(&meta, None),
+        Meta::Turn(n) => {
+            let steps = graph.data().entry(n.id)?.cloned()?.steps;
+            let init = graph.turn_init(id)?;
+            node_view(&meta, Some(turn_steps_value(&steps, init)))
+        }
+        Meta::Context(n) => {
+            let data = graph.data().entry(n.id)?.cloned()?;
+            let data = serde_json::to_value(&data).expect("context data serialization is infallible");
+            node_view(&meta, Some(data))
+        }
+    };
+    Ok(Json(view))
 }
 
 // ---- cursors ----
@@ -172,7 +185,7 @@ async fn get_chain(
     let ids = graph.chain_to_root(tip)?;
     let headers = ids
         .into_iter()
-        .filter_map(|id| graph.meta(id).map(AnyNode::header_value))
+        .filter_map(|id| graph.meta(id).map(Meta::header_value))
         .collect();
     Ok(Json(headers))
 }
@@ -199,12 +212,12 @@ async fn get_context_preview(
             .map(str::to_string)
             .collect()
     });
-    let mut graph = state.graph.lock().await;
+    let graph = state.graph.lock().await;
     // 无 tip（detached 指针）= 空链；draft 会话 UI 侧不调用本端点。
     let messages = match graph.cursors.get(cursor_id)?.node {
         Some(tip) => {
             let (chain, materials) = graph.load_chain(tip)?;
-            rua_engine::assemble(&chain, &materials)?
+            rua_engine::assemble(&chain, &materials, graph.data())?
         }
         None => Vec::new(),
     };
@@ -248,9 +261,12 @@ async fn post_input(
     // wire 层的 None（UI 全勾）就地展开为显式列表再落图：图数据里 tools
     // 就是 Vec，没有 None。用户发送恒 depth=0 且 spawner 在位。
     let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
+    // cursor tip 相继边：受检类型恢复（tip 不是 Turn 时 400）。tip 为 Input
+    // 的窗口期 turn 必在飞，已被上面的 in_flight 检查挡住，这里只是防线。
+    let parent = cursor.node.map(|tip| graph.expect_turn(tip)).transpose()?;
     let input = Input::node(
         NodeId::new(),
-        cursor.node,
+        parent,
         body.text,
         cursor.actor.clone(),
         tools.clone(),
@@ -258,18 +274,22 @@ async fn post_input(
     );
     let input_id = input.id;
     graph.commit(input)?;
-    let input_meta = graph.meta(input_id).expect("just committed").header_value();
+    let input_meta = graph.meta(input_id.raw()).expect("just committed").header_value();
     state.broadcast(ServerEvent::NodeCommitted {
         meta: input_meta.clone(),
     });
-    graph.move_cursor(cursor_id, input_id)?;
-    state.broadcast(ServerEvent::CursorMoved {
-        cursor_id,
-        node: Some(input_id),
-    });
-    let handle = graph.begin_turn(cursor_id)?;
-    let (chain, materials) = graph.load_chain(input_id)?;
-    let history = rua_engine::assemble(&chain, &materials)?;
+    let turn = {
+        let mut cur = graph.cursor_mut(cursor_id)?;
+        cur.move_to(input_id.raw())?;
+        state.broadcast(ServerEvent::CursorMoved {
+            cursor_id,
+            node: Some(input_id.raw()),
+        });
+        cur.open_turn()?
+    };
+    let turn_node_id = turn.handle.node_id;
+    let (chain, materials) = graph.load_chain(input_id.raw())?;
+    let history = rua_engine::assemble(&chain, &materials, graph.data())?;
     let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
 
@@ -279,9 +299,8 @@ async fn post_input(
         &state,
         TurnParams {
             cursor_id,
-            node_id: handle.node_id,
-            parent: Some(input_id),
-            context_refs: vec![],
+            node_id: turn_node_id,
+            parent: input_id,
             actor: cursor.actor,
             model,
             history,
@@ -292,11 +311,12 @@ async fn post_input(
             sink: None,
         },
         cancel,
+        turn,
     );
 
     Ok(Json(json!({
         "input_node": input_meta,
-        "turn_node_id": handle.node_id,
+        "turn_node_id": turn_node_id,
     })))
 }
 
@@ -306,7 +326,7 @@ struct RootInputBody {
     /// Attach point for the new session's first input: must be a turn node.
     /// `None` = the input becomes a fresh root (detached conversation tree).
     #[serde(default)]
-    parent: Option<NodeId>,
+    parent: Option<Ulid>,
     #[serde(default = "default_actor")]
     actor: String,
     /// 本次发送的模型覆盖（None = daemon 默认模型）。
@@ -329,17 +349,9 @@ async fn post_root_input(
     Json(body): Json<RootInputBody>,
 ) -> Result<Json<Value>, ApiError> {
     let mut graph = state.graph.lock().await;
-    if let Some(parent) = body.parent {
-        match graph.meta(parent) {
-            None => return Err(CoreError::NodeNotFound(parent).into()),
-            Some(meta) if !meta.is_turn() => {
-                return Err(ApiError::bad_request(
-                    "attach point must be a turn node",
-                ));
-            }
-            _ => {}
-        }
-    }
+    // attach 点必须是已提交的 turn 节点（受检类型恢复；未知 → 404，
+    // 非 turn → 400）。
+    let parent = body.parent.map(|p| graph.expect_turn(p)).transpose()?;
 
     let cursor = graph.create_cursor(body.actor, vec![]);
     let actor = cursor.actor.clone();
@@ -348,21 +360,32 @@ async fn post_root_input(
     });
     // wire 层的 None（UI 全勾）就地展开为显式列表再落图（同 post_input）。
     let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
-    let input = Input::node(NodeId::new(), body.parent, body.text, actor.clone(), tools.clone(), None);
+    let input = Input::node(
+        NodeId::new(),
+        parent,
+        body.text,
+        actor.clone(),
+        tools.clone(),
+        None,
+    );
     let input_id = input.id;
     graph.commit(input)?;
-    let input_meta = graph.meta(input_id).expect("just committed").header_value();
+    let input_meta = graph.meta(input_id.raw()).expect("just committed").header_value();
     state.broadcast(ServerEvent::NodeCommitted {
         meta: input_meta.clone(),
     });
-    graph.move_cursor(cursor.id, input_id)?;
-    state.broadcast(ServerEvent::CursorMoved {
-        cursor_id: cursor.id,
-        node: Some(input_id),
-    });
-    let handle = graph.begin_turn(cursor.id)?;
-    let (chain, materials) = graph.load_chain(input_id)?;
-    let history = rua_engine::assemble(&chain, &materials)?;
+    let turn = {
+        let mut cur = graph.cursor_mut(cursor.id)?;
+        cur.move_to(input_id.raw())?;
+        state.broadcast(ServerEvent::CursorMoved {
+            cursor_id: cursor.id,
+            node: Some(input_id.raw()),
+        });
+        cur.open_turn()?
+    };
+    let turn_node_id = turn.handle.node_id;
+    let (chain, materials) = graph.load_chain(input_id.raw())?;
+    let history = rua_engine::assemble(&chain, &materials, graph.data())?;
     let cursor_id = cursor.id;
     let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
@@ -373,9 +396,8 @@ async fn post_root_input(
         &state,
         TurnParams {
             cursor_id,
-            node_id: handle.node_id,
-            parent: Some(input_id),
-            context_refs: vec![],
+            node_id: turn_node_id,
+            parent: input_id,
             actor,
             model,
             history,
@@ -386,18 +408,19 @@ async fn post_root_input(
             sink: None,
         },
         cancel,
+        turn,
     );
 
     Ok(Json(json!({
         "cursor": cursor,
         "input_node": input_meta,
-        "turn_node_id": handle.node_id,
+        "turn_node_id": turn_node_id,
     })))
 }
 
 #[derive(Deserialize)]
 struct MoveBody {
-    node_id: NodeId,
+    node_id: Ulid,
 }
 
 async fn post_move(
@@ -423,7 +446,7 @@ async fn post_move(
         }
         _ => {}
     }
-    graph.move_cursor(cursor_id, body.node_id)?;
+    graph.cursor_mut(cursor_id)?.move_to(body.node_id)?;
     let cursor = graph.cursors.get(cursor_id)?.clone();
     state.broadcast(ServerEvent::CursorMoved {
         cursor_id,
@@ -444,7 +467,7 @@ async fn post_detach(
     if graph.cursors.in_flight(cursor_id).is_some() {
         return Err(CoreError::CursorBusy(cursor_id).into());
     }
-    graph.detach_cursor(cursor_id)?;
+    graph.cursor_mut(cursor_id)?.detach()?;
     let cursor = graph.cursors.get(cursor_id)?.clone();
     state.broadcast(ServerEvent::CursorMoved {
         cursor_id,
@@ -476,43 +499,40 @@ async fn post_cancel(
 
 #[derive(Deserialize)]
 struct SummarizeBody {
-    sources: Vec<NodeId>,
+    sources: Vec<Ulid>,
 }
 
-/// Project a node to plain text as distillation material.
-fn project_node(node: &AnyNode) -> String {
-    match node {
-        AnyNode::Input(n) => format!("[input by {}]\n{}", n.kind.actor, n.kind.text),
-        AnyNode::Context(n) => n
-            .data
-            .as_ref()
-            .map(|d| d.body.clone())
-            .unwrap_or_default(),
-        AnyNode::Turn(n) => {
+/// Project a node to plain text as distillation material（正文走数据面）。
+fn project_node(graph: &rua_graph::Graph, id: Ulid) -> Result<String, ApiError> {
+    let meta = graph.meta(id).ok_or(CoreError::NodeNotFound(id))?;
+    let out = match meta {
+        Meta::Input(n) => format!("[input by {}]\n{}", n.kind.actor, n.kind.text),
+        Meta::Context(n) => graph.data().entry(n.id)?.cloned()?.body,
+        Meta::Turn(n) => {
+            let data = graph.data().entry(n.id)?.cloned()?;
             let mut out = format!("[turn by {}]", n.kind.actor);
-            if let Some(data) = &n.data {
-                for step in &data.steps {
-                    match step {
-                        Step::LlmCall { response_text, .. } if !response_text.is_empty() => {
-                            out.push('\n');
-                            out.push_str(response_text);
-                        }
-                        Step::ToolExec {
-                            name,
-                            args,
-                            output,
-                            ..
-                        } => {
-                            let preview: String = output.chars().take(200).collect();
-                            out.push_str(&format!("\n[tool {name}] args={args}\n{preview}"));
-                        }
-                        _ => {}
+            for step in &data.steps {
+                match step {
+                    Step::LlmCall { response_text, .. } if !response_text.is_empty() => {
+                        out.push('\n');
+                        out.push_str(response_text);
                     }
+                    Step::ToolExec {
+                        name,
+                        args,
+                        output,
+                        ..
+                    } => {
+                        let preview: String = output.chars().take(200).collect();
+                        out.push_str(&format!("\n[tool {name}] args={args}\n{preview}"));
+                    }
+                    _ => {}
                 }
             }
             out
         }
-    }
+    };
+    Ok(out)
 }
 
 async fn post_summarize(
@@ -524,10 +544,10 @@ async fn post_summarize(
     }
 
     let material = {
-        let mut graph = state.graph.lock().await;
+        let graph = state.graph.lock().await;
         let mut parts = Vec::with_capacity(body.sources.len());
         for id in &body.sources {
-            parts.push(project_node(graph.node(*id)?));
+            parts.push(project_node(&graph, *id)?);
         }
         parts.join("\n\n---\n\n")
     };
@@ -538,17 +558,22 @@ async fn post_summarize(
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("summarize failed: {e}")))?;
 
-    let node = Context::node(
-        NodeId::new(),
-        summary,
-        body.sources.clone(),
-        body.sources[0],
-        state.default_model.clone(),
-    );
-    let node_id = node.id;
     let mut graph = state.graph.lock().await;
+    let node_id: NodeId<Context> = graph.data().allocate();
+    graph
+        .data()
+        .create(node_id, ContextData { body: summary.clone() })?;
+    // /api/summarize 是端点动作、没有产生者轮——distilled_from 记 None
+    // （没有就是没有，不说谎）；来源全部落在 sources。
+    let node = Context::node(
+        node_id,
+        body.sources.clone(),
+        None,
+        state.default_model.clone(),
+        &summary,
+    );
     graph.commit(node)?;
-    let meta = graph.meta(node_id).expect("just committed").header_value();
+    let meta = graph.meta(node_id.raw()).expect("just committed").header_value();
     drop(graph);
     state.broadcast(ServerEvent::NodeCommitted { meta: meta.clone() });
     Ok(Json(meta))
@@ -716,7 +741,7 @@ struct CloneBody {
     /// 源图名（从哪张图复制）。
     from_graph: String,
     /// 框选选中的节点 id。
-    nodes: Vec<NodeId>,
+    nodes: Vec<Ulid>,
 }
 
 /// 跨图克隆子树：把 from_graph 里选中的节点（含后继子树与引用的材料）

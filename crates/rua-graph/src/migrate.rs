@@ -10,29 +10,33 @@
 //! Runs at `Graph::open` when a non-empty `nodes/` directory exists. The old
 //! `nodes/` and the old journal are moved into `.trash/migration-<millis>/`
 //! before the new journal is written.
+//!
+//! 注意：legacy Turn 若缺 parent（旧模型里理论上的"根 Turn"）无法进入
+//! 严格交替的新链——迁移 loud 失败，不静默丢数据。
 
 use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use ulid::Ulid;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::NodeId;
 use crate::message::{CoreMessage, CoreToolCall};
-use crate::node::{AnyNode, Context, Input, Outcome, Step, Turn, TurnData, TurnLine, Usage};
+use crate::node::{Context, ContextData, Data, Input, Meta, Outcome, Step, Turn, TurnData, TurnLine, Usage};
 use crate::store::Store;
 
 // ---- legacy serde types (mirror the old format; never written) ----
 
 #[derive(Debug, Deserialize)]
 struct LegacyNode {
-    id: NodeId,
+    id: Ulid,
     #[serde(default)]
-    parent: Option<NodeId>,
+    parent: Option<Ulid>,
     #[serde(default)]
-    context_refs: Vec<NodeId>,
+    context_refs: Vec<Ulid>,
     #[serde(default)]
-    created_by: Option<NodeId>,
+    created_by: Option<Ulid>,
     created_at: u64,
     kind: LegacyNodeKind,
 }
@@ -58,7 +62,7 @@ enum LegacyNodeKind {
     },
     Context {
         body: String,
-        created_by: NodeId,
+        created_by: Ulid,
         model: String,
     },
 }
@@ -104,7 +108,7 @@ pub(crate) fn migrate_legacy_nodes(store: &Store) -> Result<bool> {
 
     // 1. Read every legacy node; convert to the current model and write the
     //    new body files.
-    let mut converted: Vec<AnyNode> = Vec::with_capacity(files.len());
+    let mut converted: Vec<Meta> = Vec::with_capacity(files.len());
     for path in &files {
         let bytes = fs::read(path)?;
         let legacy: LegacyNode = serde_json::from_slice(&bytes)?;
@@ -139,7 +143,7 @@ pub(crate) fn migrate_legacy_nodes(store: &Store) -> Result<bool> {
             let replaced = if v["event"] == "node_committed" {
                 v["meta"]["id"]
                     .as_str()
-                    .and_then(|s| s.parse::<NodeId>().ok())
+                    .and_then(|s| s.parse::<Ulid>().ok())
                     .and_then(|id| converted.iter().find(|n| n.id() == id))
                     .map(|node| {
                         serde_json::json!({
@@ -168,16 +172,16 @@ pub(crate) fn migrate_legacy_nodes(store: &Store) -> Result<bool> {
 }
 
 /// Convert one legacy node to the current model, writing its new body file.
-fn convert(legacy: LegacyNode, store: &Store) -> Result<AnyNode> {
-    let node = match legacy.kind {
+fn convert(legacy: LegacyNode, store: &Store) -> Result<Meta> {
+    let meta = match legacy.kind {
         LegacyNodeKind::Input { text, actor, tools } => {
-            AnyNode::Input(Input::node(
-                legacy.id,
-                legacy.parent,
+            Meta::from(Input::node(
+                NodeId::from_raw(legacy.id),
+                legacy.parent.map(NodeId::from_raw),
                 text,
                 actor,
                 tools,
-                legacy.created_by,
+                legacy.created_by.map(NodeId::from_raw),
             ))
         }
         LegacyNodeKind::Turn {
@@ -188,64 +192,63 @@ fn convert(legacy: LegacyNode, store: &Store) -> Result<AnyNode> {
             usage,
             tools,
         } => {
+            // 严格交替的新链不接受 parentless Turn：loud 失败，不静默丢数据。
+            let parent = legacy.parent.ok_or_else(|| {
+                Error::MigrationFailed(format!("legacy turn {} has no parent", legacy.id))
+            })?;
             // init 锚点：首个 LlmCall 的 request（该轮系统提示 + 初始历史）。
+            let path = TurnData::path(store.root(), legacy.id);
             let init = steps.iter().find_map(|s| match s {
                 LegacyStep::LlmCall { request, .. } => Some(request.clone()),
                 _ => None,
             });
             if let Some(request) = init {
-                store.append_turn_line(legacy.id, &TurnLine::Init { request })?;
+                crate::node::turn::append_line(&path, &TurnLine::Init { request })?;
             }
             let mut new_steps = Vec::with_capacity(steps.len());
             for step in steps {
-                let (line, new_step) = match step {
+                let new_step = match step {
                     LegacyStep::LlmCall {
                         response_text,
                         tool_calls,
                         reasoning,
                         usage,
                         ..
-                    } => {
-                        let step = Step::LlmCall {
-                            response_text,
-                            tool_calls,
-                            reasoning,
-                            usage,
-                            provider_data: None,
-                        };
-                        (TurnLine::from(step.clone()), step)
-                    }
+                    } => Step::LlmCall {
+                        response_text,
+                        tool_calls,
+                        reasoning,
+                        usage,
+                        provider_data: None,
+                    },
                     LegacyStep::ToolExec {
                         call_id,
                         name,
                         args,
                         output,
                         duration_ms,
-                    } => {
-                        let step = Step::ToolExec {
-                            call_id,
-                            name,
-                            args,
-                            output,
-                            duration_ms,
-                        };
-                        (TurnLine::from(step.clone()), step)
-                    }
+                    } => Step::ToolExec {
+                        call_id,
+                        name,
+                        args,
+                        output,
+                        duration_ms,
+                    },
                 };
-                store.append_turn_line(legacy.id, &line)?;
+                crate::node::turn::append_line(&path, &TurnLine::from(new_step.clone()))?;
                 new_steps.push(new_step);
             }
-            AnyNode::Turn(Turn::node(
-                legacy.id,
-                legacy.parent,
-                legacy.context_refs,
-                legacy.created_by,
+            // legacy Turn 信封上的 context_refs / created_by 在新模型里没有
+            // 对应字段（Turn 只有相继边），随迁移丢弃。
+            Meta::from(Turn::node(
+                NodeId::from_raw(legacy.id),
+                NodeId::from_raw(parent),
                 outcome,
                 actor,
                 model,
                 usage,
                 tools,
-                TurnData { steps: new_steps },
+                &new_steps,
             ))
         }
         LegacyNodeKind::Context {
@@ -253,15 +256,16 @@ fn convert(legacy: LegacyNode, store: &Store) -> Result<AnyNode> {
             created_by,
             model,
         } => {
-            store.write_context(legacy.id, &body)?;
-            AnyNode::Context(Context::node(
-                legacy.id,
-                body,
+            let id: NodeId<Context> = NodeId::from_raw(legacy.id);
+            ContextData { body: body.clone() }.save(&ContextData::path(store.root(), id.raw()))?;
+            Meta::from(Context::node(
+                id,
                 legacy.context_refs,
-                created_by,
+                Some(NodeId::from_raw(created_by)),
                 model,
+                &body,
             ))
         }
     };
-    Ok(node.with_created_at(legacy.created_at))
+    Ok(meta.with_created_at(legacy.created_at))
 }

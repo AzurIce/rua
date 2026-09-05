@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use rua_graph::graph::Graph;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::message::CoreMessage;
-use rua_graph::node::{Node, Outcome, Step, Turn, TurnData, TurnLine, Usage};
-use rua_graph::graph::Graph;
-use rua_graph::TurnEvent;
+use rua_graph::node::{Node, Outcome, Step, Turn, TurnLine, Usage};
+use rua_graph::{TurnEvent, Ulid};
 use rua_engine::TurnParams;
 use rua_server::engine::AgentEngine;
 use rua_server::state::AppState;
@@ -41,11 +41,11 @@ impl AgentEngine for MockEngine {
         Box::pin(async move {
             let _ = events.send(TurnEvent::Started {
                 cursor_id: params.cursor_id,
-                node_id: params.node_id,
+                node_id: params.node_id.raw(),
             });
             let _ = events.send(TurnEvent::TextDelta {
                 cursor_id: params.cursor_id,
-                node_id: params.node_id,
+                node_id: params.node_id.raw(),
                 delta: "working".into(),
             });
             if self.park {
@@ -60,8 +60,8 @@ impl AgentEngine for MockEngine {
                 Outcome::Completed
             };
             // 一个空响应的 LlmCall step：经 sink 走增量落盘（Init 锚点 +
-            // 行），同时留在返回节点的 steps 里。空响应不进装配投影，不
-            // 影响链/preview 测试。
+            // 行，进数据面条目）；header 的派生字段由 steps 切片推导。空响应
+            // 不进装配投影，不影响链/preview 测试。
             let step = Step::LlmCall {
                 response_text: String::new(),
                 tool_calls: vec![],
@@ -79,20 +79,19 @@ impl AgentEngine for MockEngine {
                             content: "hi".into(),
                         },
                     ],
-                });
-                sink(TurnLine::from(step.clone()));
+                })
+                .unwrap();
+                sink(TurnLine::from(step.clone())).unwrap();
             }
             Ok(Turn::node(
                 params.node_id,
                 params.parent,
-                params.context_refs,
-                None,
                 outcome,
                 params.actor,
                 params.model,
                 Usage::default(),
                 params.tools.clone().unwrap_or_default(),
-                TurnData { steps: vec![step] },
+                &[step],
             ))
         })
     }
@@ -301,7 +300,7 @@ async fn cursor_input_chain_move_graph() {
     assert_eq!(resp.status(), 400);
     let resp = server
         .client
-        .get(format!("{}/api/nodes/{}", server.base, NodeId::new()))
+        .get(format!("{}/api/nodes/{}", server.base, Ulid::new()))
         .send()
         .await
         .unwrap();
@@ -513,7 +512,7 @@ async fn root_input_creates_session_lazily() {
     let resp = server
         .client
         .post(format!("{}/api/inputs", server.base))
-        .json(&json!({"text": "x", "parent": NodeId::new().to_string()}))
+        .json(&json!({"text": "x", "parent": Ulid::new().to_string()}))
         .send()
         .await
         .unwrap();
@@ -577,15 +576,15 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
         .spawn_turn(None, "child task".to_string(), "agent:test".to_string(), creator, 1, all_tools.clone())
         .await
         .unwrap();
-    let input_id: NodeId = spawned.input_node_id.parse().unwrap();
-    let turn_id: NodeId = spawned.turn_node_id.parse().unwrap();
+    let input_id: Ulid = spawned.input_node_id.parse().unwrap();
+    let turn_id: Ulid = spawned.turn_node_id.parse().unwrap();
 
     // 溯源盖章：spawn 出的根 input 的 created_by 指向发起它的 turn；
     // 继承的工具集落在 input 节点上。
     {
         let graph = state.graph.lock().await;
         let meta = graph.meta(input_id).unwrap();
-        assert_eq!(meta.created_by(), Some(creator));
+        assert_eq!(meta.input().unwrap().kind.created_by, Some(creator));
         assert_eq!(meta.input().unwrap().kind.tools, all_tools);
     }
 
@@ -614,7 +613,7 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
 
     // 未知节点 + 短等待 → running。
     let running = spawner
-        .inspect(NodeId::new(), Some(Duration::from_millis(200)))
+        .inspect(Ulid::new(), Some(Duration::from_millis(200)))
         .await
         .unwrap();
     assert!(matches!(running, rua_engine::InspectOutcome::Running));
@@ -631,7 +630,7 @@ async fn server_spawner_creates_session_and_inspect_reads_it() {
         .spawn_turn(Some(turn_id), "grandchild".to_string(), "agent:test".to_string(), NodeId::new(), 2, vec!["bash".to_string()])
         .await
         .unwrap();
-    let forked_turn: NodeId = forked.turn_node_id.parse().unwrap();
+    let forked_turn: Ulid = forked.turn_node_id.parse().unwrap();
     let result = spawner
         .inspect(forked_turn, Some(Duration::from_secs(10)))
         .await

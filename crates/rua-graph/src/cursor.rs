@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::id::{CursorId, NodeId};
+use crate::node::Turn;
 
 /// A session: a movable pointer onto the graph, bound to an actor.
 /// "Fork is free" — cursors are cheap, nodes are immutable and shared.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cursor {
     pub id: CursorId,
-    /// The tip this session is attached to. `None` = empty conversation;
-    /// the next input becomes a root node.
-    pub node: Option<NodeId>,
+    /// The tip this session is attached to (Input/Turn 均可，裸 Ulid 领土).
+    /// `None` = empty conversation; the next input becomes a root node.
+    pub node: Option<Ulid>,
     pub actor: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
@@ -20,11 +22,12 @@ pub struct Cursor {
 }
 
 /// An in-flight turn handle. The node id is pre-allocated at turn start so
-/// UIs can reference the landing spot before the turn commits.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// UIs can reference the landing spot before the turn commits. 落点必然是
+/// Turn：id 带类型。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TurnHandle {
     pub cursor_id: CursorId,
-    pub node_id: NodeId,
+    pub node_id: NodeId<Turn>,
     pub started_at: u64,
 }
 
@@ -66,7 +69,7 @@ impl CursorRegistry {
 
     /// Move the cursor's tip. Landing-point validity (structural nodes only,
     /// node must exist) is checked by the caller against the graph.
-    pub fn move_to(&mut self, id: CursorId, node: NodeId) -> Result<()> {
+    pub fn move_to(&mut self, id: CursorId, node: Ulid) -> Result<()> {
         let cursor = self.cursors.get_mut(&id).ok_or(Error::CursorNotFound(id))?;
         cursor.node = Some(node);
         Ok(())
@@ -80,8 +83,8 @@ impl CursorRegistry {
         Ok(())
     }
 
-    /// Begin an in-flight turn; returns the pre-allocated node id.
-    pub fn begin_turn(&mut self, cursor_id: CursorId, node_id: NodeId) -> Result<TurnHandle> {
+    /// Begin an in-flight turn; returns the pre-allocated typed node id.
+    pub fn begin_turn(&mut self, cursor_id: CursorId, node_id: NodeId<Turn>) -> Result<TurnHandle> {
         if !self.cursors.contains_key(&cursor_id) {
             return Err(Error::CursorNotFound(cursor_id));
         }
@@ -93,7 +96,7 @@ impl CursorRegistry {
             node_id,
             started_at: crate::node::now_millis(),
         };
-        self.in_flight.insert(cursor_id, handle.clone());
+        self.in_flight.insert(cursor_id, handle);
         Ok(handle)
     }
 

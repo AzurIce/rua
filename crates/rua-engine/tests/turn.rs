@@ -4,10 +4,11 @@
 use std::sync::{Arc, Mutex};
 
 use rua_engine::config::ProviderConfig;
+use rua_graph::Ulid;
 use rua_graph::events::TurnEvent;
 use rua_graph::id::{CursorId, NodeId};
 use rua_graph::message::CoreMessage;
-use rua_graph::node::{Outcome, Step, TurnLine};
+use rua_graph::node::{Outcome, Step, Turn, TurnLine};
 use rua_engine::{Engine, TurnParams};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -104,8 +105,9 @@ fn params(history: Vec<CoreMessage>) -> TurnParams {
     TurnParams {
         cursor_id: CursorId::new(),
         node_id: NodeId::new(),
-        parent: None,
-        context_refs: vec![],
+        // engine 不校验 parent 的存在性（那是 Graph::commit 的职责），
+        // 测试里铸一个占位即可。
+        parent: NodeId::new(),
         actor: "human".to_string(),
         model: "deepseek-v4-pro".to_string(),
         history,
@@ -117,13 +119,29 @@ fn params(history: Vec<CoreMessage>) -> TurnParams {
 }
 
 /// 收集型 sink：把 run_turn 期间发出的所有 TurnLine 收进共享 vec。
-fn collecting_sink() -> (Arc<Mutex<Vec<TurnLine>>>, Box<dyn FnMut(TurnLine) + Send>) {
+fn collecting_sink() -> (
+    Arc<Mutex<Vec<TurnLine>>>,
+    Box<dyn FnMut(TurnLine) -> Result<(), String> + Send>,
+) {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let into = lines.clone();
     (
         lines,
-        Box::new(move |line: TurnLine| into.lock().unwrap().push(line)),
+        Box::new(move |line: TurnLine| {
+            into.lock().unwrap().push(line);
+            Ok(())
+        }),
     )
+}
+
+/// sink 行流 → steps（`Init` 锚点不是 step）。engine 返回的节点是
+/// header-only（正文在数据面），测试经 sink 行流观察 steps。
+fn steps_of(lines: &[TurnLine]) -> Vec<Step> {
+    lines
+        .iter()
+        .cloned()
+        .filter_map(TurnLine::into_step)
+        .collect()
 }
 
 /// 从 sink 行流重放每次 LLM 调用的 request：Init 锚点起步，LlmCall 输出
@@ -210,7 +228,8 @@ async fn plain_text_turn_completes() {
     p.sink = Some(sink);
     let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
-    let steps = &node.data.as_ref().unwrap().steps;
+    let lines = lines.lock().unwrap();
+    let steps = steps_of(&lines);
     assert_eq!(node.kind.outcome, Outcome::Completed);
     assert_eq!(node.kind.actor, "human");
     assert_eq!(node.kind.model, "deepseek-v4-pro");
@@ -236,7 +255,6 @@ async fn plain_text_turn_completes() {
     assert_eq!(node.kind.usage.input_tokens, 10);
 
     // Sink: Init 锚点（系统提示 + 初始 user 消息）+ 一条 LlmCall 行。
-    let lines = lines.lock().unwrap();
     assert_eq!(lines.len(), 2);
     let TurnLine::Init { request } = &lines[0] else {
         panic!("expected init anchor");
@@ -307,8 +325,8 @@ async fn tool_call_turn_executes_bash_and_feeds_back_result() {
         .await
         .unwrap();
 
-    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
-    assert_eq!(*outcome, Outcome::Completed);
+    let (steps, outcome) = (steps_of(&lines.lock().unwrap()), node.kind.outcome);
+    assert_eq!(outcome, Outcome::Completed);
     assert_eq!(steps.len(), 3, "llm call + tool exec + llm call");
 
     let Step::LlmCall { tool_calls, .. } = &steps[0] else {
@@ -396,19 +414,15 @@ async fn cancelled_turn_yields_cancelled_node_with_steps_preserved() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = engine
-        .run_turn(
-            params(vec![CoreMessage::User {
-                content: "hi".to_string(),
-            }]),
-            tx,
-            cancel,
-        )
-        .await
-        .unwrap();
+    let (lines, sink) = collecting_sink();
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.sink = Some(sink);
+    let node = engine.run_turn(p, tx, cancel).await.unwrap();
 
-    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
-    assert_eq!(*outcome, Outcome::Cancelled);
+    let (steps, outcome) = (steps_of(&lines.lock().unwrap()), node.kind.outcome);
+    assert_eq!(outcome, Outcome::Cancelled);
     // The in-flight LLM call is still recorded (empty response).
     assert_eq!(steps.len(), 1);
     assert!(matches!(&steps[0], Step::LlmCall { response_text, .. } if response_text.is_empty()));
@@ -425,19 +439,15 @@ async fn provider_error_yields_failed_node() {
 
     let engine = engine_for(&server);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = engine
-        .run_turn(
-            params(vec![CoreMessage::User {
-                content: "hi".to_string(),
-            }]),
-            tx,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let (lines, sink) = collecting_sink();
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.sink = Some(sink);
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
-    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
-    assert_eq!(*outcome, Outcome::Failed);
+    let (steps, outcome) = (steps_of(&lines.lock().unwrap()), node.kind.outcome);
+    assert_eq!(outcome, Outcome::Failed);
     assert_eq!(steps.len(), 1);
 }
 
@@ -456,17 +466,17 @@ async fn empty_history_is_a_parameter_error() {
 
 #[derive(Default)]
 struct MockSpawner {
-    spawned: std::sync::Mutex<Vec<(Option<NodeId>, String, usize, Vec<String>)>>,
-    inspected: std::sync::Mutex<Vec<NodeId>>,
+    spawned: std::sync::Mutex<Vec<(Option<Ulid>, String, usize, Vec<String>)>>,
+    inspected: std::sync::Mutex<Vec<Ulid>>,
 }
 
 impl rua_engine::TurnSpawner for MockSpawner {
     fn spawn_turn(
         &self,
-        parent: Option<NodeId>,
+        parent: Option<Ulid>,
         text: String,
         _actor: String,
-        _created_by: NodeId,
+        _created_by: NodeId<Turn>,
         depth: usize,
         tools: Vec<String>,
     ) -> std::pin::Pin<
@@ -479,15 +489,15 @@ impl rua_engine::TurnSpawner for MockSpawner {
         Box::pin(async move {
             Ok(rua_engine::SpawnedTurn {
                 cursor_id: "cur-child".to_string(),
-                input_node_id: NodeId::new().to_string(),
-                turn_node_id: NodeId::new().to_string(),
+                input_node_id: Ulid::new().to_string(),
+                turn_node_id: Ulid::new().to_string(),
             })
         })
     }
 
     fn inspect(
         &self,
-        node: NodeId,
+        node: Ulid,
         _wait: Option<std::time::Duration>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<rua_engine::InspectOutcome, String>> + Send>,
@@ -547,28 +557,24 @@ async fn spawn_turn_then_inspect_roundtrip() {
     engine.set_spawner(spawner.clone());
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = engine
-        .run_turn(
-            params(vec![CoreMessage::User {
-                content: "delegate".to_string(),
-            }]),
-            tx,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let (lines, sink) = collecting_sink();
+    let mut p = params(vec![CoreMessage::User {
+        content: "delegate".to_string(),
+    }]);
+    p.sink = Some(sink);
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
     let (steps, outcome, tools) = (
-        &node.data.as_ref().unwrap().steps,
-        &node.kind.outcome,
-        &node.kind.tools,
+        steps_of(&lines.lock().unwrap()),
+        node.kind.outcome,
+        node.kind.tools.clone(),
     );
-    assert_eq!(*outcome, Outcome::Completed);
+    assert_eq!(outcome, Outcome::Completed);
     assert_eq!(steps.len(), 5, "llm + spawn + llm + inspect + llm");
     // Turn 节点记录该轮有效工具集（spawner 在位、depth 0 → 全量）。
     assert_eq!(
         tools,
-        &vec![
+        vec![
             "bash".to_string(),
             "spawn_turn".to_string(),
             "inspect".to_string()
@@ -725,11 +731,13 @@ async fn disabled_tool_call_is_soft_rejected() {
         content: "delegate".to_string(),
     }]);
     p.tools = Some(vec!["bash".to_string()]);
+    let (lines, sink) = collecting_sink();
+    p.sink = Some(sink);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
 
-    let (steps, outcome) = (&node.data.as_ref().unwrap().steps, &node.kind.outcome);
-    assert_eq!(*outcome, Outcome::Completed);
+    let (steps, outcome) = (steps_of(&lines.lock().unwrap()), node.kind.outcome);
+    assert_eq!(outcome, Outcome::Completed);
     assert_eq!(steps.len(), 3, "llm + rejected tool exec + llm");
     let Step::ToolExec { name, output, .. } = &steps[1] else {
         panic!("expected tool exec");
@@ -823,18 +831,14 @@ async fn spawn_invalid_tools_subset_is_rejected() {
     let engine = engine_for(&server);
     let spawner = std::sync::Arc::new(MockSpawner::default());
     engine.set_spawner(spawner.clone());
+    let (lines, sink) = collecting_sink();
+    let mut p = params(vec![CoreMessage::User {
+        content: "delegate".to_string(),
+    }]);
+    p.sink = Some(sink);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = engine
-        .run_turn(
-            params(vec![CoreMessage::User {
-                content: "delegate".to_string(),
-            }]),
-            tx,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let steps = &node.data.as_ref().unwrap().steps;
+    let _node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+    let steps = steps_of(&lines.lock().unwrap());
     let Step::ToolExec { output, .. } = &steps[1] else {
         panic!("expected tool exec");
     };
@@ -872,12 +876,80 @@ async fn spawn_invalid_tools_subset_is_rejected() {
         content: "delegate".to_string(),
     }]);
     p.tools = Some(vec!["bash".to_string(), "spawn_turn".to_string()]);
+    let (lines, sink) = collecting_sink();
+    p.sink = Some(sink);
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
-    let steps = &node.data.as_ref().unwrap().steps;
+    let _node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+    let steps = steps_of(&lines.lock().unwrap());
     let Step::ToolExec { output, .. } = &steps[1] else {
         panic!("expected tool exec");
     };
     assert!(output.contains("error: invalid tools"), "got: {output}");
     assert!(spawner.spawned.lock().unwrap().is_empty());
+}
+
+/// 正文落盘失败（第一条 llm_call 行写不进去）：以 Failed 终止本轮，**失败
+/// 行不入账**（数据面是唯一账本——server 侧 Entry::append 的文件+内存同
+/// 临界区性质在这里表现为：sink 返回 Err 的 step 不进 steps），且不再发起
+/// 后续 LLM 调用。
+#[tokio::test]
+async fn sink_failure_terminates_turn_as_failed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[
+            text_chunk("Hello, "),
+            text_chunk("world!"),
+            final_chunk("stop"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    // 记录 sink 收到的全部尝试，llm_call 行返回失败。
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let into = attempts.clone();
+    let sink: Box<dyn FnMut(TurnLine) -> std::result::Result<(), String> + Send> =
+        Box::new(move |line: TurnLine| {
+            let fails = matches!(line, TurnLine::LlmCall { .. });
+            into.lock().unwrap().push(line);
+            if fails { Err("disk full".to_string()) } else { Ok(()) }
+        });
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.sink = Some(sink);
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(node.kind.outcome, Outcome::Failed);
+    // sink 见到的尝试：Init 锚点 + 失败的 llm_call（失败即终止）。
+    assert_eq!(attempts.lock().unwrap().len(), 2);
+    // 没有发起第二次 LLM 调用。
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Init 锚点就写不进去：零 step 的 Failed 轮，不发起任何 LLM 调用。
+#[tokio::test]
+async fn init_sink_failure_yields_empty_failed_turn() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(sse_response(sse(&[text_chunk("hi"), final_chunk("stop")])))
+        .mount(&server)
+        .await;
+
+    let engine = engine_for(&server);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink: Box<dyn FnMut(TurnLine) -> std::result::Result<(), String> + Send> =
+        Box::new(|_line: TurnLine| Err("read-only fs".to_string()));
+    let mut p = params(vec![CoreMessage::User {
+        content: "hi".to_string(),
+    }]);
+    p.sink = Some(sink);
+    let node = engine.run_turn(p, tx, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(node.kind.outcome, Outcome::Failed);
+    // Init 失败 = 正文无法持久化：一次 LLM 调用都不发起。
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }

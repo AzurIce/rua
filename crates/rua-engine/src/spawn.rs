@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rig_core::completion::ToolDefinition;
+use rua_graph::Ulid;
 use rua_graph::id::NodeId;
-use rua_graph::node::Usage;
+use rua_graph::node::{Turn, Usage};
 use tokio_util::sync::CancellationToken;
 
 /// 递归上限：子 turn 也带这套工具，深度到顶后不再注册 spawn/inspect。
@@ -56,10 +57,10 @@ pub trait TurnSpawner: Send + Sync {
     /// spawn 边单调衰减，永不放大）。
     fn spawn_turn(
         &self,
-        parent: Option<NodeId>,
+        parent: Option<Ulid>,
         text: String,
         actor: String,
-        created_by: NodeId,
+        created_by: NodeId<Turn>,
         depth: usize,
         tools: Vec<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SpawnedTurn, String>> + Send>>;
@@ -69,7 +70,7 @@ pub trait TurnSpawner: Send + Sync {
     /// turn is handled engine-side and never touches the child.
     fn inspect(
         &self,
-        node: NodeId,
+        node: Ulid,
         wait: Option<Duration>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<InspectOutcome, String>> + Send>>;
 }
@@ -139,7 +140,7 @@ pub fn inspect_definition() -> ToolDefinition {
 pub async fn execute_spawn(
     spawner: &Arc<dyn TurnSpawner>,
     args: &serde_json::Value,
-    parent_turn: NodeId,
+    parent_turn: NodeId<Turn>,
     depth: usize,
     parent_tools: &crate::prompt::EffectiveTools,
 ) -> String {
@@ -174,7 +175,7 @@ pub async fn execute_spawn(
             list
         }
     };
-    let parent = match args.pointer.as_deref().map(str::parse::<NodeId>).transpose() {
+    let parent = match args.pointer.as_deref().map(str::parse::<Ulid>).transpose() {
         Ok(p) => p,
         Err(_) => return format!("error: invalid node id: {:?}", args.pointer),
     };
@@ -206,7 +207,7 @@ pub async fn execute_inspect(
         Ok(a) => a,
         Err(e) => return format!("error: invalid inspect arguments: {e}"),
     };
-    let node: NodeId = match args.pointer.parse() {
+    let node: Ulid = match args.pointer.parse() {
         Ok(id) => id,
         Err(_) => return format!("error: invalid node id: {:?}", args.pointer),
     };

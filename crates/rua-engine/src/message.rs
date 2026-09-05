@@ -56,7 +56,7 @@ pub fn history_to_rig(history: &[CoreMessage]) -> Vec<Message> {
 mod tests {
     use super::*;
     use rig_core::completion::message::{ToolResultContent, UserContent};
-    use rua_graph::id::NodeId;
+    use rua_graph::Ulid;
     use rua_graph::message::CoreToolCall;
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn maps_context_with_provenance_header() {
-        let src = NodeId::new();
+        let src = Ulid::new();
         let Message::User { content } = to_rig(&CoreMessage::Context {
             body: "distilled material".into(),
             sources: vec![src],

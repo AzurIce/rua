@@ -3,9 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::id::NodeId;
 use crate::journal::JournalEvent;
-use crate::node::TurnLine;
 
 /// On-disk layout for one project's graph:
 ///
@@ -16,6 +14,8 @@ use crate::node::TurnLine;
 /// └── contexts/<ulid>.md  Context 正文：文本材料（tmp + rename 原子写）
 /// ```
 ///
+/// 本类型只管 journal 的 IO 与根目录；正文的文件知识（路径构造、读、写）
+/// 内聚在各 kind 的 `Data` 实现里（`turns/`、`contexts/` 是它们的地盘）。
 /// Input 正文内联在 journal header（`Input.text`），不落正文文件。
 #[derive(Clone)]
 pub struct Store {
@@ -35,88 +35,6 @@ impl Store {
         &self.root
     }
 
-    // ---- turn bodies (jsonl event streams) ----
-
-    fn turn_path(&self, id: NodeId) -> PathBuf {
-        self.root.join("turns").join(format!("{id}.jsonl"))
-    }
-
-    /// Whether the turn body file exists (a sink already appended to it).
-    pub fn has_turn_lines(&self, id: NodeId) -> bool {
-        self.turn_path(id).exists()
-    }
-
-    /// Append one line to `turns/<id>.jsonl` (created on first append),
-    /// durability on par with the journal (append + `sync_data`).
-    pub fn append_turn_line(&self, id: NodeId, line: &TurnLine) -> Result<()> {
-        let mut line_bytes = serde_json::to_vec(line)?;
-        line_bytes.push(b'\n');
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.turn_path(id))?;
-        file.write_all(&line_bytes)?;
-        file.sync_data()?;
-        Ok(())
-    }
-
-    /// Read all lines of a turn body, tolerating a truncated/corrupt final
-    /// line (the daemon may have died mid-append; same policy as the journal).
-    /// A missing file reads as an empty body.
-    pub fn read_turn_lines(&self, id: NodeId) -> Result<Vec<TurnLine>> {
-        let path = self.turn_path(id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let text = fs::read_to_string(&path)?;
-        let mut lines = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str(line) {
-                Ok(l) => lines.push(l),
-                Err(e) => {
-                    // Only the last line may be incomplete (crash mid-append).
-                    if i + 1 == text.lines().count() {
-                        break;
-                    }
-                    return Err(crate::error::Error::JournalCorrupted {
-                        line: i + 1,
-                        reason: e.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(lines)
-    }
-
-    // ---- context bodies (text files) ----
-
-    fn context_path(&self, id: NodeId) -> PathBuf {
-        self.root.join("contexts").join(format!("{id}.md"))
-    }
-
-    /// Persist a context body (tmp + rename atomic write).
-    pub fn write_context(&self, id: NodeId, body: &str) -> Result<()> {
-        let path = self.context_path(id);
-        if path.exists() {
-            return Err(crate::error::Error::NodeAlreadyCommitted(id));
-        }
-        let tmp = self.root.join("contexts").join(format!(".{id}.tmp"));
-        fs::write(&tmp, body)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    pub fn read_context(&self, id: NodeId) -> Result<String> {
-        let path = self.context_path(id);
-        if !path.exists() {
-            return Err(crate::error::Error::NodeNotFound(id));
-        }
-        Ok(fs::read_to_string(&path)?)
-    }
-
     // ---- journal ----
 
     pub fn journal_path(&self) -> PathBuf {
@@ -131,7 +49,7 @@ impl Store {
     }
 
     /// Append a pre-encoded journal line (commit 路径用：header 直接从
-    /// 节点序列化，避免为落盘深拷贝正文)。
+    /// 节点序列化)。
     pub fn append_journal_value(&self, value: &serde_json::Value) -> Result<()> {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');

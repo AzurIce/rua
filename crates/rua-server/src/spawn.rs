@@ -5,8 +5,9 @@
 
 use std::time::Duration;
 
+use rua_graph::Ulid;
 use rua_graph::id::NodeId;
-use rua_graph::node::{AnyNode, Input, Step};
+use rua_graph::node::{Input, Meta, Step, Turn};
 use rua_engine::{InspectOutcome, SpawnedTurn, TurnParams, TurnSpawner};
 use tokio_util::sync::CancellationToken;
 
@@ -29,10 +30,10 @@ impl ServerSpawner {
 impl TurnSpawner for ServerSpawner {
     fn spawn_turn(
         &self,
-        parent: Option<NodeId>,
+        parent: Option<Ulid>,
         text: String,
         actor: String,
-        created_by: NodeId,
+        created_by: NodeId<Turn>,
         depth: usize,
         tools: Vec<String>,
     ) -> std::pin::Pin<
@@ -41,15 +42,10 @@ impl TurnSpawner for ServerSpawner {
         let state = self.state.clone();
         Box::pin(async move {
             let mut graph = state.graph.lock().await;
-            if let Some(parent) = parent {
-                match graph.meta(parent) {
-                    None => return Err(format!("node not found: {parent}")),
-                    Some(meta) if !meta.is_turn() => {
-                        return Err("pointer must be a committed turn node".to_string());
-                    }
-                    _ => {}
-                }
-            }
+            // pointer 必须落在已提交的 turn 节点上（受检类型恢复）。
+            let parent = parent
+                .map(|p| graph.expect_turn(p).map_err(|e| e.to_string()))
+                .transpose()?;
 
             let cursor = graph.create_cursor(actor.clone(), vec![]);
             state.broadcast(ServerEvent::CursorCreated {
@@ -67,18 +63,23 @@ impl TurnSpawner for ServerSpawner {
             let input_id = input.id;
             graph.commit(input).map_err(|e| e.to_string())?;
             let input_meta = graph
-                .meta(input_id)
+                .meta(input_id.raw())
                 .expect("just committed")
                 .header_value();
             state.broadcast(ServerEvent::NodeCommitted { meta: input_meta });
-            graph.move_cursor(cursor.id, input_id).map_err(|e| e.to_string())?;
-            state.broadcast(ServerEvent::CursorMoved {
-                cursor_id: cursor.id,
-                node: Some(input_id),
-            });
-            let handle = graph.begin_turn(cursor.id).map_err(|e| e.to_string())?;
-            let (chain, materials) = graph.load_chain(input_id).map_err(|e| e.to_string())?;
-            let history = rua_engine::assemble(&chain, &materials).map_err(|e| e.to_string())?;
+            let turn = {
+                let mut cur = graph.cursor_mut(cursor.id).map_err(|e| e.to_string())?;
+                cur.move_to(input_id.raw()).map_err(|e| e.to_string())?;
+                state.broadcast(ServerEvent::CursorMoved {
+                    cursor_id: cursor.id,
+                    node: Some(input_id.raw()),
+                });
+                cur.open_turn().map_err(|e| e.to_string())?
+            };
+            let turn_node_id = turn.handle.node_id;
+            let (chain, materials) = graph.load_chain(input_id.raw()).map_err(|e| e.to_string())?;
+            let history =
+                rua_engine::assemble(&chain, &materials, graph.data()).map_err(|e| e.to_string())?;
             let cursor_id = cursor.id;
             drop(graph);
 
@@ -88,9 +89,8 @@ impl TurnSpawner for ServerSpawner {
                 &state,
                 TurnParams {
                     cursor_id,
-                    node_id: handle.node_id,
-                    parent: Some(input_id),
-                    context_refs: vec![],
+                    node_id: turn_node_id,
+                    parent: input_id,
                     actor,
                     model: state.default_model.clone(),
                     history,
@@ -102,19 +102,20 @@ impl TurnSpawner for ServerSpawner {
                     sink: None,
                 },
                 cancel,
+                turn,
             );
 
             Ok(SpawnedTurn {
                 cursor_id: cursor_id.to_string(),
                 input_node_id: input_id.to_string(),
-                turn_node_id: handle.node_id.to_string(),
+                turn_node_id: turn_node_id.to_string(),
             })
         })
     }
 
     fn inspect(
         &self,
-        node: NodeId,
+        node: Ulid,
         wait: Option<Duration>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<InspectOutcome, String>> + Send>,
@@ -124,9 +125,11 @@ impl TurnSpawner for ServerSpawner {
             let deadline = wait.map(|w| tokio::time::Instant::now() + w);
             loop {
                 {
-                    let mut graph = state.graph.lock().await;
-                    if let Ok(node) = graph.node(node) {
-                        return Ok(project(node));
+                    let graph = state.graph.lock().await;
+                    if let Some(meta) = graph.meta(node) {
+                        // meta 在索引里 = 已提交（进行中的轮只有数据面条目，
+                        // 这里不可见，继续等）。
+                        return project(meta, graph.data()).map_err(|e| e.to_string());
                     }
                 }
                 if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
@@ -138,26 +141,21 @@ impl TurnSpawner for ServerSpawner {
     }
 }
 
-/// Project a committed node to the inspect payload. Turn = outcome + final
-/// response text + usage; Input/Context are returned as their text verbatim
-/// (the agent may inspect any pointer it holds).
-fn project(node: &AnyNode) -> InspectOutcome {
-    match node {
-        AnyNode::Turn(n) => {
-            let text = n
-                .data
-                .as_ref()
-                .map(|d| {
-                    d.steps
-                        .iter()
-                        .rev()
-                        .find_map(|s| match s {
-                            Step::LlmCall {
-                                response_text, ..
-                            } if !response_text.is_empty() => Some(response_text.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_default()
+/// Project a committed node to the inspect payload（正文走数据面）.
+/// Turn = outcome + final response text + usage; Input/Context are returned
+/// as their text verbatim (the agent may inspect any pointer it holds).
+fn project(meta: &Meta, data: &rua_graph::DataStore) -> rua_graph::Result<InspectOutcome> {
+    Ok(match meta {
+        Meta::Turn(n) => {
+            let steps = data.entry(n.id)?.cloned()?.steps;
+            let text = steps
+                .iter()
+                .rev()
+                .find_map(|s| match s {
+                    Step::LlmCall {
+                        response_text, ..
+                    } if !response_text.is_empty() => Some(response_text.clone()),
+                    _ => None,
                 })
                 .unwrap_or_default();
             InspectOutcome::Committed {
@@ -166,19 +164,15 @@ fn project(node: &AnyNode) -> InspectOutcome {
                 usage: Some(n.kind.usage),
             }
         }
-        AnyNode::Input(n) => InspectOutcome::Committed {
+        Meta::Input(n) => InspectOutcome::Committed {
             outcome: None,
             text: n.kind.text.clone(),
             usage: None,
         },
-        AnyNode::Context(n) => InspectOutcome::Committed {
+        Meta::Context(n) => InspectOutcome::Committed {
             outcome: None,
-            text: n
-                .data
-                .as_ref()
-                .map(|d| d.body.clone())
-                .unwrap_or_default(),
+            text: data.entry(n.id)?.cloned()?.body,
             usage: None,
         },
-    }
+    })
 }
