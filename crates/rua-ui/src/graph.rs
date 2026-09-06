@@ -15,7 +15,7 @@ use dioxus_flow::{
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::chat::{compact_args, markdown_html, usage_label};
+use crate::chat::{compact_args, compact_num, markdown_html, usage_label, usage_label_full};
 use crate::state::{AppState, Inflight, InflightItem, detach_current_cursor, move_current_cursor, send_current_input};
 use crate::types::*;
 
@@ -668,13 +668,13 @@ fn node_card(
             div { class: "fcard-bottom",
                 span { class: "fcard-actor", title: "{meta.actor}", "{meta.actor}" }
                 if let Some(ctx) = meta.context_tokens {
-                    span { class: "fcard-ctx", title: "上下文量（该回合最后一次调用的 input tokens）",
-                        "ctx {fmt_tokens(ctx)}"
+                    span { class: "fcard-ctx", title: "上下文量（该回合最后一次调用的 input tokens）：{ctx}",
+                        "ctx {compact_num(ctx)}"
                     }
                 }
                 if let Some(usage) = &meta.usage {
-                    span { class: "fcard-usage",
-                        "↑{usage.input_tokens} ↓{usage.output_tokens}"
+                    span { class: "fcard-usage", title: "{usage_label_full(usage)}",
+                        "↑{compact_num(usage.input_tokens)} ↓{compact_num(usage.output_tokens)}"
                         if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
                             " · 缓存{usage.cached_input_tokens * 100 / usage.input_tokens}%"
                         }
@@ -726,19 +726,6 @@ fn SpawnStrip(creator: String, count: usize, collapsed: bool, model_info: Option
                 span { class: "spawn-strip-model", "{info}" }
             }
         }
-    }
-}
-
-/// 紧凑的 token 量格式化：932 / 1.2K / 12K / 1.2M。
-fn fmt_tokens(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 10_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else if n < 1_000_000 {
-        format!("{}K", n / 1_000)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 
@@ -893,7 +880,7 @@ fn DetailPanel() -> Element {
                         }
                         if let Some(ctx) = meta.context_tokens {
                             dt { "上下文" }
-                            dd { "{fmt_tokens(ctx)} tokens" }
+                            dd { title: "{ctx} tokens", "{compact_num(ctx)} tokens" }
                         }
                         if let Some(model) = &meta.model {
                             dt { "model" }
@@ -1013,7 +1000,7 @@ fn NodeBody(node: Node) -> Element {
                 div { class: "bubble-footer",
                     span { class: "bubble-model", "{model}" }
                     span { class: "badge outcome-{outcome.label()}", "{outcome.label()}" }
-                    span { class: "bubble-usage", "{usage_label(usage)}" }
+                    span { class: "bubble-usage", title: "{usage_label_full(usage)}", "{usage_label(usage)}" }
                 }
                 for step in steps {
                     match step {
@@ -1028,6 +1015,7 @@ fn NodeBody(node: Node) -> Element {
                                 div { class: "bubble-text markdown", dangerous_inner_html: markdown_html(response_text) }
                             }
                             div { class: "step-usage",
+                                title: "{usage_label_full(usage)}",
                                 "本次调用 {usage_label(usage)}"
                             }
                         },

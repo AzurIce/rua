@@ -1,21 +1,25 @@
-//! Server-side `TurnSpawner`: the agent's spawn_turn / inspect tools run
-//! against the live graph and runtime. `spawn_turn` deliberately walks the
-//! exact atomic path of `POST /api/inputs` (create cursor + commit input +
-//! start turn).
-
-use std::time::Duration;
+//! Server-side turn spawning: `graph.spawn`（script 绑定面）在此对接活图与
+//! 运行时。`spawn_turn` deliberately walks the exact atomic path of
+//! `POST /api/inputs` (create cursor + commit input + start turn).
+//!
+//! 等待/读取一侧在 [`crate::script`]（wait 绑定轮询图索引）。
 
 use rua_graph::Ulid;
 use rua_graph::id::NodeId;
-use rua_graph::node::{Input, Meta, Step, Turn};
-use rua_engine::{InspectOutcome, SpawnedTurn, TurnParams, TurnSpawner};
+use rua_graph::node::{Input, Turn};
+use rua_engine::TurnParams;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::ServerEvent;
 use crate::state::SharedState;
 
-/// inspect 的轮询间隔（本地 daemon，简单轮询比事件订阅省事）。
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Result of a successful `graph.spawn` call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SpawnedTurn {
+    pub cursor_id: String,
+    pub input_node_id: String,
+    pub turn_node_id: String,
+}
 
 pub struct ServerSpawner {
     state: SharedState,
@@ -25,10 +29,8 @@ impl ServerSpawner {
     pub fn new(state: SharedState) -> Self {
         Self { state }
     }
-}
 
-impl TurnSpawner for ServerSpawner {
-    fn spawn_turn(
+    pub fn spawn_turn(
         &self,
         parent: Option<Ulid>,
         text: String,
@@ -112,67 +114,4 @@ impl TurnSpawner for ServerSpawner {
             })
         })
     }
-
-    fn inspect(
-        &self,
-        node: Ulid,
-        wait: Option<Duration>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<InspectOutcome, String>> + Send>,
-    > {
-        let state = self.state.clone();
-        Box::pin(async move {
-            let deadline = wait.map(|w| tokio::time::Instant::now() + w);
-            loop {
-                {
-                    let graph = state.graph.lock().await;
-                    if let Some(meta) = graph.meta(node) {
-                        // meta 在索引里 = 已提交（进行中的轮只有数据面条目，
-                        // 这里不可见，继续等）。
-                        return project(meta, graph.data()).map_err(|e| e.to_string());
-                    }
-                }
-                if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-                    return Ok(InspectOutcome::Running);
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        })
-    }
-}
-
-/// Project a committed node to the inspect payload（正文走数据面）.
-/// Turn = outcome + final response text + usage; Input/Context are returned
-/// as their text verbatim (the agent may inspect any pointer it holds).
-fn project(meta: &Meta, data: &rua_graph::DataStore) -> rua_graph::Result<InspectOutcome> {
-    Ok(match meta {
-        Meta::Turn(n) => {
-            let steps = data.entry(n.id)?.cloned()?.steps;
-            let text = steps
-                .iter()
-                .rev()
-                .find_map(|s| match s {
-                    Step::LlmCall {
-                        response_text, ..
-                    } if !response_text.is_empty() => Some(response_text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            InspectOutcome::Committed {
-                outcome: Some(format!("{:?}", n.kind.outcome).to_lowercase()),
-                text,
-                usage: Some(n.kind.usage),
-            }
-        }
-        Meta::Input(n) => InspectOutcome::Committed {
-            outcome: None,
-            text: n.kind.text.clone(),
-            usage: None,
-        },
-        Meta::Context(n) => InspectOutcome::Committed {
-            outcome: None,
-            text: data.entry(n.id)?.cloned()?.body,
-            usage: None,
-        },
-    })
 }

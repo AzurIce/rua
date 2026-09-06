@@ -4,7 +4,7 @@
 
 use rua_graph::cursor::Cursor;
 use rua_graph::id::CursorId;
-use rua_graph::node::Outcome;
+use rua_graph::node::{Outcome, Usage};
 use rua_graph::{TurnEvent, Ulid};
 use serde::Serialize;
 
@@ -35,6 +35,14 @@ pub enum ServerEvent {
         call_id: String,
         output_preview: String,
         duration_ms: u64,
+    },
+    /// 一次 LLM 调用完成；`usage` 为该轮截至当前的累计用量（in-flight 用量
+    /// 实时刷新的数据源）。
+    LlmCallFinished {
+        cursor_id: CursorId,
+        node_id: Ulid,
+        step: usize,
+        usage: Usage,
     },
     /// A turn reached a terminal state and (normally) its node was committed.
     /// Also emitted with `outcome: failed` when the engine errored before a
@@ -107,6 +115,17 @@ impl From<TurnEvent> for ServerEvent {
                 call_id,
                 output_preview,
                 duration_ms,
+            },
+            TurnEvent::LlmCallFinished {
+                cursor_id,
+                node_id,
+                step,
+                usage,
+            } => Self::LlmCallFinished {
+                cursor_id,
+                node_id,
+                step,
+                usage,
             },
             TurnEvent::Committed {
                 cursor_id,

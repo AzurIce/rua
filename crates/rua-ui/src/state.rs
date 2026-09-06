@@ -67,6 +67,11 @@ pub struct Inflight {
     pub node_id: String,
     pub parent: Option<String>,
     pub items: Vec<InflightItem>,
+    /// 截至当前的累计 token 用量（engine 随每次 LLM 调用完成推送累计值）。
+    /// 连接/重同步后清零，直到下一次 LlmCallFinished；提交后以 header 为准。
+    pub usage: Usage,
+    /// 最近一次完成的 LlmCall 在 step 列表中的下标（0 起）。
+    pub step: Option<usize>,
 }
 
 impl Inflight {
@@ -76,6 +81,8 @@ impl Inflight {
             node_id,
             parent,
             items: vec![],
+            usage: Usage::default(),
+            step: None,
         }
     }
 
@@ -177,6 +184,8 @@ pub struct AppState {
     pub draft: Signal<String>,
     /// 聊天视图的 inspect 侧栏开关（默认关）。
     pub context_panel_open: Signal<bool>,
+    /// 左缘图列表侧栏的展开状态（收起后渲染成细条）。
+    pub sidebar_open: Signal<bool>,
     pub booted: Signal<bool>,
 }
 
@@ -218,7 +227,7 @@ impl AppState {
     }
 
     /// 全部可用工具。spawn 工具的实际可用性还受 spawner/深度门控。
-    pub const ALL_TOOLS: &'static [&'static str] = &["bash", "spawn_turn", "inspect"];
+    pub const ALL_TOOLS: &'static [&'static str] = &["bash", "script"];
 
     /// 本次发送的工具覆盖：全开 → None；有关掉的 → Some(剩余列表)。
     pub fn tools_override(&self) -> Option<Vec<String>> {
@@ -305,6 +314,7 @@ pub async fn bootstrap(mut state: AppState) {
 /// Full resync: graph snapshot + current cursor's chain. Used at startup and
 /// after every WS reconnect.
 pub async fn resync(mut state: AppState) {
+    let mut in_flight_ids: Vec<String> = Vec::new();
     match api::get_graph().await {
         Ok(graph) => {
             state
@@ -325,10 +335,68 @@ pub async fn resync(mut state: AppState) {
                     Inflight::new(h.cursor_id.clone(), h.node_id.clone(), parent)
                 });
             }
+            in_flight_ids = graph.in_flight.iter().map(|h| h.node_id.clone()).collect();
         }
         Err(e) => state.set_error(format!("同步图数据失败: {e}")),
     }
+    // 刷新/重连会错过已播过的流式 delta：从 server 的数据面回填已完成
+    // 部分（详见 hydrate_inflight）。
+    for node_id in in_flight_ids {
+        hydrate_inflight(state, node_id);
+    }
     refresh_chain(state).await;
+}
+
+/// 回填 in-flight 轮的已完成内容：拉部分 steps（server 数据面逐 step 落
+/// 盘，进行中的轮可读）按序转成流式项，整体替换**空**累加器。守卫两道：
+/// 写回时 items 仍为空（WS delta 已先到就放弃回填，保持 delta 流，避免
+/// 重复/错位合并）；轮已被 TurnCommitted 移除则 get_mut 自然为 None。
+fn hydrate_inflight(mut state: AppState, node_id: String) {
+    spawn(async move {
+        let Ok(steps) = api::get_inflight_steps(&node_id).await else {
+            return; // 已提交/不在飞：无需回填
+        };
+        let items: Vec<InflightItem> = steps
+            .into_iter()
+            .flat_map(|step| match step {
+                Step::LlmCall {
+                    response_text,
+                    reasoning,
+                    ..
+                } => {
+                    let mut out = Vec::with_capacity(2);
+                    if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+                        out.push(InflightItem::Reasoning(r));
+                    }
+                    if !response_text.is_empty() {
+                        out.push(InflightItem::Text(response_text));
+                    }
+                    out
+                }
+                Step::ToolExec {
+                    call_id,
+                    name,
+                    args,
+                    output,
+                    duration_ms,
+                } => vec![InflightItem::Tool(InflightTool {
+                    call_id,
+                    name,
+                    args,
+                    output_preview: Some(output),
+                    duration_ms: Some(duration_ms),
+                })],
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        if let Some(t) = state.inflights.write().get_mut(&node_id)
+            && t.items.is_empty()
+        {
+            t.items = items;
+        }
+    });
 }
 
 pub async fn refresh_chain(mut state: AppState) {
@@ -400,6 +468,17 @@ pub async fn handle_event(mut state: AppState, ev: WsEvent) {
             {
                 tool.output_preview = Some(output_preview);
                 tool.duration_ms = Some(duration_ms);
+            }
+        }
+        WsEvent::LlmCallFinished {
+            node_id,
+            step,
+            usage,
+            ..
+        } => {
+            if let Some(t) = state.inflights.write().get_mut(&node_id) {
+                t.usage = usage;
+                t.step = Some(step);
             }
         }
         WsEvent::TurnCommitted {

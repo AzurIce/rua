@@ -141,6 +141,10 @@ pub fn ChatView() -> Element {
             let _cursor = state.current_cursor.read();
             let _chain_len = state.chain.read().len();
             let _inflight_len = state.current_inflight().map(|t| t.content_len());
+            // Turn 提交瞬间流式气泡换成详情骨架（内容骤缩把 scrollTop 钳
+            // 回去），详情异步到达后内容长回来——靠这条依赖再贴一次底，
+            // 否则视图停在中间不跟了。
+            let _detail_len = state.turn_details.read().len();
             if let Some(el) = scroll_el.read().clone() {
                 if *state.follow_bottom.read() {
                     el.set_scroll_top(el.scroll_height());
@@ -424,28 +428,64 @@ pub(crate) fn compact_args(args: &serde_json::Value) -> String {
     }
 }
 
+/// Token 数紧凑格式：`<1000` 原样；之后 k/M 缩写，值 <100 保留一位小数
+/// （7.9k / 16.5k / 1.2M），再大取整（655k / 602k）。精确值经
+/// `usage_label_full` 放在展示 label 的 hover tooltip 里。
+pub(crate) fn compact_num(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let (v, unit) = if n >= 1_000_000 {
+        (n as f64 / 1_000_000.0, "M")
+    } else {
+        (n as f64 / 1_000.0, "k")
+    };
+    if v >= 100.0 {
+        format!("{v:.0}{unit}")
+    } else {
+        let s = format!("{v:.1}");
+        let s = s.strip_suffix(".0").unwrap_or(&s);
+        format!("{s}{unit}")
+    }
+}
+
 /// 统一的 token 用量展示：`↑{in} ↓{out}[ · 缓存{cached}({pct}%)][ · 思考{r}]`，
-/// 零值部分省略；pct = cached*100/input（input>0 且有缓存时）。聊天气泡
-/// footer、图节点详情 turn 汇总行、LlmCall step 行三处共用。
-pub(crate) fn usage_label(usage: &Usage) -> String {
-    let mut s = format!("↑{} ↓{}", usage.input_tokens, usage.output_tokens);
+/// 零值部分省略；pct = cached*100/input（input>0 且有缓存时）。数字经
+/// `num_fmt` 渲染，紧凑展示与精确 tooltip 共用这套拼装。聊天气泡 footer、
+/// 图节点详情 turn 汇总行、LlmCall step 行三处共用。
+fn usage_label_with(usage: &Usage, num_fmt: impl Fn(u64) -> String) -> String {
+    let mut s = format!(
+        "↑{} ↓{}",
+        num_fmt(usage.input_tokens),
+        num_fmt(usage.output_tokens)
+    );
     if usage.input_tokens > 0 && usage.cached_input_tokens > 0 {
         s.push_str(&format!(
             " · 缓存{}({}%)",
-            usage.cached_input_tokens,
+            num_fmt(usage.cached_input_tokens),
             usage.cached_input_tokens * 100 / usage.input_tokens
         ));
     }
     if usage.reasoning_tokens > 0 {
-        s.push_str(&format!(" · 思考{}", usage.reasoning_tokens));
+        s.push_str(&format!(" · 思考{}", num_fmt(usage.reasoning_tokens)));
     }
     s
+}
+
+/// 展示用紧凑 label（数字缩写，控制宽度）。
+pub(crate) fn usage_label(usage: &Usage) -> String {
+    usage_label_with(usage, compact_num)
+}
+
+/// 精确数字 label：紧凑 label 所在元素的 hover tooltip 用。
+pub(crate) fn usage_label_full(usage: &Usage) -> String {
+    usage_label_with(usage, |n| n.to_string())
 }
 
 #[component]
 fn UsageView(usage: Usage) -> Element {
     rsx! {
-        span { class: "bubble-usage", "{usage_label(&usage)}" }
+        span { class: "bubble-usage", title: "{usage_label_full(&usage)}", "{usage_label(&usage)}" }
     }
 }
 
@@ -491,6 +531,8 @@ fn InflightBubble(turn: Inflight) -> Element {
     let state = use_context::<AppState>();
     rsx! {
         div { class: "bubble bubble-turn bubble-inflight",
+            // 与已提交轮容器同名的锚点 id：导航条能定位到进行中轮。
+            id: "turn-{turn.node_id}",
             div { class: "bubble-header",
                 span { class: "bubble-actor", "agent" }
                 span { class: "bubble-id", "#{short_id(&turn.node_id)}" }
@@ -533,6 +575,18 @@ fn InflightBubble(turn: Inflight) -> Element {
                     },
                 }
             }
+            // live footer：usage 随每次 LLM 调用完成跳动（provider 只在流
+            // 末尾给数，这是最细粒度），step 序号反映生成进度。
+            if turn.step.is_some() || turn.usage != Usage::default() {
+                div { class: "bubble-footer",
+                    if let Some(step) = turn.step {
+                        span { class: "badge", { format!("第{}步", step + 1) } }
+                    }
+                    if turn.usage != Usage::default() {
+                        UsageView { usage: turn.usage }
+                    }
+                }
+            }
         }
     }
 }
@@ -551,6 +605,14 @@ fn tick_scale(usage: Option<Usage>) -> (u32, f64) {
     (width, opacity)
 }
 
+/// 导航条上的一个刻度：已提交轮来自 chain meta，进行中轮由 in-flight
+/// 累计器供给（usage 随每次 LLM 调用完成 live 增长）。
+struct NavTick {
+    id: String,
+    tip: String,
+    usage: Option<Usage>,
+}
+
 /// 常显细条，在聊天主区左缘：每个 Turn 一个刻度，长度/透明度映射该轮
 /// 体量；hover 出对应 Input 的 preview，点击定位该轮，条上滚轮以聚焦
 /// Turn 为基准按轮上/下跳。主内容区滚轮不受影响（导航条本身不可滚动
@@ -560,9 +622,11 @@ fn TurnNav() -> Element {
     let state = use_context::<AppState>();
     let chain = state.chain.read();
     let focused = state.focused_turn.read().clone();
+    // 读 inflights（current_inflight 内部）：usage 更新让进行中刻度 live。
+    let inflight = state.current_inflight();
 
+    let mut ticks: Vec<NavTick> = Vec::new();
     // (turn meta, 对应 Input 的 preview)——配对规则同 group_chain。
-    let mut ticks: Vec<(NodeMeta, String)> = Vec::new();
     let mut pending: Option<&NodeMeta> = None;
     for m in chain.iter() {
         match m.kind {
@@ -572,13 +636,30 @@ fn TurnNav() -> Element {
                     .filter(|i| !i.preview.is_empty())
                     .map(|i| i.preview.clone())
                     .unwrap_or_else(|| m.preview.clone());
-                ticks.push((m.clone(), tip));
+                ticks.push(NavTick {
+                    id: m.id.clone(),
+                    tip,
+                    usage: m.usage,
+                });
                 pending = None;
             }
             NodeKindTag::Context => {}
         }
     }
-    let turn_ids: Vec<String> = ticks.iter().map(|(m, _)| m.id.clone()).collect();
+    // 进行中轮：链上还没有它的 Turn meta，追加一条 live 刻度；tip 取
+    // 尚未配对的尾部 Input（刚发送的那条）。
+    if let Some(t) = inflight {
+        let tip = pending
+            .filter(|i| !i.preview.is_empty())
+            .map(|i| i.preview.clone())
+            .unwrap_or_else(|| "生成中…".to_string());
+        ticks.push(NavTick {
+            id: t.node_id,
+            tip,
+            usage: Some(t.usage),
+        });
+    }
+    let turn_ids: Vec<String> = ticks.iter().map(|t| t.id.clone()).collect();
 
     rsx! {
         div {
@@ -590,11 +671,11 @@ fn TurnNav() -> Element {
                 }
                 nav_jump(state, &turn_ids, dy > 0.0);
             },
-            for (meta, tip) in ticks {
+            for tick in ticks {
                 {
-                    let id = meta.id.clone();
+                    let id = tick.id.clone();
                     let active = focused.as_deref() == Some(id.as_str());
-                    let (w, o) = tick_scale(meta.usage);
+                    let (w, o) = tick_scale(tick.usage);
                     rsx! {
                         button {
                             key: "{id}",
@@ -604,7 +685,7 @@ fn TurnNav() -> Element {
                             onclick: move |_| {
                                 jump_to_turn(state, &id);
                             },
-                            span { class: "turn-nav-tip", "{tip}" }
+                            span { class: "turn-nav-tip", "{tick.tip}" }
                         }
                     }
                 }
@@ -634,8 +715,8 @@ fn nav_jump(state: AppState, turn_ids: &[String], down: bool) {
 }
 
 /// 模型选择下拉（发送时覆盖；「默认」= daemon 配置模型）。多 provider：
-/// 条目按 provider 分组（optgroup），值是 model ref（默认 provider 组用
-/// 裸模型名，具名 provider 用 "provider/model"）。
+/// 条目按 provider 分组（optgroup），值/id 一律是完整 model ref
+/// `"provider/model"`。
 /// 注意：换模型/改工具列表都会改变请求前缀，前缀缓存会失效。
 #[component]
 pub(crate) fn ModelPicker() -> Element {
@@ -643,7 +724,7 @@ pub(crate) fn ModelPicker() -> Element {
     let models = state.models.read().clone();
     let selected = state.selected_model.read().clone();
     let default_model = state.default_model.read().clone();
-    // 按 provider 分组，保持返回顺序（server 保证默认 provider 在前）。
+    // 按 provider 分组，保持返回顺序（= 配置文件顺序）。
     let mut groups: Vec<(String, Vec<ModelEntry>)> = Vec::new();
     for e in &models {
         if let Some(g) = groups.iter_mut().find(|(p, _)| p == &e.provider) {
@@ -661,10 +742,9 @@ pub(crate) fn ModelPicker() -> Element {
                 let v = e.value();
                 state.selected_model.set(if v.is_empty() { None } else { Some(v) });
             },
-            option { value: "", "模型: 默认 ({short_model(&default_model)})" }
+            option { value: "", "模型: 默认 ({default_model})" }
             for (provider, entries) in groups {
-                // rua-engine 的 DEFAULT_PROVIDER = "default"（UI 不依赖 rua-engine）。
-                optgroup { label: if provider == "default" { "默认 provider".to_string() } else { provider.clone() },
+                optgroup { label: "{provider}",
                     for e in entries {
                         option {
                             key: "{e.id}",
@@ -981,7 +1061,7 @@ fn TurnSnapshot(turn_id: String) -> Element {
         }
         div { class: "ctx-section",
             span { class: "ctx-label", "用量" }
-            span { class: "ctx-call-usage", "{usage_label(usage)}" }
+            span { class: "ctx-call-usage", title: "{usage_label_full(usage)}", "{usage_label(usage)}" }
         }
         if let Some(prompt) = &system_prompt {
             details { class: "ctx-msg ctx-system",
@@ -1002,7 +1082,7 @@ fn TurnSnapshot(turn_id: String) -> Element {
                     Step::LlmCall { usage, .. } => rsx! {
                         div { class: "ctx-step", key: "{i}",
                             span { class: "ctx-step-name", "LLM 调用" }
-                            span { class: "ctx-step-note", "{usage_label(usage)}" }
+                            span { class: "ctx-step-note", title: "{usage_label_full(usage)}", "{usage_label(usage)}" }
                         }
                     },
                     Step::ToolExec { name, duration_ms, .. } => rsx! {
@@ -1121,10 +1201,29 @@ mod tests {
     #[test]
     fn usage_label_reasoning_part() {
         assert_eq!(usage_label(&usage(100, 20, 30, 0)), "↑100 ↓20 · 思考30");
-        // 缓存在前、思考在后。
+        // 缓存在前、思考在后；≥1000 的数字缩写为 k。
         assert_eq!(
             usage_label(&usage(1000, 200, 40, 250)),
-            "↑1000 ↓200 · 缓存250(25%) · 思考40"
+            "↑1k ↓200 · 缓存250(25%) · 思考40"
+        );
+    }
+
+    #[test]
+    fn compact_num_scales() {
+        assert_eq!(compact_num(0), "0");
+        assert_eq!(compact_num(932), "932");
+        assert_eq!(compact_num(1000), "1k");
+        assert_eq!(compact_num(7909), "7.9k");
+        assert_eq!(compact_num(16483), "16.5k");
+        assert_eq!(compact_num(655_147), "655k");
+        assert_eq!(compact_num(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn usage_label_full_keeps_exact_numbers() {
+        assert_eq!(
+            usage_label_full(&usage(655_147, 16_483, 7_909, 602_112)),
+            "↑655147 ↓16483 · 缓存602112(91%) · 思考7909"
         );
     }
 

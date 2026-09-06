@@ -15,7 +15,7 @@ impl Engine {
     /// One-shot summarize: material in, summary body text out. `model_ref`
     /// 与 turn 同一套规则（`"provider/model"` 或裸名 = 默认 provider）。
     pub async fn summarize(&self, model_ref: &str, material: &str) -> Result<String> {
-        let (model, additional_params) = self.model_for(model_ref)?;
+        let (model, additional_params, _) = self.model_for(model_ref)?;
         let prompt = format!("{DISTILL_INSTRUCTION}\n\n<material>\n{material}\n</material>");
         let mut builder = model.completion_request(Message::user(prompt));
         if let Some(additional_params) = &additional_params {

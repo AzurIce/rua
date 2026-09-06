@@ -88,6 +88,20 @@ pub async fn get_node(id: &str) -> Result<Node, String> {
     unwrap(resp).await
 }
 
+/// `GET /api/nodes/:id/steps`：in-flight turn 的部分 steps（刷新/重连后
+/// 回填流式内容用）。仅在进行中的轮上有效（409 = 不在飞）。
+pub async fn get_inflight_steps(id: &str) -> Result<Vec<Step>, String> {
+    #[derive(serde::Deserialize)]
+    struct StepsResponse {
+        steps: Vec<Step>,
+    }
+    let resp = Request::get(&format!("{}/api/nodes/{id}/steps", api_base()))
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
+    unwrap(resp).await.map(|r: StepsResponse| r.steps)
+}
+
 /// `GET /api/cursors/:id/context_preview`：下一轮请求的实时装配预览。
 /// `tools` = 工具覆盖（None = 全量，同发送语义）。
 pub async fn get_context_preview(

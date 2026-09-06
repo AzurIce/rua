@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::id::CursorId;
-use crate::node::Outcome;
+use crate::node::{Outcome, Usage};
 
 /// Streaming/control events emitted while a turn is in flight. The engine
 /// produces them; the server bridges them onto the WebSocket event stream.
@@ -35,6 +35,16 @@ pub enum TurnEvent {
         call_id: String,
         output_preview: String,
         duration_ms: u64,
+    },
+    /// 一次 LLM 调用完成（该 step 已落盘）。`usage` 是截至本轮该次调用的
+    /// **累计**用量（由 engine 汇总），`step` 是本次 LlmCall 在 turn step
+    /// 列表中的下标（0 起）。UI 靠它做 in-flight 用量的实时刷新；provider
+    /// 只在流末尾给数，所以粒度是每调用一次跳一格，不是逐 token。
+    LlmCallFinished {
+        cursor_id: CursorId,
+        node_id: Ulid,
+        step: usize,
+        usage: Usage,
     },
     /// The turn node was committed to the graph.
     Committed {

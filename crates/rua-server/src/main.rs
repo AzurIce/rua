@@ -28,6 +28,7 @@ The server binds to 127.0.0.1 only. Config is read from
 API overview:
     GET  /api/graph                  node metas + cursors + interrupted turns
     GET  /api/nodes/{id}             full node body
+    GET  /api/nodes/{id}/steps       partial steps of an in-flight turn
     GET  /api/cursors                list cursors
     POST /api/cursors                create cursor  {\"actor\": ..., \"capabilities\": [...]}
     GET  /api/cursors/{id}/chain     conversation chain root->tip
@@ -89,6 +90,15 @@ async fn main() {
 }
 
 async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
+    // 日志：标准 RUST_LOG 约定，默认 info。格式 = 常规 fmt 层（时间/级别/
+    // 目标/消息；span 字段含 HTTP method/path）。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let config = Config::load()?;
     let port = opts.port.unwrap_or(config.server.port);
 
@@ -102,18 +112,18 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState::new(
         graph,
         engine.clone(),
-        config.provider.model.clone(),
+        config.model.clone(),
         graphs_root,
         rua_server::graphs::DEFAULT_GRAPH.to_string(),
         config.all_providers(),
     ));
-    // 注入图生长工具的运行时后端（循环依赖：spawner 持有 state，
+    // 注入 script 工具的运行时后端（循环依赖：host 持有 state，
     // state 持有 engine——所以 late-bind）。
-    engine.set_spawner(Arc::new(rua_server::spawn::ServerSpawner::new(state.clone())));
+    engine.set_script_host(Arc::new(rua_server::script::BoaScriptHost::new(state.clone())));
 
     let ui_dist = find_ui_dist();
     if let Some(d) = &ui_dist {
-        println!("rua: serving web UI from {}", d.display());
+        tracing::info!("serving web UI from {}", d.display());
     }
     let app = rua_server::build_router(state, ui_dist);
 
@@ -121,8 +131,8 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // not be reachable from the network.
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("rua: listening on http://{addr}");
-    println!("rua: graph at {}", default_dir.display());
+    tracing::info!("listening on http://{addr}");
+    tracing::info!("graph at {}", default_dir.display());
     axum::serve(listener, app).await?;
     Ok(())
 }

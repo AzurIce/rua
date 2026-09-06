@@ -1,26 +1,10 @@
-//! Top bar: view switch, graph management, cursor switcher, current tip,
-//! connection state.
+//! Top bar: view switch, new-session draft entry, cursor switcher, current
+//! tip, connection state. Graph management lives in the left sidebar.
 
 use dioxus::prelude::*;
 
-use crate::state::{AppState, ConnState, View, enter_draft, resync, run_graph_op};
+use crate::state::{AppState, ConnState, View, enter_draft, resync};
 use crate::types::short_id;
-
-fn prompt(message: &str, default: &str) -> Option<String> {
-    let window = web_sys::window()?;
-    window
-        .prompt_with_message_and_default(message, default)
-        .ok()
-        .flatten()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn confirm(message: &str) -> bool {
-    web_sys::window()
-        .and_then(|w| w.confirm_with_message(message).ok())
-        .unwrap_or(false)
-}
 
 #[component]
 pub fn TopBar() -> Element {
@@ -29,8 +13,6 @@ pub fn TopBar() -> Element {
     let conn = *state.conn.read();
     let current_id = state.current_cursor.read().clone();
     let tip = state.current().and_then(|c| c.node);
-    let graphs = state.graphs.read().clone();
-    let current_graph = state.current_graph.read().clone();
 
     rsx! {
         header { class: "topbar",
@@ -47,96 +29,7 @@ pub fn TopBar() -> Element {
                     "图"
                 }
             }
-            // ---- 图管理（用户侧）：切换 / 新建 / 重命名 / 删除（回收站）----
-            div { class: "graph-switch",
-                select {
-                    class: "graph-select",
-                    title: "切换图",
-                    value: current_graph.clone(),
-                    onchange: move |e| {
-                        let name = e.value();
-                        if name.is_empty() || name == current_graph {
-                            return;
-                        }
-                        spawn(async move {
-                            run_graph_op(state, crate::api::activate_graph(&name)).await;
-                        });
-                    },
-                    if graphs.is_empty() {
-                        option { value: "", "…" }
-                    }
-                    for name in &graphs {
-                        option {
-                            key: "{name}",
-                            value: "{name}",
-                            selected: *name == current_graph,
-                            "{name}"
-                        }
-                    }
-                }
-                button {
-                    class: "graph-op-btn",
-                    title: "新建空图并切换过去",
-                    onclick: move |_| {
-                        if let Some(name) = prompt("新图的名字：", "") {
-                            spawn(async move {
-                                run_graph_op(state, crate::api::create_graph(&name)).await;
-                            });
-                        }
-                    },
-                    "+"
-                }
-                button {
-                    class: "graph-op-btn",
-                    title: "重命名当前图",
-                    onclick: move |_| {
-                        let from = state.current_graph.read().clone();
-                        if from.is_empty() {
-                            return;
-                        }
-                        if let Some(to) = prompt("重命名为：", &from) {
-                            if to != from {
-                                spawn(async move {
-                                    run_graph_op(state, crate::api::rename_graph(&from, &to)).await;
-                                });
-                            }
-                        }
-                    },
-                    "✎"
-                }
-                button {
-                    class: "graph-op-btn",
-                    title: "复制当前图为一个新图（深拷贝，不切换）",
-                    onclick: move |_| {
-                        let from = state.current_graph.read().clone();
-                        if from.is_empty() {
-                            return;
-                        }
-                        if let Some(to) = prompt("复制为：", &format!("{from}-副本")) {
-                            spawn(async move {
-                                run_graph_op(state, crate::api::duplicate_graph(&from, &to)).await;
-                            });
-                        }
-                    },
-                    "⧉"
-                }
-                button {
-                    class: "graph-op-btn danger",
-                    title: "删除当前图（移入 .rua/graphs/.trash/，可手工恢复）",
-                    onclick: move |_| {
-                        let name = state.current_graph.read().clone();
-                        if name.is_empty() {
-                            return;
-                        }
-                        if confirm(&format!("删除图「{name}」？\n数据会移入回收站（.rua/graphs/.trash/），不会真删。")) {
-                            spawn(async move {
-                                run_graph_op(state, crate::api::delete_graph(&name)).await;
-                            });
-                        }
-                    },
-                    "🗑"
-                }
-            }
+            // ---- 图管理已移至左侧边栏（sidebar.rs）----
             button {
                 class: "view-btn",
                 title: "新对话：进入本地草稿态（不碰服务端），发送第一条消息时才真正创建会话",

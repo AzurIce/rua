@@ -10,11 +10,10 @@ fn engine_for(server: &MockServer) -> Engine {
         kind: "deepseek".to_string(),
         api_key: "test-key".to_string(),
         base_url: server.uri(),
-        model: "deepseek-v4-pro".to_string(),
-        additional_params: serde_json::Map::new(),
+        ..ProviderConfig::default()
     };
     Engine::new(
-        &[(rua_engine::config::DEFAULT_PROVIDER.to_string(), config)],
+        &[("deepseek".to_string(), config)],
         std::env::current_dir().unwrap(),
     )
     .unwrap()
@@ -55,7 +54,7 @@ async fn summarize_returns_body_text() {
 
     let engine = engine_for(&server);
     let body = engine
-        .summarize("deepseek-v4-pro", "raw material here")
+        .summarize("deepseek/deepseek-v4-pro", "raw material here")
         .await
         .unwrap();
     assert_eq!(body, "- fact one\n- decision two");

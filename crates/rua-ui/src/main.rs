@@ -8,6 +8,7 @@
 mod api;
 mod chat;
 mod graph;
+mod sidebar;
 mod state;
 mod topbar;
 mod types;
@@ -17,6 +18,7 @@ use dioxus::prelude::*;
 
 use crate::chat::ChatView;
 use crate::graph::GraphView;
+use crate::sidebar::Sidebar;
 use crate::state::{AppState, ConnState, View, bootstrap};
 use crate::topbar::TopBar;
 
@@ -58,6 +60,7 @@ fn App() -> Element {
         clipboard: use_signal(|| None),
         draft: use_signal(String::new),
         context_panel_open: use_signal(|| false),
+        sidebar_open: use_signal(|| true),
         booted: use_signal(|| false),
     };
     use_context_provider(|| state);
@@ -88,9 +91,12 @@ fn App() -> Element {
                 }
             }
             if booted {
-                match view {
-                    View::Chat => rsx! { ChatView {} },
-                    View::Graph => rsx! { GraphView {} },
+                div { class: "app-body",
+                    Sidebar {}
+                    match view {
+                        View::Chat => rsx! { ChatView {} },
+                        View::Graph => rsx! { GraphView {} },
+                    }
                 }
             } else {
                 div { class: "loading", "正在连接 rua-server…" }

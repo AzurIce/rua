@@ -26,6 +26,7 @@ pub fn api_router(state: SharedState) -> Router {
     Router::new()
         .route("/graph", get(get_graph))
         .route("/nodes/{id}", get(get_node))
+        .route("/nodes/{id}/steps", get(get_node_steps))
         .route("/cursors", get(list_cursors).post(create_cursor))
         .route("/inputs", post(post_root_input))
         .route("/cursors/{id}/chain", get(get_chain))
@@ -139,6 +140,27 @@ async fn get_node(
         }
     };
     Ok(Json(view))
+}
+
+/// In-flight turn 的部分 steps：刷新/重连的客户端回填流式内容用。数据
+/// 面条目在 open_turn 时就注册、engine 逐 step 追加，所以进行中的轮也能
+/// 读到已完成的部分（request 重放与已提交轮同一套）。已提交的轮走
+/// `/api/nodes/{id}`；不在飞 → 409。
+async fn get_node_steps(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse_node_id(&id)?;
+    let graph = state.graph.lock().await;
+    let handle = graph
+        .cursors
+        .in_flight_all()
+        .find(|h| h.node_id.raw() == id)
+        .cloned()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, format!("node is not in flight: {id}")))?;
+    let steps = graph.data().entry(handle.node_id)?.cloned()?.steps;
+    let init = graph.turn_init(id)?;
+    Ok(Json(turn_steps_value(&steps, init)))
 }
 
 // ---- cursors ----
@@ -261,6 +283,7 @@ async fn post_input(
     // wire 层的 None（UI 全勾）就地展开为显式列表再落图：图数据里 tools
     // 就是 Vec，没有 None。用户发送恒 depth=0 且 spawner 在位。
     let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
+    let text_bytes = body.text.len();
     // cursor tip 相继边：受检类型恢复（tip 不是 Turn 时 400）。tip 为 Input
     // 的窗口期 turn 必在飞，已被上面的 in_flight 检查挡住，这里只是防线。
     let parent = cursor.node.map(|tip| graph.expect_turn(tip)).transpose()?;
@@ -292,6 +315,15 @@ async fn post_input(
     let history = rua_engine::assemble(&chain, &materials, graph.data())?;
     let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
+    tracing::info!(
+        cursor = %cursor_id,
+        input = %input_id.raw(),
+        turn = %turn_node_id.raw(),
+        text_bytes,
+        tools = tools.len(),
+        model = %model,
+        "input committed; turn spawning"
+    );
 
     let cancel = CancellationToken::new();
     state.cancels.lock().await.insert(cursor_id, cancel.clone());
@@ -360,6 +392,7 @@ async fn post_root_input(
     });
     // wire 层的 None（UI 全勾）就地展开为显式列表再落图（同 post_input）。
     let tools = rua_engine::prompt::EffectiveTools::compute(body.tools.as_deref(), true, 0).names();
+    let text_bytes = body.text.len();
     let input = Input::node(
         NodeId::new(),
         parent,
@@ -389,6 +422,15 @@ async fn post_root_input(
     let cursor_id = cursor.id;
     let model = body.model.clone().unwrap_or_else(|| state.default_model.clone());
     drop(graph);
+    tracing::info!(
+        cursor = %cursor_id,
+        input = %input_id.raw(),
+        turn = %turn_node_id.raw(),
+        text_bytes,
+        tools = tools.len(),
+        model = %model,
+        "input committed; turn spawning"
+    );
 
     let cancel = CancellationToken::new();
     state.cancels.lock().await.insert(cursor_id, cancel.clone());
@@ -485,6 +527,7 @@ async fn post_cancel(
     let token = state.cancels.lock().await.get(&cursor_id).cloned();
     match token {
         Some(token) => {
+            tracing::info!(cursor = %cursor_id, "turn cancel requested");
             token.cancel();
             Ok(StatusCode::NO_CONTENT)
         }
@@ -581,14 +624,14 @@ async fn post_summarize(
 
 // ---- models ----
 
-/// Aggregate every registered provider's model list (OpenAI-compatible
-/// `GET {base_url}/models` per provider, fetched in parallel). Each provider
-/// falls back to its configured default model when unreachable.
+/// Aggregate every registered provider's model list (static config `models`
+/// merged with OpenAI-compatible `GET {base_url}/models`, fetched in
+/// parallel).
 ///
 /// 每个 provider 独立 2s 超时 + 60s 缓存：provider 不在时（比如 oMLX 没开）
 /// 代理请求会挂到连接超时，UI 每次刷新都调这个端点，不能每次都卡几秒。
-/// 返回的条目带 model ref（默认 provider 用裸模型名，具名 provider 用
-/// `"provider/model"`），UI 直接把它作为发送时的模型覆盖值。
+/// 返回条目的 id 就是 model ref `"provider/model"`，UI 直接把它作为发送
+/// 时的模型覆盖值。
 async fn list_models(State(state): State<SharedState>) -> Json<Value> {
     const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -610,19 +653,16 @@ async fn list_models(State(state): State<SharedState>) -> Json<Value> {
     let mut models = Vec::new();
     for (name, list) in futures::future::join_all(fetches).await {
         for m in list {
-            let id = if name == rua_engine::config::DEFAULT_PROVIDER {
-                m.clone()
-            } else {
-                format!("{name}/{m}")
-            };
-            models.push(json!({ "id": id, "provider": name, "model": m }));
+            // id 即 model ref，UI 直接作为发送时的模型覆盖值。
+            models.push(json!({ "id": format!("{name}/{m}"), "provider": name, "model": m }));
         }
     }
     Json(json!({ "models": models, "default": state.default_model }))
 }
 
 /// 单个 provider 的模型列表：60s 缓存 → 2s 超时拉取 → 失败回退陈旧缓存
-/// → 兜底为配置的默认模型。`cfg.model` 保证在列表里。
+/// → 与配置的静态 `models` 表合并（静态在前）。都拿不到时静态表是唯一
+/// 展示，两者皆空则该 provider 不出现。
 async fn fetch_provider_models(
     state: &SharedState,
     client: &reqwest::Client,
@@ -650,11 +690,15 @@ async fn fetch_provider_models(
         }),
         Err(_) => None,
     };
-    let mut models = fetched
+    // 静态表优先（curated 条目沉到列表头），动态结果去重后追加其后。
+    let mut models = cfg.models.clone();
+    for m in fetched
         .or_else(|| cached.map(|(_, m)| m))
-        .unwrap_or_default();
-    if !models.contains(&cfg.model) {
-        models.insert(0, cfg.model.clone());
+        .unwrap_or_default()
+    {
+        if !models.contains(&m) {
+            models.push(m);
+        }
     }
     state
         .models_cache
@@ -762,6 +806,7 @@ async fn ws_handler(State(state): State<SharedState>, ws: WebSocketUpgrade) -> i
 }
 
 async fn ws_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+    tracing::debug!("ws client connected");
     loop {
         tokio::select! {
             biased;
@@ -782,4 +827,5 @@ async fn ws_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
             },
         }
     }
+    tracing::debug!("ws client disconnected");
 }

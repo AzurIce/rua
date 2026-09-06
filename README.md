@@ -114,19 +114,22 @@ first run). Minimal example:
 
 ```toml
 # DeepSeek API
-[provider]
-kind = "deepseek"                 # or "openai" for any OpenAI-compatible endpoint
-api_key = "$DEEPSEEK_API_KEY"     # env var, "!shell command", or literal
+model = "deepseek/deepseek-v4-pro"  # current model: full "provider/model" ref
+
+[[providers]]
+name = "deepseek"
+kind = "deepseek"                   # or "openai" for any OpenAI-compatible endpoint
+api_key = "$DEEPSEEK_API_KEY"       # env var, "!shell command", or literal
 base_url = "https://api.deepseek.com"
-model = "deepseek-v4-pro"
 
 [server]
 port = 3080
 ```
 
-Multiple providers can be registered via `[[providers]]`; models are then
-referenced as `"provider/model"` (a bare name resolves to the default
-provider). The UI model picker aggregates every provider's model list.
+Providers are a flat named registry (`[[providers]]`); the current model is a
+top-level `model` ref pointing at one of them and is validated at load. The
+UI model picker merges each provider's optional static `models` list with its
+live `GET {base_url}/models`.
 
 Full reference: [docs/config.md](docs/config.md).
 

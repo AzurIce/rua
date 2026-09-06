@@ -12,12 +12,12 @@ pub mod distill;
 pub mod error;
 pub mod message;
 pub mod prompt;
-pub mod spawn;
+pub mod script;
 pub mod tools;
 pub mod turn;
 
 pub use assemble::assemble;
 pub use client::Engine;
 pub use error::{Error, Result};
-pub use spawn::{InspectOutcome, SpawnedTurn, TurnSpawner};
+pub use script::{ScriptHost, MAX_SPAWN_DEPTH};
 pub use turn::{MAX_TOOL_ROUNDS, TurnParams};

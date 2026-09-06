@@ -15,7 +15,7 @@ use rua_graph::node::{Input, Node, Outcome, Step, Turn, TurnLine, Usage};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::Engine;
+use crate::client::{Engine, RetryPolicy, error_chain_text, is_retryable_llm_error};
 use crate::error::{Error, Result};
 use crate::message::history_to_rig;
 use crate::prompt::{EffectiveTools, build_system_prompt};
@@ -41,7 +41,7 @@ pub struct TurnParams {
     /// 调用方附加段：拼在 engine 按有效工具集组装出的系统提示词之后
     /// （空行分隔）。不再是完整提示词。
     pub system_prompt: Option<String>,
-    /// spawn_turn 递归深度（0 = 用户发起）。达到 MAX_SPAWN_DEPTH 后不再
+    /// spawn 递归深度（0 = 用户发起）。达到 MAX_SPAWN_DEPTH 后不再
     /// 注册 spawn_turn/inspect 工具。
     pub depth: usize,
     /// 本次发送的工具列表覆盖（None = 全部可用工具）。改工具列表会改变
@@ -64,6 +64,27 @@ struct CallOutcome {
     usage: Usage,
     cancelled: bool,
     error: Option<String>,
+    duration_ms: u64,
+}
+
+impl CallOutcome {
+    fn empty() -> Self {
+        Self {
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            cancelled: false,
+            error: None,
+            duration_ms: 0,
+        }
+    }
+
+    /// 该次调用没产出任何可见内容（text/reasoning/tool_calls 全空）——
+    /// 只有这种失败可以安全重试；流建立后重试会把已发出的内容重复一遍。
+    fn is_blank(&self) -> bool {
+        self.text.is_empty() && self.reasoning.is_empty() && self.tool_calls.is_empty()
+    }
 }
 
 impl Engine {
@@ -90,7 +111,8 @@ impl Engine {
         }
 
         // 有效工具集只算一次：schema 注册、提示词组装、执行分发三处共用。
-        let effective = EffectiveTools::compute(tools.as_deref(), self.spawner.get().is_some(), depth);
+        let effective =
+            EffectiveTools::compute(tools.as_deref(), self.script.get().is_some(), depth);
         // 最终提示词 = engine 按工具集组装 + 调用方附加段（空行拼接在后）。
         let mut prompt = build_system_prompt(&effective);
         if let Some(extra) = system_prompt.as_deref() {
@@ -114,7 +136,7 @@ impl Engine {
             if let Err(e) = sink(TurnLine::Init {
                 request: request_snapshot(&history, &prompt),
             }) {
-                eprintln!("rua: turn {node_id} init anchor persist failed: {e}");
+                tracing::error!(turn = %node_id.raw(), error = %e, "init anchor persist failed");
                 persist_ok = false;
             }
         }
@@ -128,13 +150,12 @@ impl Engine {
                 break Outcome::Failed;
             }
             let call = self
-                .stream_call(
+                .stream_call_with_retry(
                     &model,
                     &history,
                     &prompt,
                     cursor_id,
                     node_id,
-                    depth,
                     &effective,
                     &send,
                     &cancel,
@@ -152,11 +173,19 @@ impl Engine {
             // 先落盘再入账：落盘失败的 step 不进 steps（数据面是唯一账本）。
             if let Some(sink) = &mut sink {
                 if let Err(e) = sink(TurnLine::from(step.clone())) {
-                    eprintln!("rua: turn {node_id} body persist failed: {e}");
+                    tracing::error!(turn = %node_id.raw(), error = %e, "turn body persist failed");
                     break Outcome::Failed;
                 }
             }
             steps.push(step);
+            // 累计用量随每次调用完成推给订阅方（provider 只在流末尾给数，
+            // 这是 in-flight 用量能刷新的最细粒度）。
+            send(TurnEvent::LlmCallFinished {
+                cursor_id,
+                node_id: node_id.raw(),
+                step: steps.len() - 1,
+                usage,
+            });
             history.push(CoreMessage::Assistant {
                 content: call.text.clone(),
                 tool_calls: call.tool_calls.clone(),
@@ -192,30 +221,34 @@ impl Engine {
                 } else {
                     match call_tool.name.as_str() {
                         "bash" => self.bash.execute(&call_tool.args, &cancel).await,
-                        "spawn_turn" => match self.spawner.get() {
-                            Some(spawner) => {
-                                crate::spawn::execute_spawn(
-                                    spawner,
-                                    &call_tool.args,
+                        "script" => match self.script.get() {
+                            Some(host) => {
+                                let code = call_tool
+                                    .args
+                                    .get("code")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                host.run(
+                                    code,
                                     node_id,
                                     depth,
-                                    &effective,
+                                    effective.names(),
+                                    cancel.clone(),
                                 )
-                                .await
                             }
-                            None => "error: spawn_turn is not available".to_string(),
-                        },
-                        "inspect" => match self.spawner.get() {
-                            Some(spawner) => {
-                                crate::spawn::execute_inspect(spawner, &call_tool.args, &cancel)
-                                    .await
-                            }
-                            None => "error: inspect is not available".to_string(),
+                            None => "error: script is not available".to_string(),
                         },
                         other => format!("error: unknown tool: {other}"),
                     }
                 };
                 let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    turn = %node_id.raw(),
+                    tool = %call_tool.name,
+                    duration_ms,
+                    output_bytes = output.len(),
+                    "tool exec finished"
+                );
                 send(TurnEvent::ToolExecFinished {
                     cursor_id,
                     node_id: node_id.raw(),
@@ -233,7 +266,7 @@ impl Engine {
                 // 先落盘再入账：落盘失败的 step 不进 steps（数据面是唯一账本）。
                 if let Some(sink) = &mut sink {
                     if let Err(e) = sink(TurnLine::from(step.clone())) {
-                        eprintln!("rua: turn {node_id} body persist failed: {e}");
+                        tracing::error!(turn = %node_id.raw(), error = %e, "turn body persist failed");
                         break 'agent Outcome::Failed;
                     }
                 }
@@ -258,6 +291,64 @@ impl Engine {
         ))
     }
 
+    /// [`Engine::stream_call`] 的重试包装：错误分类 + 指数退避（策略来自
+    /// 该 provider 的 config）。只有「还没吐出任何内容」的可重试失败才
+    /// 重试；重试等待期间可被取消（返回 cancelled 形态，走正常闭账）。
+    async fn stream_call_with_retry(
+        &self,
+        model_ref: &str,
+        history: &[CoreMessage],
+        prompt: &str,
+        cursor_id: CursorId,
+        node_id: NodeId<Turn>,
+        tools: &EffectiveTools,
+        send: &dyn Fn(TurnEvent),
+        cancel: &CancellationToken,
+    ) -> CallOutcome {
+        let retry = self
+            .model_for(model_ref)
+            .map(|(_, _, retry)| retry)
+            .unwrap_or(RetryPolicy {
+                max_retries: 0,
+                base_delay_ms: 0,
+            });
+        let mut attempt = 0u32;
+        loop {
+            let call = self
+                .stream_call(model_ref, history, prompt, cursor_id, node_id, tools, send, cancel)
+                .await;
+            // 重试资格：非取消、零内容、错误在可重试类别里。
+            let eligible = !call.cancelled
+                && call.is_blank()
+                && call
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| is_retryable_llm_error(e));
+            match (call.error.as_deref(), eligible) {
+                (Some(error), true) if attempt < retry.max_retries => {
+                    attempt += 1;
+                    let delay = retry.delay_for(attempt);
+                    tracing::warn!(
+                        turn = %node_id.raw(),
+                        model = model_ref,
+                        attempt,
+                        retry_after_ms = delay.as_millis() as u64,
+                        error,
+                        "llm call failed before any content; retrying"
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            return CallOutcome { cancelled: true, ..call };
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                _ => return call,
+            }
+        }
+    }
+
     /// One streaming LLM call over the current history. `model_ref` is the
     /// per-turn model override (`"provider/model"` or bare = default
     /// provider); it is resolved per call so per-send overrides actually
@@ -271,21 +362,17 @@ impl Engine {
         prompt: &str,
         cursor_id: CursorId,
         node_id: NodeId<Turn>,
-        depth: usize,
         tools: &EffectiveTools,
         send: &dyn Fn(TurnEvent),
         cancel: &CancellationToken,
     ) -> CallOutcome {
-        let (model, additional_params) = match self.model_for(model_ref) {
+        let start = std::time::Instant::now();
+        let (model, additional_params, _) = match self.model_for(model_ref) {
             Ok(x) => x,
             Err(e) => {
                 return CallOutcome {
-                    text: String::new(),
-                    reasoning: String::new(),
-                    tool_calls: Vec::new(),
-                    usage: Usage::default(),
-                    cancelled: false,
-                    error: Some(e.to_string()),
+                    error: Some(error_chain_text(&e)),
+                    ..CallOutcome::empty()
                 };
             }
         };
@@ -294,16 +381,13 @@ impl Engine {
         // tail and put everything before it into `.messages()`.
         let prompt_msg = rig_history.pop().expect("history checked non-empty");
 
-        // 工具 schema 直接读有效工具集的三个布尔。
+        // 工具 schema 直接读有效工具集的布尔。
         let mut tool_defs = Vec::new();
         if tools.bash {
             tool_defs.push(BashTool::definition());
         }
-        if tools.spawn_turn {
-            tool_defs.push(crate::spawn::spawn_turn_definition(depth));
-        }
-        if tools.inspect {
-            tool_defs.push(crate::spawn::inspect_definition());
+        if tools.script {
+            tool_defs.push(crate::script::script_definition());
         }
         let mut builder = model
             .completion_request(prompt_msg)
@@ -318,24 +402,14 @@ impl Engine {
             Ok(stream) => stream,
             Err(e) => {
                 return CallOutcome {
-                    text: String::new(),
-                    reasoning: String::new(),
-                    tool_calls: Vec::new(),
-                    usage: Usage::default(),
-                    cancelled: false,
-                    error: Some(e.to_string()),
+                    error: Some(error_chain_text(&e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..CallOutcome::empty()
                 };
             }
         };
 
-        let mut outcome = CallOutcome {
-            text: String::new(),
-            reasoning: String::new(),
-            tool_calls: Vec::new(),
-            usage: Usage::default(),
-            cancelled: false,
-            error: None,
-        };
+        let mut outcome = CallOutcome::empty();
 
         loop {
             let item = tokio::select! {
@@ -349,7 +423,7 @@ impl Engine {
                     None => break,
                     Some(Ok(content)) => content,
                     Some(Err(e)) => {
-                        outcome.error = Some(e.to_string());
+                        outcome.error = Some(error_chain_text(&e));
                         break;
                     }
                 },
@@ -408,6 +482,20 @@ impl Engine {
             reasoning_tokens: rig_usage.reasoning_tokens,
             cached_input_tokens: rig_usage.cached_input_tokens,
         };
+        outcome.duration_ms = start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            turn = %node_id.raw(),
+            model = model_ref,
+            duration_ms = outcome.duration_ms,
+            input = outcome.usage.input_tokens,
+            output = outcome.usage.output_tokens,
+            cached = outcome.usage.cached_input_tokens,
+            reasoning = outcome.usage.reasoning_tokens,
+            tool_calls = outcome.tool_calls.len(),
+            error = outcome.error.as_deref().unwrap_or(""),
+            cancelled = outcome.cancelled,
+            "llm call finished"
+        );
         outcome
     }
 }

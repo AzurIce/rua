@@ -85,7 +85,7 @@ pub fn migrate_legacy(rua_dir: &Path) -> Result<()> {
     if legacy.is_dir() && !default.exists() {
         std::fs::create_dir_all(default.parent().expect("graphs dir")).map_err(GraphOpError::Io)?;
         std::fs::rename(&legacy, &default).map_err(GraphOpError::Io)?;
-        eprintln!("rua: migrated {} -> {}", legacy.display(), default.display());
+        tracing::warn!(from = %legacy.display(), to = %default.display(), "migrated legacy graph dir");
     }
     Ok(())
 }
@@ -123,6 +123,7 @@ pub async fn create_graph(state: &SharedState, name: &str) -> Result<()> {
     }
     let graph = Graph::open(&dir).map_err(GraphOpError::Core)?;
     swap_active(state, name, graph).await;
+    tracing::info!(graph = name, "graph created and activated");
     Ok(())
 }
 
@@ -141,6 +142,7 @@ pub async fn activate_graph(state: &SharedState, name: &str) -> Result<()> {
     }
     let graph = Graph::open(&dir).map_err(GraphOpError::Core)?;
     swap_active(state, name, graph).await;
+    tracing::info!(graph = name, "graph activated");
     Ok(())
 }
 
@@ -169,6 +171,7 @@ pub async fn rename_graph(state: &SharedState, from: &str, to: &str) -> Result<(
         let graph = Graph::open(&dst).map_err(GraphOpError::Core)?;
         swap_active(state, to, graph).await;
     }
+    tracing::info!(from, to, "graph renamed");
     Ok(())
 }
 
@@ -186,6 +189,7 @@ pub fn duplicate_graph(state: &SharedState, from: &str, to: &str) -> Result<()> 
         return Err(GraphOpError::AlreadyExists(to.to_string()));
     }
     copy_dir(&src, &dst)?;
+    tracing::info!(from, to, "graph duplicated");
     Ok(())
 }
 
@@ -231,6 +235,7 @@ pub async fn delete_graph(state: &SharedState, name: &str) -> Result<()> {
         let graph = Graph::open(graph_dir(&state.graphs_root, &next)).map_err(GraphOpError::Core)?;
         swap_active(state, &next, graph).await;
     }
+    tracing::info!(graph = name, current = is_current, "graph deleted (moved to trash)");
     Ok(())
 }
 
@@ -416,5 +421,6 @@ pub async fn clone_subgraph(
         state.broadcast(ServerEvent::NodeCommitted { meta });
         count += 1;
     }
+    tracing::info!(from = from_graph, cloned = count, "subgraph cloned into current graph");
     Ok(count)
 }

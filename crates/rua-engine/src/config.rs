@@ -16,12 +16,14 @@ fn cache() -> &'static Mutex<HashMap<String, String>> {
 }
 
 /// rua configuration, read from `~/.config/rua/config.toml`.
+///
+/// Provider 注册表统一在 `[[providers]]`（每项具名），当前模型是顶层
+/// `model`（完整 ref，指向某个已注册 provider）。没有隐式的默认 provider。
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct Config {
+    /// 当前模型：`"provider/model"`，发送时不指定模型的请求落到它。
     #[serde(default)]
-    pub provider: ProviderConfig,
-    /// 额外注册的具名 provider（`[[providers]]`）。默认 provider 即上面的
-    /// `[provider]` 节，名为 `"default"`。
+    pub model: String,
     #[serde(default)]
     pub providers: Vec<NamedProviderConfig>,
     #[serde(default)]
@@ -36,15 +38,14 @@ pub struct NamedProviderConfig {
     pub provider: ProviderConfig,
 }
 
-/// 默认 provider 的名字（model ref 中裸模型名解析到它）。
-pub const DEFAULT_PROVIDER: &str = "default";
-
-/// 模型引用：`"provider名/模型名"`；裸名（无 `/`）指默认 provider。
-/// 返回 (provider 名, 模型名)。
-pub fn parse_model_ref(model_ref: &str) -> (&str, &str) {
+/// 模型引用：`"provider名/模型名"`。模型名本身可以含 `/`（按第一个
+/// `/` 切）；裸名（无 `/`）无效——ref 必须带 provider 前缀。
+pub fn parse_model_ref(model_ref: &str) -> Result<(&str, &str)> {
     match model_ref.split_once('/') {
-        Some((p, m)) if !p.is_empty() && !m.is_empty() => (p, m),
-        _ => (DEFAULT_PROVIDER, model_ref),
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => Ok((p, m)),
+        _ => Err(Error::Config(format!(
+            "invalid model ref {model_ref:?} (expected \"provider/model\")"
+        ))),
     }
 }
 
@@ -58,12 +59,29 @@ pub struct ProviderConfig {
     pub api_key: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    #[serde(default = "default_model")]
-    pub model: String,
+    /// 可选静态模型表：与动态 `GET {base_url}/models` 合并去重后进
+    /// /api/models（UI 模型选择器）。provider 不可达或端点不支持时，
+    /// 这张表是唯一展示。
+    #[serde(default)]
+    pub models: Vec<String>,
     /// Provider-specific request params, passed through verbatim
     /// (e.g. thinking toggles).
     #[serde(default)]
     pub additional_params: serde_json::Map<String, serde_json::Value>,
+    /// TCP 连接超时（秒）。
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// 流式响应的读空闲超时（秒）：两次读到数据之间的最大等待（含首字节
+    /// 前的等待）。治「连接半死但无错误」的无限挂起；0 = 不设。
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+    /// 单次 LLM 调用的最大重试次数。只重试「还没吐出任何内容」的可重试
+    /// 失败（连接/超时/429/5xx/流早断）；流建立后失败不重试（会重复内容）。
+    #[serde(default = "default_llm_max_retries")]
+    pub llm_max_retries: u32,
+    /// 重试退避基数（毫秒），按 2^n 指数增长，封顶 60s。
+    #[serde(default = "default_llm_retry_base_ms")]
+    pub llm_retry_base_ms: u64,
 }
 
 impl Default for ProviderConfig {
@@ -72,8 +90,12 @@ impl Default for ProviderConfig {
             kind: default_kind(),
             api_key: String::new(),
             base_url: default_base_url(),
-            model: default_model(),
+            models: Vec::new(),
             additional_params: serde_json::Map::new(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            read_timeout_secs: default_read_timeout_secs(),
+            llm_max_retries: default_llm_max_retries(),
+            llm_retry_base_ms: default_llm_retry_base_ms(),
         }
     }
 }
@@ -100,12 +122,24 @@ fn default_base_url() -> String {
     "http://127.0.0.1:1234/v1".to_string()
 }
 
-fn default_model() -> String {
-    "qwen3.8-27b-uncensored-mlx".to_string()
-}
-
 fn default_port() -> u16 {
     3080
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_read_timeout_secs() -> u64 {
+    120
+}
+
+fn default_llm_max_retries() -> u32 {
+    3
+}
+
+fn default_llm_retry_base_ms() -> u64 {
+    1000
 }
 
 /// Resolve a config value using pi-style rules:
@@ -160,38 +194,16 @@ impl Config {
         }
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("failed to read {}: {e}", path.display())))?;
-
-        // Legacy configs use `[deepseek]`; accept it as a fallback when
-        // `[provider]` is absent.
-        #[derive(Deserialize)]
-        struct RawConfig {
-            provider: Option<ProviderConfig>,
-            deepseek: Option<ProviderConfig>,
-            providers: Option<Vec<NamedProviderConfig>>,
-            server: Option<ServerConfig>,
-        }
-        let raw: RawConfig = toml::from_str(&contents)
+        let mut config: Config = toml::from_str(&contents)
             .map_err(|e| Error::Config(format!("failed to parse {}: {e}", path.display())))?;
-        let provider = match (raw.provider, raw.deepseek) {
-            (Some(p), _) => p,
-            // The legacy section never carried `kind`; it means DeepSeek.
-            (None, Some(mut d)) => {
-                d.kind = "deepseek".to_string();
-                d
-            }
-            (None, None) => ProviderConfig::default(),
-        };
-        let mut config = Config {
-            provider,
-            providers: raw.providers.unwrap_or_default(),
-            server: raw.server.unwrap_or_default(),
-        };
-        // 具名 provider 校验：名字非空、不得占用 "default"、不得重复。
+
+        // 校验：provider 名非空、不含 "/"、不重复；全局 model 必须是
+        // 指向已注册 provider 的完整 ref。全部 fail loud。
         let mut seen = std::collections::HashSet::new();
         for p in &config.providers {
-            if p.name.is_empty() || p.name == DEFAULT_PROVIDER || p.name.contains('/') {
+            if p.name.is_empty() || p.name.contains('/') {
                 return Err(Error::Config(format!(
-                    "invalid provider name {:?} (empty, \"{DEFAULT_PROVIDER}\" and \"/\" are not allowed)",
+                    "invalid provider name {:?} (empty and \"/\" are not allowed)",
                     p.name
                 )));
             }
@@ -202,8 +214,13 @@ impl Config {
                 )));
             }
         }
-        config.provider.api_key = resolve_value(&config.provider.api_key)
-            .map_err(|e| Error::Config(format!("failed to resolve provider.api_key: {e}")))?;
+        let (model_provider, _) = parse_model_ref(&config.model)?;
+        if !config.providers.iter().any(|p| p.name == model_provider) {
+            return Err(Error::Config(format!(
+                "config model {:?} references unknown provider {model_provider:?}",
+                config.model
+            )));
+        }
         for p in &mut config.providers {
             p.provider.api_key = resolve_value(&p.provider.api_key).map_err(|e| {
                 Error::Config(format!("failed to resolve api_key of provider {:?}: {e}", p.name))
@@ -212,19 +229,12 @@ impl Config {
         Ok(config)
     }
 
-    /// 全部 provider：默认 provider 在前（名 `"default"`），后跟具名列表。
+    /// 全部 provider，配置文件顺序。
     pub fn all_providers(&self) -> Vec<(String, ProviderConfig)> {
-        let mut out = vec![(DEFAULT_PROVIDER.to_string(), self.provider.clone())];
-        out.extend(
-            self.providers
-                .iter()
-                .map(|p| (p.name.clone(), p.provider.clone())),
-        );
-        out
-    }
-
-    pub fn resolved_api_key(&self) -> Result<String> {
-        resolve_value(&self.provider.api_key)
+        self.providers
+            .iter()
+            .map(|p| (p.name.clone(), p.provider.clone()))
+            .collect()
     }
 }
 
@@ -233,9 +243,14 @@ fn ensure_default_config(path: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let default_contents = r#"# rua configuration file
 
-[provider]
-# Provider kind: "openai" = any OpenAI-compatible endpoint (default: LM
-# Studio local server); "deepseek" = DeepSeek API.
+# 当前模型：完整 ref "provider/model"，必须指向下面某个 [[providers]]。
+# 发送时不指定模型的请求落到它。
+model = "local/qwen3.8-27b-uncensored-mlx"
+
+# Provider 注册表。kind: "openai" = 任意 OpenAI 兼容端点（默认：LM
+# Studio 本地 server）；"deepseek" = DeepSeek API。
+[[providers]]
+name = "local"
 kind = "openai"
 # API key supports these formats (LM Studio accepts any non-empty string):
 # 1. Literal: api_key = "lm-studio"
@@ -247,19 +262,16 @@ kind = "openai"
 #    api_key = "!security find-generic-password -s deepseek-api-key -w"
 api_key = "lm-studio"
 base_url = "http://127.0.0.1:1234/v1"
-model = "qwen3.8-27b-uncensored-mlx"
+# 可选静态模型表：与动态 GET {base_url}/models 合并去重后进模型选择器；
+# 端点不支持 /models 或 provider 不可达时，这张表是唯一展示。
+# models = ["qwen3.8-27b-uncensored-mlx"]
 # Provider-specific params passed through verbatim, e.g.:
-# [provider.additional_params]
-# thinking = { type = "enabled" }
-
-# Extra named providers (a model ref is then "name/model"; bare model names
-# resolve to the default [provider] above):
-# [[providers]]
-# name = "deepseek"
-# kind = "deepseek"
-# api_key = "$DEEPSEEK_API_KEY"
-# base_url = "https://api.deepseek.com"
-# model = "deepseek-v4-pro"
+# additional_params = { thinking = { type = "enabled" } }
+# LLM HTTP timeouts & retry (defaults shown):
+# connect_timeout_secs = 10
+# read_timeout_secs = 120   # idle gap between stream reads; 0 disables
+# llm_max_retries = 3       # only retries calls that produced no content yet
+# llm_retry_base_ms = 1000  # exponential backoff base, capped at 60s
 
 [server]
 port = 3080
@@ -312,93 +324,119 @@ mod tests {
     }
 
     #[test]
-    fn named_providers_are_parsed_and_resolved() {
+    fn providers_are_parsed_and_keys_resolved() {
         unsafe { std::env::set_var("RUA_TEST_DS_KEY", "sk-ds-env") };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
             r#"
-[provider]
+model = "deepseek/deepseek-v4-pro"
+
+[[providers]]
+name = "local"
 kind = "openai"
 api_key = "lm-studio"
 base_url = "http://127.0.0.1:8000/v1"
-model = "local-model"
+models = ["local-model", "small-model"]
 
 [[providers]]
 name = "deepseek"
 kind = "deepseek"
 api_key = "$RUA_TEST_DS_KEY"
 base_url = "https://api.deepseek.com"
-model = "deepseek-v4-pro"
-
-[[providers]]
-name = "backup"
-kind = "openai"
-api_key = "sk-literal"
-base_url = "http://127.0.0.1:9999/v1"
-model = "small-model"
 "#,
         )
         .unwrap();
         let cfg = Config::load_from(path).unwrap();
         let all = cfg.all_providers();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].0, DEFAULT_PROVIDER);
-        assert_eq!(all[0].1.model, "local-model");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "local");
+        assert_eq!(all[0].1.models, vec!["local-model", "small-model"]);
         assert_eq!(all[1].0, "deepseek");
         assert_eq!(all[1].1.api_key, "sk-ds-env");
         assert_eq!(all[1].1.kind, "deepseek");
-        assert_eq!(all[2].0, "backup");
-        assert_eq!(all[2].1.api_key, "sk-literal");
+        assert_eq!(cfg.model, "deepseek/deepseek-v4-pro");
     }
 
     #[test]
     fn duplicate_provider_name_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[[providers]]\nname = \"a\"\n[[providers]]\nname = \"a\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "model = \"a/m\"\n[[providers]]\nname = \"a\"\n[[providers]]\nname = \"a\"\n",
+        )
+        .unwrap();
         assert!(Config::load_from(path).is_err());
     }
 
     #[test]
-    fn reserved_provider_name_is_rejected() {
+    fn global_model_must_reference_registered_provider() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[[providers]]\nname = \"default\"\n").unwrap();
+        std::fs::write(&path, "model = \"nope/m\"\n[[providers]]\nname = \"a\"\n").unwrap();
+        let err = Config::load_from(path).unwrap_err().to_string();
+        assert!(err.contains("unknown provider"), "{err}");
+    }
+
+    #[test]
+    fn bare_global_model_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "model = \"bare\"\n[[providers]]\nname = \"bare\"\n").unwrap();
+        let err = Config::load_from(path).unwrap_err().to_string();
+        assert!(err.contains("expected \"provider/model\""), "{err}");
+    }
+
+    #[test]
+    fn missing_model_field_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[[providers]]\nname = \"a\"\n").unwrap();
+        assert!(Config::load_from(path).is_err());
+    }
+
+    #[test]
+    fn legacy_provider_section_is_rejected() {
+        // 硬断：旧格式（[provider] 节、无顶层 model）解析为缺字段错误。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider]\nkind = \"openai\"\napi_key = \"k\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
         assert!(Config::load_from(path).is_err());
     }
 
     #[test]
     fn model_ref_parsing() {
         assert_eq!(
-            parse_model_ref("deepseek/deepseek-v4-pro"),
+            parse_model_ref("deepseek/deepseek-v4-pro").unwrap(),
             ("deepseek", "deepseek-v4-pro")
         );
-        assert_eq!(parse_model_ref("local-model"), (DEFAULT_PROVIDER, "local-model"));
         // 模型名本身含 / 时按第一个 / 切（provider/model/sub）
-        assert_eq!(parse_model_ref("p/a/b"), ("p", "a/b"));
+        assert_eq!(parse_model_ref("p/a/b").unwrap(), ("p", "a/b"));
+        // 裸名无效
+        assert!(parse_model_ref("local-model").is_err());
+        assert!(parse_model_ref("p/").is_err());
+        assert!(parse_model_ref("/m").is_err());
     }
 
     #[test]
-    fn legacy_deepseek_section_is_accepted() {
+    fn timeout_and_retry_defaults_apply_when_omitted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            r#"
-[deepseek]
-api_key = "sk-legacy"
-base_url = "https://example.com"
-model = "legacy-model"
-"#,
+            "model = \"p/m\"\n[[providers]]\nname = \"p\"\napi_key = \"k\"\n",
         )
         .unwrap();
         let cfg = Config::load_from(path).unwrap();
-        assert_eq!(cfg.provider.kind, "deepseek");
-        assert_eq!(cfg.provider.api_key, "sk-legacy");
-        assert_eq!(cfg.provider.base_url, "https://example.com");
-        assert_eq!(cfg.provider.model, "legacy-model");
-        assert_eq!(cfg.server.port, 3080);
+        assert_eq!(cfg.providers[0].provider.connect_timeout_secs, 10);
+        assert_eq!(cfg.providers[0].provider.read_timeout_secs, 120);
+        assert_eq!(cfg.providers[0].provider.llm_max_retries, 3);
+        assert_eq!(cfg.providers[0].provider.llm_retry_base_ms, 1000);
     }
 }

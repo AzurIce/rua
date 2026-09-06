@@ -27,11 +27,11 @@ pub struct AppState {
     pub events: broadcast::Sender<String>,
     /// Cancellation token per in-flight turn, keyed by cursor.
     pub cancels: Mutex<HashMap<CursorId, CancellationToken>>,
-    /// 默认模型（默认 provider 的裸模型名；model ref 规则见
-    /// `rua_engine::config::parse_model_ref`）。
+    /// 默认模型：config 顶层 `model`（完整 model ref，请求不带 model
+    /// 时落到它；规则见 `rua_engine::config::parse_model_ref`）。
     pub default_model: String,
-    /// 全部 provider（默认在前，名为 "default"）：/api/models 聚合代理和
-    /// Engine 的 model ref 解析都要用。
+    /// 全部具名 provider（config `[[providers]]` 顺序）：/api/models
+    /// 聚合代理和 Engine 的 model ref 解析都要用。
     pub providers: Vec<(String, rua_engine::config::ProviderConfig)>,
     /// /api/models 按 provider 的缓存：provider 不可达时代理请求会挂到
     /// 超时（数秒），UI 每次刷新都调这个端点，不能每次都等。

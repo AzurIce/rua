@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use rua_graph::graph::Graph;
-use rua_graph::id::{CursorId, NodeId};
+use rua_graph::id::CursorId;
 use rua_graph::message::CoreMessage;
 use rua_graph::node::{Node, Outcome, Step, Turn, TurnLine, Usage};
 use rua_graph::{TurnEvent, Ulid};
@@ -48,17 +48,17 @@ impl AgentEngine for MockEngine {
                 node_id: params.node_id.raw(),
                 delta: "working".into(),
             });
-            if self.park {
-                tokio::select! {
-                    _ = self.release.notified() => {}
-                    _ = cancel.cancelled() => {}
-                }
-            }
-            let outcome = if cancel.is_cancelled() {
-                Outcome::Cancelled
-            } else {
-                Outcome::Completed
-            };
+            let _ = events.send(TurnEvent::LlmCallFinished {
+                cursor_id: params.cursor_id,
+                node_id: params.node_id.raw(),
+                step: 0,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    reasoning_tokens: 0,
+                    cached_input_tokens: 4,
+                },
+            });
             // 一个空响应的 LlmCall step：经 sink 走增量落盘（Init 锚点 +
             // 行，进数据面条目）；header 的派生字段由 steps 切片推导。空响应
             // 不进装配投影，不影响链/preview 测试。
@@ -83,6 +83,19 @@ impl AgentEngine for MockEngine {
                 .unwrap();
                 sink(TurnLine::from(step.clone())).unwrap();
             }
+            // 落盘先于 park：in-flight 窗口内数据面就有内容可读
+            // （in-flight steps 端点测试依赖此）。
+            if self.park {
+                tokio::select! {
+                    _ = self.release.notified() => {}
+                    _ = cancel.cancelled() => {}
+                }
+            }
+            let outcome = if cancel.is_cancelled() {
+                Outcome::Cancelled
+            } else {
+                Outcome::Completed
+            };
             Ok(Turn::node(
                 params.node_id,
                 params.parent,
@@ -128,10 +141,7 @@ async fn spawn_server() -> TestServer {
         "mock-model".into(),
         graphs_root,
         "default".into(),
-        vec![(
-            rua_engine::config::DEFAULT_PROVIDER.to_string(),
-            rua_engine::config::ProviderConfig::default(),
-        )],
+        vec![("mock".to_string(), rua_engine::config::ProviderConfig::default())],
     ));
     let app = rua_server::build_router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -427,6 +437,13 @@ async fn ws_streams_turn_events() {
             if name == "text_delta" {
                 assert_eq!(event["delta"], "working");
             }
+            if name == "llm_call_finished" {
+                // 累计用量随事件走 wire（UI in-flight 实时显示的数据源）。
+                assert_eq!(event["step"], 0);
+                assert_eq!(event["usage"]["input_tokens"], 10);
+                assert_eq!(event["usage"]["output_tokens"], 5);
+                assert_eq!(event["usage"]["cached_input_tokens"], 4);
+            }
             let done = name == "turn_committed";
             events.push(name);
             if done {
@@ -444,6 +461,7 @@ async fn ws_streams_turn_events() {
         "cursor_moved",
         "turn_started",
         "text_delta",
+        "llm_call_finished",
         "turn_committed",
     ] {
         assert!(
@@ -478,7 +496,7 @@ async fn root_input_creates_session_lazily() {
     assert_eq!(graph["in_flight"].as_array().unwrap().len(), 1);
 
     // Let the mock turn finish; cursor lands on the committed turn.
-    server.release.notify_waiters();
+    server.release.notify_one();
     let graph = server.wait_for_nodes(2).await;
     let turn_id = graph["nodes"].as_array().unwrap()[1]["id"]
         .as_str()
@@ -498,7 +516,7 @@ async fn root_input_creates_session_lazily() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["input_node"]["parent"], json!(turn_id));
-    server.release.notify_waiters();
+    server.release.notify_one();
 
     // Parent must be a turn node: input -> 400, unknown -> 404.
     let resp = server
@@ -540,104 +558,7 @@ async fn root_input_creates_session_lazily() {
     assert_eq!(resp.status(), 400);
 }
 
-#[tokio::test]
-async fn server_spawner_creates_session_and_inspect_reads_it() {
-    use rua_engine::TurnSpawner;
-    use rua_server::spawn::ServerSpawner;
-
-    let dir = tempfile::tempdir().unwrap();
-    let graphs_root = dir.path().join("graphs");
-    let graph = Graph::open(graphs_root.join("default")).unwrap();
-    let engine = Arc::new(MockEngine {
-        release: Arc::new(Notify::new()),
-        park: false,
-    });
-    let state = Arc::new(AppState::new(
-        graph,
-        engine,
-        "mock-model".into(),
-        graphs_root,
-        "default".into(),
-        vec![(
-            rua_engine::config::DEFAULT_PROVIDER.to_string(),
-            rua_engine::config::ProviderConfig::default(),
-        )],
-    ));
-    let spawner = ServerSpawner::new(state.clone());
-
-    // 从零 spawn：立即返回，turn 在后台跑（mock engine 直接完成）。
-    let creator = NodeId::new();
-    let all_tools = vec![
-        "bash".to_string(),
-        "spawn_turn".to_string(),
-        "inspect".to_string(),
-    ];
-    let spawned = spawner
-        .spawn_turn(None, "child task".to_string(), "agent:test".to_string(), creator, 1, all_tools.clone())
-        .await
-        .unwrap();
-    let input_id: Ulid = spawned.input_node_id.parse().unwrap();
-    let turn_id: Ulid = spawned.turn_node_id.parse().unwrap();
-
-    // 溯源盖章：spawn 出的根 input 的 created_by 指向发起它的 turn；
-    // 继承的工具集落在 input 节点上。
-    {
-        let graph = state.graph.lock().await;
-        let meta = graph.meta(input_id).unwrap();
-        assert_eq!(meta.input().unwrap().kind.created_by, Some(creator));
-        assert_eq!(meta.input().unwrap().kind.tools, all_tools);
-    }
-
-    // Input 节点已同步 commit，inspect 立即可读。
-    let input = spawner.inspect(input_id, None).await.unwrap();
-    match input {
-        rua_engine::InspectOutcome::Committed { text, outcome, .. } => {
-            assert_eq!(text, "child task");
-            assert_eq!(outcome, None);
-        }
-        other => panic!("expected committed input, got {other:?}"),
-    }
-
-    // Turn 节点：inspect 阻塞到 commit（mock engine 立即完成）。
-    let turn = spawner
-        .inspect(turn_id, Some(Duration::from_secs(10)))
-        .await
-        .unwrap();
-    match turn {
-        rua_engine::InspectOutcome::Committed { outcome, usage, .. } => {
-            assert_eq!(outcome.as_deref(), Some("completed"));
-            assert!(usage.is_some());
-        }
-        other => panic!("expected committed turn, got {other:?}"),
-    }
-
-    // 未知节点 + 短等待 → running。
-    let running = spawner
-        .inspect(Ulid::new(), Some(Duration::from_millis(200)))
-        .await
-        .unwrap();
-    assert!(matches!(running, rua_engine::InspectOutcome::Running));
-
-    // pointer 必须落在已 commit 的 turn 节点上：input 节点非法。
-    let err = spawner
-        .spawn_turn(Some(input_id), "x".to_string(), "agent:test".to_string(), NodeId::new(), 1, all_tools.clone())
-        .await
-        .unwrap_err();
-    assert!(err.contains("turn node"), "got: {err}");
-
-    // 以刚完成的 turn 为 parent spawn（fork），能成。
-    let forked = spawner
-        .spawn_turn(Some(turn_id), "grandchild".to_string(), "agent:test".to_string(), NodeId::new(), 2, vec!["bash".to_string()])
-        .await
-        .unwrap();
-    let forked_turn: Ulid = forked.turn_node_id.parse().unwrap();
-    let result = spawner
-        .inspect(forked_turn, Some(Duration::from_secs(10)))
-        .await
-        .unwrap();
-    assert!(matches!(result, rua_engine::InspectOutcome::Committed { .. }));
-}
-
+// 注：原 ServerSpawner trait 测试已由 tests/script.rs 的 script 工具端到端覆盖。
 #[tokio::test]
 async fn graph_management_lifecycle() {
     let server = spawn_server().await;
@@ -903,15 +824,14 @@ async fn clone_subgraph_across_graphs() {
     assert_eq!(resp.status(), 404);
 }
 
-/// GET /api/models：聚合多个 provider 的模型列表，id 为 model ref（默认
-/// provider 裸名、具名 provider "name/model"）；不可达的 provider 回退到
-/// 它配置的默认模型。
+/// GET /api/models：聚合多个 provider 的模型列表，id 一律为完整 model
+/// ref `"provider/model"`；provider 不可达时静态 `models` 表是唯一展示。
 #[tokio::test]
 async fn models_aggregates_providers_with_model_refs() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // 可达的默认 provider：/models 返回两个模型。
+    // 可达 provider：/models 返回两个模型。
     let provider = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/models"))
@@ -921,12 +841,12 @@ async fn models_aggregates_providers_with_model_refs() {
         .mount(&provider)
         .await;
 
-    let mk = |base_url: String, model: &str| rua_engine::config::ProviderConfig {
+    let mk = |base_url: String, models: Vec<String>| rua_engine::config::ProviderConfig {
         kind: "openai".into(),
         api_key: "k".into(),
         base_url,
-        model: model.into(),
-        additional_params: Default::default(),
+        models,
+        ..rua_engine::config::ProviderConfig::default()
     };
     let dir = tempfile::tempdir().unwrap();
     let graphs_root = dir.path().join("graphs");
@@ -938,16 +858,16 @@ async fn models_aggregates_providers_with_model_refs() {
     let state = Arc::new(AppState::new(
         graph,
         engine,
-        "m-a".into(),
+        "mock/m-a".into(),
         graphs_root,
         "default".into(),
         vec![
+            ("mock".to_string(), mk(provider.uri(), vec![])),
+            // 不可达 provider（连接拒绝，快速失败）：静态 models 表兜底。
             (
-                rua_engine::config::DEFAULT_PROVIDER.to_string(),
-                mk(provider.uri(), "m-a"),
+                "dead".to_string(),
+                mk("http://127.0.0.1:1".into(), vec!["fallback-model".into()]),
             ),
-            // 不可达 provider（连接拒绝，快速失败）：回退到配置模型。
-            ("dead".to_string(), mk("http://127.0.0.1:1".into(), "fallback-model")),
         ],
     ));
     let app = rua_server::build_router(state, None);
@@ -964,14 +884,14 @@ async fn models_aggregates_providers_with_model_refs() {
         .await
         .unwrap();
     let models = resp["models"].as_array().unwrap();
-    // 默认 provider：裸 id。
-    assert!(models.iter().any(|e| e["id"] == "m-a" && e["provider"] == "default" && e["model"] == "m-a"));
-    assert!(models.iter().any(|e| e["id"] == "m-b" && e["provider"] == "default"));
-    // 不可达 provider：回退模型，id 带 provider 前缀。
+    // 可达 provider：动态列表，id 一律完整 ref。
+    assert!(models.iter().any(|e| e["id"] == "mock/m-a" && e["provider"] == "mock" && e["model"] == "m-a"));
+    assert!(models.iter().any(|e| e["id"] == "mock/m-b" && e["provider"] == "mock"));
+    // 不可达 provider：静态 models 表兜底。
     assert!(models.iter().any(
         |e| e["id"] == "dead/fallback-model" && e["provider"] == "dead" && e["model"] == "fallback-model"
     ));
-    assert_eq!(resp["default"], "m-a");
+    assert_eq!(resp["default"], "mock/m-a");
 }
 
 /// POST input 的 tools：wire 层 None（不带字段）在 commit 前就地展开为
@@ -993,7 +913,7 @@ async fn input_tools_none_expands_to_full_list() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
         body["input_node"]["tools"],
-        json!(["bash", "spawn_turn", "inspect"])
+        json!(["bash", "script"])
     );
     server.release.notify_one();
     server.wait_for_nodes(2).await;
@@ -1023,8 +943,8 @@ async fn input_tools_none_expands_to_full_list() {
 }
 
 /// GET /api/cursors/:id/context_preview：下一轮请求的实时装配预览——
-/// 不带 tools = 全量（system_prompt 含 delegation 段）；?tools=bash 时
-/// 无 spawn bullet / 无 delegation，tools 字段为 ["bash"]；messages 与
+/// 不带 tools = 全量（system_prompt 含 operating loop 段）；?tools=bash 时
+/// 无 spawn bullet / 无 operating loop，tools 字段为 ["bash"]；messages 与
 /// 当前 tip 的链装配一致（detached 指针 = 空 messages）。
 #[tokio::test]
 async fn context_preview_endpoint() {
@@ -1053,10 +973,10 @@ async fn context_preview_endpoint() {
     // 无 tip（新游标）：messages 为空；全量工具 → delegation 段在。
     let p = preview("").await;
     assert_eq!(p["messages"], json!([]));
-    assert_eq!(p["tools"], json!(["bash", "spawn_turn", "inspect"]));
+    assert_eq!(p["tools"], json!(["bash", "script"]));
     let prompt = p["system_prompt"].as_str().unwrap();
-    assert!(prompt.contains("Delegation policy:"));
-    assert!(prompt.contains("`spawn_turn`"));
+    assert!(prompt.contains("Operating loop:"));
+    assert!(prompt.contains("`script`"));
 
     // 提交一轮后：tip = 回合节点，链装配出 input 的 user 消息。
     server
@@ -1080,8 +1000,8 @@ async fn context_preview_endpoint() {
     assert_eq!(p["tools"], json!(["bash"]));
     let prompt = p["system_prompt"].as_str().unwrap();
     assert!(prompt.contains("`bash`"));
-    assert!(!prompt.contains("`spawn_turn`"));
-    assert!(!prompt.contains("Delegation policy:"));
+    assert!(!prompt.contains("`script`"));
+    assert!(!prompt.contains("Operating loop:"));
 
     // detach（指针置空）后：messages 回到空，提示词不受影响。
     server
@@ -1108,6 +1028,53 @@ async fn context_preview_endpoint() {
 }
 
 /// get_node 的 wire 视图：盘上 LlmCall 不存 request，响应里按 init 锚点 +
+/// In-flight steps 端点：在飞时回数据面已完成部分（request 由 init 锚点
+/// 重建），提交后转 409（已提交轮走 /api/nodes/{id}）。
+#[tokio::test]
+async fn inflight_steps_serve_partial_view_then_409() {
+    let server = spawn_server().await;
+    let cursor_id = server.create_cursor().await;
+
+    let resp = server
+        .client
+        .post(format!("{}/api/cursors/{cursor_id}/input", server.base))
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let turn_id = resp.json::<Value>().await.unwrap()["turn_node_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 在飞（parked，但 mock 已落盘 Init + LlmCall 行）：部分 steps 可读。
+    let resp = server
+        .client
+        .get(format!("{}/api/nodes/{turn_id}/steps", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let steps = body["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["type"], "llm_call");
+    // request 重放：init 锚点（system + user）。
+    assert_eq!(steps[0]["request"].as_array().unwrap().len(), 2);
+
+    // 提交后：409。
+    server.release.notify_one();
+    server.wait_for_nodes(2).await;
+    let resp = server
+        .client
+        .get(format!("{}/api/nodes/{turn_id}/steps", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+}
+
 /// 轮内重放重建（UI 快照 tab 依赖该字段）。mock engine 经 sink 增量落盘。
 #[tokio::test]
 async fn get_node_rebuilds_llm_request_snapshot() {

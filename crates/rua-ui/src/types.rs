@@ -51,7 +51,7 @@ pub struct NodeMeta {
     /// 该回合最后一次 LLM 调用的上下文量（input tokens，turn 节点才有）。
     #[serde(default)]
     pub context_tokens: Option<u64>,
-    /// 创建者（哪个 turn 的 spawn_turn 产生）；None = 用户/直接操作。
+    /// 创建者（哪个 turn 的 graph.spawn 产生）；None = 用户/直接操作。
     #[serde(default)]
     pub created_by: Option<String>,
     /// Context 节点的蒸馏来源（新 wire 字段；旧 wire 曾借 created_by 槽）。
@@ -292,6 +292,14 @@ pub enum WsEvent {
         call_id: String,
         output_preview: String,
         duration_ms: u64,
+    },
+    /// 一次 LLM 调用完成；`usage` 为该轮截至当前的累计用量，`step` 为本次
+    /// LlmCall 在 step 列表中的下标（0 起）。驱动 in-flight 用量的实时显示。
+    LlmCallFinished {
+        cursor_id: String,
+        node_id: String,
+        step: usize,
+        usage: Usage,
     },
     TurnCommitted {
         cursor_id: String,
