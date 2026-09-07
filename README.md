@@ -25,13 +25,13 @@ traditional "session" is just one chain in that graph.
 - **Forking is trivial.** Pick any node, type an input, and a new branch
   grows from it — as many parallel investigations as you like, no session
   juggling.
-- **Graph operations are tools given to the agent itself.** The agent can
-  *continue* a node (fork a new turn from any committed turn, with a task as
-  its input) and *inspect* a node (wait for it to commit and read its
-  result). Subagents are not a separate abstraction — they emerge from the
-  agent growing the graph. A goal loop falls out naturally: one chain
-  delegates subtasks to other chains, inspects their outcomes, and continues
-  until satisfied.
+- **Graph operations are tools given to the agent itself.** One `script`
+  tool lets the agent program the graph in JS: read it (`list` / `view` /
+  `wait` — the whole memory, across sessions) and grow it (`spawn` a
+  sub-session off any committed turn). Only `console.log` output enters the
+  model's context — parsing, filtering and aggregation happen in the script.
+  Subagents are not a separate abstraction — they emerge from the agent
+  growing the graph (next section).
 - **Compaction is a node too.** Summarizing several turns produces a
   *context node*: distilled material that any branch can reference as input.
   "Forgetting" is just starting a fresh chain carrying only the summary —
@@ -40,6 +40,51 @@ traditional "session" is just one chain in that graph.
   "main line of consciousness" that gets lossily compacted over and over;
   identity lives in the graph as a whole, and work can be handed off between
   chains explicitly.
+
+### Graph access is PTC
+
+`list` / `view` / `wait` / `spawn` / `me` are not five query tools; they are
+bindings callable from ONE JavaScript program the agent writes per tool
+call. Filtering, grep, cross-node joins and aggregation happen inside the
+script; only its `console.log` output enters the model's context.
+
+That shape buys three things. **One round-trip instead of dozens** — "which
+branches failed, and what did each say?" is a single call that scans every
+header and greps every transcript. **Context holds conclusions, not
+evidence** — scanning a hundred turns costs exactly the lines the script
+prints; the script's working memory is free, because the graph is the
+memory. **No query API to design or version** — future questions compose
+from the same bindings plus the language itself, and when a script throws,
+the error comes back as text for the model to fix and rerun.
+
+### Subagents and goals
+
+Neither is a new abstraction — both are ordinary nodes and edges:
+
+```
+input "map all render pipelines"            ← the goal: just an input
+   └▶ turn  list the graph · classify · spawn one branch per pipeline ·
+            wait each · synthesize → outcome
+        │ created_by (spawn provenance)
+        ├▶ input "vitem pipeline"  ─▶ turn  investigate → distilled summary
+        ├▶ input "mesh pipeline"   ─▶ turn  …
+        └▶ input "OIT + debug"     ─▶ turn  …
+```
+
+- A **subagent is two nodes**: an input carrying the task, and the turn
+  that works it — on its own cursor, off any committed turn (or rootless).
+  The spawning turn stamps that input with `created_by`, so the agent tree
+  is simply the forest of provenance edges. A child inherits the spawner's
+  tool set, attenuating with depth; the spawner sees only the child's
+  distilled final text (`wait`), never its transcript.
+- A **goal is an input**; pursuing it is the turn that owns it. That turn
+  classifies the task, delegates independent branches to spawned sessions,
+  waits, and synthesizes — the goal is done when the turn commits with its
+  final text. Because every branch stays committed (failed ones included),
+  a later session handed the same goal checks the graph first — list
+  previews, view a prior summary, verify it still holds — and reuses it
+  instead of re-deriving. Delegation, memory and forgetting (start a fresh
+  chain from any node) are the same mechanism at different depths.
 
 The outlook: the whole graph, with all its parallel agents, *is* the agent.
 Wrap it in a black box — external input lands on a rootless turn node, the
@@ -53,10 +98,10 @@ an agent has memory for free: its own history is the graph it lives in.
   effective tool set), **Context** (distilled material).
 - Cursor registry with movable HEADs; journal-based event sourcing
   (replayed at startup; unfinished turns are marked interrupted).
-- An agent loop with a bash tool plus the graph-growing tools
-  `spawn_turn` / `inspect` — with per-node tool capabilities that attenuate
-  monotonically along spawn edges, and a system prompt assembled dynamically
-  from the effective tool set.
+- An agent loop with a bash tool plus the `script` tool — programmatic
+  graph access (PTC) hosted by the daemon's JS interpreter — with per-node
+  tool capabilities that attenuate monotonically along spawn edges, and a
+  system prompt assembled dynamically from the effective tool set.
 - A daemon (`rua`) owning the graph with a REST + WebSocket API, and a web
   UI (chat view + interactive graph view, context-assembly sidebar, usage /
   prompt-cache visibility).
@@ -75,9 +120,11 @@ crates/
 └── rua-ui       # Dioxus 0.7 web UI: chat view + graph view
 ```
 
-Storage is per-project: `<project>/.rua/graphs/<name>/` holds immutable node
-bodies (`nodes/<ulid>.json`, atomic temp+rename writes) and the journal
-(`journal.jsonl`). Multiple named graphs are supported.
+Storage is per-project: `<project>/.rua/graphs/<name>/` holds the journal
+(`journal.jsonl` — the structural source of truth, node headers + cursor
+events) plus immutable node bodies: turn transcripts as
+`turns/<ulid>.jsonl`, distilled material as `contexts/<ulid>.md`. Multiple
+named graphs are supported; older layouts migrate automatically.
 
 ## Run
 
