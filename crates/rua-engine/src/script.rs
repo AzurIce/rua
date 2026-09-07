@@ -52,16 +52,29 @@ pub fn script_definition() -> ToolDefinition {
                console.log(id, r.outcome, r.text);\n\
              }\n\
              ```\n\
-             Bindings on the `graph` object:\n\
+             Bindings — all edges live on headers, so one `list()` call carries the whole \
+             graph structure; index it and navigate in JS:\n\
              - `graph.me()` -> your turn's node id\n\
-             - `graph.list({kind, actor, outcome, limit})` -> node headers (kind: \
-             \"input\"|\"turn\"|\"context\"; ordered by creation)\n\
-             - `graph.view(id)` -> one node's header (+ text/steps_count for turns)\n\
-             - `graph.spawn({pointer?, content})` -> fork a session (under a committed turn, \
-             or a fresh root); returns {cursor_id, input_node_id, turn_node_id}; runs in the \
-             background; spawned sessions inherit your tool set\n\
-             - `graph.wait(id, timeout_secs?)` -> blocks until the node commits, returns \
-             {status, outcome?, text?}; status is \"running\" on timeout\n\
+             - `graph.list({kind?, actor?, outcome?, limit?})` -> header rows in creation \
+             order. Every header: `id`, `created_at`, `preview`, `kind` \
+             (\"input\"|\"turn\"|\"context\"), plus per kind:\n\
+             · input: `parent`? (previous turn; absent at root), `created_by`? (turn that \
+             spawned it), `context_refs`[] (attached contexts), `text` (full input text)\n\
+             · turn: `parent` (the input that started this turn), `outcome`, `actor`, \
+             `model`, `tools`[], `usage`\n\
+             · context: `context_refs`[] (distillation sources), `distilled_from`? (turn \
+             that produced it)\n\
+             - `graph.view(id)` -> the whole node: header fields flattened + body:\n\
+             · turn: `steps` — [{type:\"llm_call\", response_text, tool_calls, reasoning?, \
+             usage} | {type:\"tool_exec\", call_id, name, args, output, duration_ms}]\n\
+             · context: `body`; input has no body (its `text` is on the header)\n\
+             - `graph.wait(id, timeout_secs?)` -> blocks until the node commits: \
+             {status:\"committed\", outcome?, text?, usage?}; {status:\"running\"} on \
+             timeout; no timeout = wait forever\n\
+             - `graph.spawn({pointer?, content})` -> fork a session (pointer = a committed \
+             turn to continue from, omit for a fresh root); returns {cursor_id, \
+             input_node_id, turn_node_id}; runs in the background; spawned sessions inherit \
+             your tool set\n\
              Only `console.log` output is returned (tail-truncated); compute is capped by an \
              instruction budget. If the script throws, the JS error (with line numbers) comes \
              back as text — fix and rerun."

@@ -66,10 +66,28 @@
 | 绑定 | 签名 | 说明 |
 |---|---|---|
 | `me` | `graph.me() -> string` | 调用方 turn 的节点 id |
-| `list` | `graph.list({kind?, actor?, outcome?, limit?}) -> header[]` | 扫描 meta 索引（created_at 升序，O(1)，不触正文）；kind ∈ `input`/`turn`/`context`；过滤为精确匹配；返回 header 行（id/kind/preview/actor/outcome/...） |
-| `view` | `graph.view(id) -> row` | 单节点：header + `text`（turn 另有 `steps_count`；input/context 为正文原文） |
-| `wait` | `graph.wait(id, timeout_secs?) -> row` | 同步阻塞到该节点 commit（每轮必闭账，故必然终止）；返回 header + `status:"committed"` + `outcome`/`text`/`usage`（turn）；超时返回 `{status:"running"}`；**不设 timeout = 一直等**（turn 被取消时可中断） |
+| `list` | `graph.list({kind?, actor?, outcome?, limit?}) -> header[]` | 扫描 meta 索引（created_at 升序，O(1)，不触正文）；kind ∈ `input`/`turn`/`context`；过滤为精确匹配；返回 header 行（id/kind/preview/...）——**含全部边字段**（见下节），一次 `list()` 即整图结构 |
+| `view` | `graph.view(id) -> 整节点` | header（信封 + meta 平铺）+ 正文平铺：turn = `steps`（`{type:"llm_call",...}`/`{type:"tool_exec",...}` 行，不含 init 锚点/request 重放）；context = `body`；input 无正文字段（`text` 在 header 上） |
+| `wait` | `graph.wait(id, timeout_secs?) -> row` | 同步阻塞到该节点 commit（每轮必闭账，故必然终止）；返回轻量投影 header + `status:"committed"` + `outcome`/`text`/`usage`（turn）；超时返回 `{status:"running"}`；**不设 timeout = 一直等**（turn 被取消时可中断）。要正文再 `view`，轮询期不克隆全量正文 |
 | `spawn` | `graph.spawn({pointer?, content}) -> {cursor_id, input_node_id, turn_node_id}` | fork 新会话：`pointer` 为已提交 turn（省略 = 新根），`content` 为子会话首条消息。**立即返回**，子轮后台真实运行；走与 `/api/inputs` 相同的原子路径，事件进 WS |
+
+### 导航与查找（边语义 + 惯例）
+
+图的全部邻接关系都在 header 上，导航/查找不需要专门绑定——`list()` 建
+一次 `id -> row` 索引，其余在 JS 里走：
+
+- **会话链**：`turn.parent` = 发起该轮的 input；`input.parent` = 上一
+  turn（根 input 为 null）。回溯 = 交替走 `parent`。
+- **分支**：某 turn 的子 input = `list({kind:"input"}).filter(r => r.parent === turnId)`。
+- **spawn 溯源**：`input.created_by` = 发起 spawn 的 turn。
+- **蒸馏溯源**：`context.distilled_from` = 产出它的 turn；context 的
+  `context_refs`（落盘/wire 键名沿用）= 蒸馏来源；`input.context_refs` =
+  该轮挂载的材料。
+- **查正文**：先用 header 便宜地筛（kind/actor/outcome/preview/
+  created_by），只对候选 `view` 拉正文，JS `RegExp` 匹配，打印
+  `id + 片段`——别打印整个正文，只有 `console.log` 进上下文。
+- view 与 `GET /api/nodes/:id` 同一数据面，但后者多做 request 重放
+  （UI 用）；脚本要历史沿链走即可。
 
 语义要点：
 

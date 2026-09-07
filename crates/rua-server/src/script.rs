@@ -114,31 +114,39 @@ impl Bindings {
         })
     }
 
+    /// 整节点投影：header（信封 + kind tag + meta 平铺，全部边字段都在）
+    /// + 正文平铺（turn = `steps`，context = `body`；input 的 `text` 本就
+    /// 在 meta 上）。与详情端点同一数据面来源，但不做 request 重放（init
+    /// 锚点不外露——脚本能沿链重放，不必逐字复制一份）。
     fn view(&self, id: &str) -> Result<serde_json::Value, String> {
         let ulid = Ulid::from_string(id).map_err(|e| format!("invalid node id: {e}"))?;
         crate::runtime::shared_runtime().block_on(async {
             let g = self.state.graph.lock().await;
-            match g.meta(ulid) {
-                None => Err(format!("node not found: {id}")),
-                Some(m) => {
-                    let mut row = m.header_value();
-                    if let Meta::Turn(t) = m {
-                        if let Ok(data) = g.data().entry(t.id).and_then(|e| e.cloned()) {
-                            row["steps_count"] = data.steps.len().into();
-                            row["text"] = last_text(&data.steps).into();
-                        }
-                    }
-                    if let Meta::Input(n) = m {
-                        row["text"] = n.kind.text.clone().into();
-                    }
-                    if let Meta::Context(n) = m {
-                        if let Ok(data) = g.data().entry(n.id).and_then(|e| e.cloned()) {
-                            row["text"] = data.body.into();
-                        }
-                    }
-                    Ok(row)
-                }
+            let m = g
+                .meta(ulid)
+                .ok_or_else(|| format!("node not found: {id}"))?;
+            let mut row = m.header_value();
+            let body: Option<serde_json::Value> = match m {
+                Meta::Turn(t) => g
+                    .data()
+                    .entry(t.id)
+                    .and_then(|e| e.cloned())
+                    .ok()
+                    .map(|d| serde_json::to_value(&d).expect("turn data serialization")),
+                Meta::Context(c) => g
+                    .data()
+                    .entry(c.id)
+                    .and_then(|e| e.cloned())
+                    .ok()
+                    .map(|d| serde_json::to_value(&d).expect("context data serialization")),
+                Meta::Input(_) => None,
+            };
+            if let Some(serde_json::Value::Object(o)) = body {
+                row.as_object_mut()
+                    .expect("header serializes to an object")
+                    .extend(o);
             }
+            Ok(row)
         })
     }
 

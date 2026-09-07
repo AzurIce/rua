@@ -78,6 +78,26 @@ pub fn build_system_prompt(tools: &EffectiveTools) -> String {
     } else {
         out.push_str("\nAll tools are disabled for this turn — answer directly in text.");
     }
+    // 图的世界模型：只陈述事实与成本，不下行为命令——“先查图”应当是理解的
+    // 推论。script 在场才提读图（文本只引用使条件为真的工具）。
+    if tools.script {
+        out.push_str(
+            "\nThe graph you live on is shared memory, not a log: every session's inputs, \
+             full turn transcripts (every tool call with its output), and distilled \
+             summaries are committed to it — sessions that ran before yours, sessions \
+             running in parallel, and your own. All of it is readable by you at any time \
+             through `script` (`graph.list`, `graph.view`), for the cost of a single \
+             call; your own turns are committed the same way. Whatever one session \
+             learns, every session can use.",
+        );
+        out.push_str(
+            "\nBefore doing anything else — before reasoning about how to split the task, \
+             before any `bash`, before any spawning — call `graph.list()` and check what \
+             it returns: the graph's memory often already holds turns or distilled \
+             summaries usable for the task at hand. Reuse what you find; derive only \
+             what the graph does not have.",
+        );
+    }
     // 搜索引导是策略 guideline（条件 = 工具集谓词），不是 bash 的固有描述：
     // 以后若有专用 grep 工具，此条变为 "prefer the grep tool"（grep 在场时
     // 替换本行，类似 operating loop 段的合取条件）。
@@ -150,6 +170,8 @@ mod tests {
         assert!(p.contains("You have these tools:"));
         assert!(p.contains("`bash`"));
         assert!(p.contains("`script`"));
+        assert!(p.contains("shared memory, not a log"));
+        assert!(p.contains("Before doing anything else"));
         assert!(p.contains("Operating loop:"));
         assert!(p.ends_with(
             "Keep answers concise, and prefer examining the relevant files before changing them."

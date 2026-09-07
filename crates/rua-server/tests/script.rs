@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use rua_graph::graph::Graph;
 use rua_graph::id::NodeId;
-use rua_graph::message::CoreMessage;
-use rua_graph::node::{Input, Meta, Node, Outcome, Step, Turn, TurnLine, Usage};
+use rua_graph::message::{CoreMessage, CoreToolCall};
+use rua_graph::node::{
+    Context, ContextData, Input, Meta, Node, Outcome, Step, Turn, TurnLine, Usage,
+};
 use rua_graph::Ulid;
 use rua_engine::TurnParams;
 use rua_engine::ScriptHost;
@@ -198,4 +200,128 @@ async fn script_spawn_with_pointer_forks_and_validates() {
     let out = host.run(&code, me, 0, tools, CancellationToken::new());
     assert!(out.contains("is not a turn node"), "out: {out}");
     assert!(!out.contains("unreachable"), "out: {out}");
+}
+
+/// 整节点 view + 导航/grep 惯例：view 回 header + steps/body（无便利字段）；
+/// 边全在 header 上，脚本建索引即可回溯链、找分支、按正文 grep。
+#[tokio::test]
+async fn script_view_whole_node_navigation_and_grep() {
+    let (_dir, state, me) = test_state().await;
+    let host = BoaScriptHost::new(state.clone());
+
+    // 另造历史：带 tool_exec 的轮（grep 目标，挂在 me 链上）+ 一个
+    // 蒸馏出的 context（正文节点）。
+    let (t1_id, ctx_id) = {
+        let mut g = state.graph.lock().await;
+        let i1 = Input::node(NodeId::new(), Some(me), "fix the panic", "human", vec![], None);
+        let i1_id = i1.id;
+        g.commit(i1).unwrap();
+        let t1_id: NodeId<Turn> = g.data().allocate();
+        let bash_args = serde_json::json!({"command": "make test"});
+        let steps = vec![
+            Step::LlmCall {
+                response_text: String::new(),
+                tool_calls: vec![CoreToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args: bash_args.clone(),
+                }],
+                reasoning: None,
+                usage: Usage::default(),
+                provider_data: None,
+            },
+            Step::ToolExec {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                args: bash_args,
+                output: "test result: FAILED. thread 'main' panicked at lib.rs:7: boom".into(),
+                duration_ms: 5,
+            },
+            Step::LlmCall {
+                response_text: "fixed".into(),
+                tool_calls: vec![],
+                reasoning: None,
+                usage: Usage::default(),
+                provider_data: None,
+            },
+        ];
+        {
+            let entry = g.data().entry(t1_id).unwrap();
+            for s in &steps {
+                entry.append(TurnLine::from(s.clone())).unwrap();
+            }
+        }
+        g.commit(Turn::node(
+            t1_id,
+            i1_id,
+            Outcome::Completed,
+            "human",
+            "mock-model",
+            Usage::default(),
+            vec![],
+            &steps,
+        ))
+        .unwrap();
+
+        let ctx_id = NodeId::new();
+        let body = "distilled: the boom was in lib.rs";
+        g.data()
+            .create(ctx_id, ContextData { body: body.into() })
+            .unwrap();
+        g.commit(Context::node(ctx_id, vec![t1_id.raw()], Some(t1_id), "mock-model", body))
+            .unwrap();
+        (t1_id, ctx_id)
+    };
+
+    // id 经 prologue 注入（正文含大量花括号，不走 format!）。
+    let code = format!(
+        "const ME = \"{me}\";\nconst T1 = \"{t1}\";\nconst CTX = \"{ctx}\";\n{}",
+        r#"
+const idx = Object.fromEntries(graph.list().map((r) => [r.id, r]));
+
+// 整节点 view：turn 带 steps，不再有 text/steps_count 便利字段。
+const v = graph.view(ME);
+console.log("kind:", v.kind, "steps:", v.steps.length, "hasText:", "text" in v, "hasCount:", "steps_count" in v);
+console.log("resp:", v.steps.find((s) => s.type === "llm_call").response_text);
+
+// 链回溯：turn.parent -> 发起它的 input；input.parent -> 上一 turn；根为 null。
+let chain = [];
+let cur = ME;
+while (cur) {
+  chain.push(cur);
+  const input = idx[idx[cur].parent];
+  cur = input ? input.parent || null : null;
+}
+console.log("chain:", chain.length);
+
+// 分支：挂在 me 下的子 input（链上提交的 + spawn 出来的），spawn 溯源看 created_by。
+const s = graph.spawn({ pointer: ME, content: "branch task" });
+graph.wait(s.turn_node_id, 10);
+const kids = graph.list({ kind: "input" }).filter((r) => r.parent === ME);
+console.log("kids:", kids.length, "spawnedByMe:", kids.some((k) => k.created_by === ME));
+
+// grep 正文：只对候选拉 steps，命中打印 id 而非整个正文。
+const hits = graph.list({ kind: "turn" }).map((r) => r.id)
+  .filter((id) => graph.view(id).steps.some((st) => st.type === "tool_exec" && /panic/.test(st.output)));
+console.log("hits:", hits.join(","));
+
+// context：整节点含 body，蒸馏溯源边在 header 上。
+const c = graph.view(CTX);
+console.log("ctx:", c.kind, c.body, c.distilled_from === T1);
+"#,
+        me = me,
+        t1 = t1_id.raw(),
+        ctx = ctx_id.raw(),
+    );
+    let out = host.run(&code, me, 0, vec!["bash".to_string(), "script".to_string()], CancellationToken::new());
+    println!("{out}");
+    assert!(out.contains("kind: turn steps: 1 hasText: false hasCount: false"), "out: {out}");
+    assert!(out.contains("resp: done"), "out: {out}");
+    assert!(out.contains("chain: 1"), "out: {out}");
+    assert!(out.contains("kids: 2 spawnedByMe: true"), "out: {out}");
+    assert!(out.contains(&format!("hits: {}", t1_id.raw())), "out: {out}");
+    assert!(
+        out.contains("ctx: context distilled: the boom was in lib.rs true"),
+        "out: {out}"
+    );
 }
